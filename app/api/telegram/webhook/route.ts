@@ -4,6 +4,7 @@ import { getDb } from "@/lib/mongodb";
 import { resolveWorkflow } from "@/lib/workflow-resolver";
 import { renderCurrentStep, applyMessage, applyCallback, type EngineResult } from "@/lib/workflow-engine";
 import { sendMessage, answerCallbackQuery } from "@/lib/telegram";
+import { recordGroupActivity } from "@/lib/telegram-health";
 import type { BotSession } from "@/lib/workflow-types";
 
 export const dynamic = "force-dynamic";
@@ -102,6 +103,14 @@ export async function POST(req: NextRequest) {
     return ok();
   }
   const name = String(auth.user.username || from.first_name || "Unknown");
+
+  // Monitoring: mark the group as seen and log the update. Fire-and-forget so it
+  // never adds latency to (or fails) the bot's reply.
+  void recordGroupActivity(db, chatId, {
+    isCommand: Boolean(callback) || Boolean(message?.text && String(message.text).startsWith("/")),
+    text: callback ? `callback ${String(callback.data ?? "")}` : message?.text,
+    actor: name,
+  });
 
   // ---------------- Callback queries ----------------
   if (callback) {

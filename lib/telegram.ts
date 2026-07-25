@@ -60,6 +60,13 @@ export async function getFile(fileId: string) {
   return call<{ file_path: string }>("getFile", { file_id: fileId });
 }
 
+// Health probe: getChat succeeds only when the bot is a member of the chat and
+// the Telegram API is reachable, so a non-null result means the bot is live in
+// that group. In the dev stub (no token) this resolves truthy → "healthy".
+export async function getChat(chatId: string | number) {
+  return call<{ id: number; title?: string; type?: string }>("getChat", { chat_id: chatId });
+}
+
 export async function setWebhook(url: string, secretToken: string) {
   return call("setWebhook", { url, secret_token: secretToken, allowed_updates: ["message", "callback_query"] });
 }
