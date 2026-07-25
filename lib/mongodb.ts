@@ -41,6 +41,8 @@ async function ensureIndexes(db: Db) {
     db.collection("workflows").createIndex({ isDefault: 1 }),
     db.collection("workflowVersions").createIndex({ workflowId: 1, version: 1 }, { unique: true }),
     db.collection("telegramGroups").createIndex({ chatId: 1 }, { unique: true }),
+    db.collection("telegramLogs").createIndex({ ts: -1 }),
+    db.collection("telegramLogs").createIndex({ chatId: 1, ts: -1 }),
     db.collection("workflowAssignments").createIndex({ chatId: 1 }),
     db.collection("workflowAssignments").createIndex({ category: 1 }),
     db.collection("botSessions").createIndex({ chatId: 1, userId: 1 }),
