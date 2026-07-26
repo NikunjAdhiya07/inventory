@@ -356,6 +356,26 @@ export function EmptyState({ text }: { text: string }) {
   return <div style={{ padding: 44, textAlign: "center", color: "#98a4bd", fontSize: 13.5 }}>{text}</div>;
 }
 
+// Shown when a page's initial fetch rejects. Without it a failing API leaves the
+// page rendering an empty table, which reads as "no records" rather than "broken".
+export function ErrorBanner({ message }: { message: string }) {
+  return (
+    <div
+      style={{
+        background: "#fff4f4",
+        border: "1px solid #f5c2c2",
+        borderRadius: 12,
+        padding: "12px 16px",
+        marginBottom: 18,
+        fontSize: 13,
+        color: "#a11b1b",
+      }}
+    >
+      <strong style={{ fontWeight: 700 }}>Couldn&apos;t load data.</strong> {message}
+    </div>
+  );
+}
+
 export function SearchInput({
   value,
   onChange,

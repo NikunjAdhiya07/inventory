@@ -3,7 +3,7 @@
 import { useEffect, useState } from "react";
 import Link from "next/link";
 import PageShell from "@/components/page-shell";
-import { PageIntro } from "@/components/dc-ui";
+import { ErrorBanner, PageIntro } from "@/components/dc-ui";
 import { api } from "@/lib/api-client";
 
 const AV = ["#1560f0", "#0d9488", "#f59e0b", "#8b5cf6", "#ec4899", "#6366f1"];
@@ -62,6 +62,7 @@ export default function DashboardPage() {
   const [rolesCount, setRolesCount] = useState(0);
   const [usersCount, setUsersCount] = useState(0);
   const [activity, setActivity] = useState<ActivityRow[]>([]);
+  const [loadError, setLoadError] = useState<string | null>(null);
 
   useEffect(() => {
     // One batch of parallel GETs on mount — no polling, no interval timers.
@@ -73,15 +74,17 @@ export default function DashboardPage() {
       api.get<unknown[]>("/api/roles"),
       api.get<unknown[]>("/api/users"),
       api.get<{ rows: ActivityRow[] }>("/api/audit-log?limit=5"),
-    ]).then(([cats, subs, us, locs, roles, users, log]) => {
-      setCategories(cats);
-      setSubcategoriesCount(subs.length);
-      setUnits(us);
-      setLocations(locs);
-      setRolesCount(roles.length);
-      setUsersCount(users.length);
-      setActivity(log.rows);
-    });
+    ])
+      .then(([cats, subs, us, locs, roles, users, log]) => {
+        setCategories(cats);
+        setSubcategoriesCount(subs.length);
+        setUnits(us);
+        setLocations(locs);
+        setRolesCount(roles.length);
+        setUsersCount(users.length);
+        setActivity(log.rows);
+      })
+      .catch((err: Error) => setLoadError(err.message));
   }, []);
 
   const activeCats = categories.filter((c) => c.status === "Active").length;
@@ -115,6 +118,8 @@ export default function DashboardPage() {
           description="The single source of truth every inventory entry and workflow reads from. Manage each master below — approved changes sync straight to the Telegram bot."
         />
       </div>
+
+      {loadError && <ErrorBanner message={loadError} />}
 
       <section
         style={{

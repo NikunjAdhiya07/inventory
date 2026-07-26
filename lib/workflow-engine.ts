@@ -190,7 +190,11 @@ export async function applyMessage(
     }
 
     default:
-      return { notice: "Please use the buttons above." };
+      // Button-only step. A typed message can't answer it, so re-send the step
+      // with its keyboard rather than a bare nudge: in a busy group the original
+      // buttons have usually scrolled out of view, which is what prompts people
+      // to type in the first place.
+      return { render: await renderCurrentStep(db, session) };
   }
 }
 

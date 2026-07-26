@@ -53,8 +53,18 @@ function newSession(chatId: string, userId: string, name: string, resolved: { wo
 // Deliver an engine result to the chat: next step, a nudge, or a terminal.
 async function deliver(db: Db, session: BotSession, result: EngineResult, callbackQueryId?: string) {
   if (result.notice) {
-    if (callbackQueryId) await answerCallbackQuery(callbackQueryId, result.notice);
-    else await sendMessage(session.chatId, result.notice);
+    if (callbackQueryId) {
+      await answerCallbackQuery(callbackQueryId, result.notice);
+      return;
+    }
+    // A nudge triggered by a typed message (failed validation, wrong input for
+    // the step). Repeat the step with its keyboard underneath the reason, so the
+    // user can act on it without scrolling back to the original prompt.
+    const render = session.status === "active" ? await renderCurrentStep(db, session) : null;
+    const sent = render
+      ? await sendMessage(session.chatId, `${result.notice}\n\n${render.text}`, render.keyboard)
+      : await sendMessage(session.chatId, result.notice);
+    if (sent?.message_id) session.lastMessageId = sent.message_id;
     return;
   }
   if (callbackQueryId) await answerCallbackQuery(callbackQueryId);

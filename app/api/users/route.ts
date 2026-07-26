@@ -1,14 +1,15 @@
 import { NextRequest, NextResponse } from "next/server";
 import { getDb } from "@/lib/mongodb";
 import { toClient, toClientList } from "@/lib/serialize";
+import { withErrors } from "@/lib/api-error";
 
-export async function GET() {
+export const GET = withErrors(async () => {
   const db = await getDb();
   const docs = await db.collection("users").find({}).toArray();
   return NextResponse.json(toClientList(docs));
-}
+});
 
-export async function POST(req: NextRequest) {
+export const POST = withErrors(async (req: NextRequest) => {
   const body = await req.json();
   const db = await getDb();
   try {
@@ -18,4 +19,4 @@ export async function POST(req: NextRequest) {
   } catch {
     return NextResponse.json({ error: "A user with that Telegram ID already exists" }, { status: 409 });
   }
-}
+});

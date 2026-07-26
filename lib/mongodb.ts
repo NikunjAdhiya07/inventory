@@ -1,24 +1,47 @@
 import { MongoClient, type Db } from "mongodb";
 
-const uri = process.env.MONGODB_URI || "mongodb://localhost:27017";
+const uri = process.env.MONGODB_URI;
 const dbName = process.env.MONGODB_DB || "inventory";
 
 // Cached on `global` so Next.js dev-mode hot reloads reuse one client instead of
-// opening a fresh TCP connection (and connection-pool) per file change.
+// opening a fresh TCP connection (and connection-pool) per file change. Serverless
+// instances reuse it across invocations for the lifetime of the container.
 const globalForMongo = globalThis as unknown as { _mongoClientPromise?: Promise<MongoClient> };
 
 function createClient() {
+  if (!uri) {
+    // Defaulting to localhost here turns a missing deploy-time env var into a
+    // connection timeout on every single request, with nothing in the logs that
+    // points at the real cause. Fail loudly instead.
+    throw new Error(
+      "MONGODB_URI is not set. Add it to the deployment's environment variables and redeploy."
+    );
+  }
   const client = new MongoClient(uri, {
     maxPoolSize: 10,
     minPoolSize: 0,
+    // The driver's 30s default outlives the serverless function itself, so an
+    // unreachable cluster shows up as a hung request rather than a readable
+    // error. Fail inside the function's budget so the reason reaches the logs.
+    serverSelectionTimeoutMS: 8000,
   });
   return client.connect();
 }
 
-const clientPromise: Promise<MongoClient> = globalForMongo._mongoClientPromise ?? createClient();
+function getClient(): Promise<MongoClient> {
+  const cached = globalForMongo._mongoClientPromise;
+  if (cached) return cached;
 
-if (process.env.NODE_ENV !== "production") {
-  globalForMongo._mongoClientPromise = clientPromise;
+  const promise = createClient();
+  // Two reasons this catch has to be attached synchronously: an unawaited
+  // rejected promise is an unhandled rejection, and a cached rejected promise
+  // would poison every later request on this instance. Dropping it lets the
+  // next call retry a cluster that has since come back.
+  promise.catch(() => {
+    if (globalForMongo._mongoClientPromise === promise) delete globalForMongo._mongoClientPromise;
+  });
+  globalForMongo._mongoClientPromise = promise;
+  return promise;
 }
 
 let indexesEnsured: Promise<void> | null = null;
@@ -52,7 +75,7 @@ async function ensureIndexes(db: Db) {
 }
 
 export async function getDb(): Promise<Db> {
-  const client = await clientPromise;
+  const client = await getClient();
   const db = client.db(dbName);
   // Index creation is idempotent and cheap once created; only ever run it once
   // per server process instead of on every request.
