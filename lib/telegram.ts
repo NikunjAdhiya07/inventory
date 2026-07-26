@@ -13,10 +13,12 @@ export type InlineKeyboard = InlineButton[][];
 
 let stubMessageId = 1000;
 
-async function call<T = unknown>(method: string, payload: Record<string, unknown>): Promise<T | null> {
+type CallResult<T> = { ok: true; result: T } | { ok: false; description: string };
+
+async function callRaw<T = unknown>(method: string, payload: Record<string, unknown>): Promise<CallResult<T>> {
   if (!TOKEN) {
     console.log(`[telegram:stub] ${method}`, JSON.stringify(payload));
-    return { message_id: ++stubMessageId } as unknown as T;
+    return { ok: true, result: { message_id: ++stubMessageId } as unknown as T };
   }
   try {
     const res = await fetch(`${API}/${method}`, {
@@ -26,14 +28,19 @@ async function call<T = unknown>(method: string, payload: Record<string, unknown
     });
     const data = await res.json();
     if (!data.ok) {
-        console.error(`[telegram] ${method} failed:`, data.description);
-      return null;
+      console.error(`[telegram] ${method} failed:`, data.description);
+      return { ok: false, description: String(data.description ?? "unknown error") };
     }
-    return data.result as T;
+    return { ok: true, result: data.result as T };
   } catch (err) {
     console.error(`[telegram] ${method} error:`, err);
-    return null;
+    return { ok: false, description: String(err) };
   }
+}
+
+async function call<T = unknown>(method: string, payload: Record<string, unknown>): Promise<T | null> {
+  const res = await callRaw<T>(method, payload);
+  return res.ok ? res.result : null;
 }
 
 function replyMarkup(keyboard?: InlineKeyboard) {
@@ -44,8 +51,28 @@ export async function sendMessage(chatId: string | number, text: string, keyboar
   return call<{ message_id: number }>("sendMessage", { chat_id: chatId, text, parse_mode: "HTML", ...replyMarkup(keyboard) });
 }
 
-export async function editMessageText(chatId: string | number, messageId: number, text: string, keyboard?: InlineKeyboard) {
-  return call("editMessageText", { chat_id: chatId, message_id: messageId, text, parse_mode: "HTML", ...replyMarkup(keyboard) });
+// Outcome of an in-place edit. `notModified` means Telegram rejected the edit
+// because the text and keyboard are already exactly what's on screen — nothing
+// is wrong, so callers must not fall back to sending a duplicate message.
+export type EditResult = { ok: boolean; notModified: boolean };
+
+export async function editMessageText(
+  chatId: string | number,
+  messageId: number,
+  text: string,
+  keyboard?: InlineKeyboard
+): Promise<EditResult> {
+  // Always send reply_markup explicitly: an empty inline_keyboard is what clears
+  // the buttons off a finished/cancelled entry.
+  const res = await callRaw("editMessageText", {
+    chat_id: chatId,
+    message_id: messageId,
+    text,
+    parse_mode: "HTML",
+    reply_markup: { inline_keyboard: keyboard ?? [] },
+  });
+  if (res.ok) return { ok: true, notModified: false };
+  return { ok: false, notModified: /message is not modified/i.test(res.description) };
 }
 
 export async function editMessageReplyMarkup(chatId: string | number, messageId: number, keyboard?: InlineKeyboard) {
