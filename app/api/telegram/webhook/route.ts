@@ -3,7 +3,7 @@ import type { Db } from "mongodb";
 import { getDb } from "@/lib/mongodb";
 import { resolveWorkflow } from "@/lib/workflow-resolver";
 import { renderCurrentStep, applyMessage, applyCallback, type EngineResult } from "@/lib/workflow-engine";
-import { sendMessage, answerCallbackQuery } from "@/lib/telegram";
+import { sendMessage, editMessageText, answerCallbackQuery, type InlineKeyboard } from "@/lib/telegram";
 import { recordGroupActivity } from "@/lib/telegram-health";
 import type { BotSession } from "@/lib/workflow-types";
 
@@ -50,32 +50,48 @@ function newSession(chatId: string, userId: string, name: string, resolved: { wo
   };
 }
 
+// Render into the session's single anchor message. The whole entry — every step,
+// nudge, and the terminal summary — lives in ONE chat message that gets edited in
+// place, so a multi-step entry never floods the group. Only the first step of an
+// entry sends; everything after edits.
+//
+// If the edit fails (message deleted, or older than Telegram's 48h edit window)
+// we send a fresh message and re-anchor to it, so the flow never dead-ends.
+async function render(session: BotSession, text: string, keyboard?: InlineKeyboard) {
+  if (session.lastMessageId) {
+    const res = await editMessageText(session.chatId, session.lastMessageId, text, keyboard);
+    if (res.ok || res.notModified) return;
+  }
+  const sent = await sendMessage(session.chatId, text, keyboard);
+  if (sent?.message_id) session.lastMessageId = sent.message_id;
+}
+
 // Deliver an engine result to the chat: next step, a nudge, or a terminal.
 async function deliver(db: Db, session: BotSession, result: EngineResult, callbackQueryId?: string) {
   if (result.notice) {
+    // A button tap that can't be honoured answers as a toast — the anchor message
+    // is still on screen and unchanged, so there's nothing to redraw.
     if (callbackQueryId) {
       await answerCallbackQuery(callbackQueryId, result.notice);
       return;
     }
     // A nudge triggered by a typed message (failed validation, wrong input for
-    // the step). Repeat the step with its keyboard underneath the reason, so the
-    // user can act on it without scrolling back to the original prompt.
-    const render = session.status === "active" ? await renderCurrentStep(db, session) : null;
-    const sent = render
-      ? await sendMessage(session.chatId, `${result.notice}\n\n${render.text}`, render.keyboard)
-      : await sendMessage(session.chatId, result.notice);
-    if (sent?.message_id) session.lastMessageId = sent.message_id;
+    // the step). Redraw the anchor with the reason above the step and its
+    // keyboard, so the user can act on it in place.
+    const step = session.status === "active" ? await renderCurrentStep(db, session) : null;
+    if (step) await render(session, `${result.notice}\n\n${step.text}`, step.keyboard);
+    else await render(session, result.notice);
     return;
   }
   if (callbackQueryId) await answerCallbackQuery(callbackQueryId);
   if (result.cancelled) {
     session.status = "cancelled";
-    await sendMessage(session.chatId, result.render?.text || "Entry cancelled.");
+    // Terminal: no keyboard, so the buttons clear off the finished entry.
+    await render(session, result.render?.text || "Entry cancelled.");
     return;
   }
   if (result.render) {
-    const sent = await sendMessage(session.chatId, result.render.text, result.render.keyboard);
-    if (sent?.message_id) session.lastMessageId = sent.message_id;
+    await render(session, result.render.text, result.render.keyboard);
   }
 }
 
@@ -153,6 +169,12 @@ export async function POST(req: NextRequest) {
       return ok();
     }
 
+    // Re-anchor to the message the button actually lives on. It is normally the
+    // session's anchor already, but this keeps the flow editing what the user is
+    // looking at even if the stored id drifted.
+    const tappedMessageId = callback.message?.message_id;
+    if (typeof tappedMessageId === "number") session.lastMessageId = tappedMessageId;
+
     const result = await applyCallback(db, session, data);
     session.processedUpdateIds = [...(session.processedUpdateIds ?? []), updateId].slice(-20);
     await deliver(db, session, result, callback.id);
@@ -193,11 +215,11 @@ export async function POST(req: NextRequest) {
       await saveSession(db, session);
       return ok();
     }
-    // Otherwise just render the first step.
+    // Otherwise just render the first step. No anchor exists yet, so this is the
+    // one send of the entry — every later step edits this message.
     session.processedUpdateIds = [updateId];
-    const render = await renderCurrentStep(db, session);
-    const sent = await sendMessage(chatId, render.text, render.keyboard);
-    if (sent?.message_id) session.lastMessageId = sent.message_id;
+    const first = await renderCurrentStep(db, session);
+    await render(session, first.text, first.keyboard);
     await saveSession(db, session);
     return ok();
   }
@@ -206,7 +228,7 @@ export async function POST(req: NextRequest) {
   if (text && /^\/cancel/i.test(text)) {
     session.status = "cancelled";
     session.processedUpdateIds = [...(session.processedUpdateIds ?? []), updateId].slice(-20);
-    await sendMessage(chatId, "Entry cancelled.");
+    await render(session, "Entry cancelled.");
     await saveSession(db, session);
     return ok();
   }

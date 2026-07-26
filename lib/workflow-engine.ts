@@ -190,10 +190,9 @@ export async function applyMessage(
     }
 
     default:
-      // Button-only step. A typed message can't answer it, so re-send the step
-      // with its keyboard rather than a bare nudge: in a busy group the original
-      // buttons have usually scrolled out of view, which is what prompts people
-      // to type in the first place.
+      // Button-only step. A typed message can't answer it, so re-render the step
+      // rather than emit a nudge: the webhook redraws the anchor message in place,
+      // which leaves the existing prompt and its buttons exactly as they are.
       return { render: await renderCurrentStep(db, session) };
   }
 }
