@@ -4,6 +4,7 @@ import { useEffect, useState } from "react";
 import PageShell from "@/components/page-shell";
 import { api } from "@/lib/api-client";
 import {
+  ErrorBanner,
   PageIntro,
   SearchInput,
   EmptyState,
@@ -77,6 +78,7 @@ export default function CategoriesPage() {
   const [subFormOpen, setSubFormOpen] = useState(false);
   const [subForm, setSubForm] = useState<SubForm>(EMPTY_SUB_FORM);
   const [subDelId, setSubDelId] = useState<string | null>(null);
+  const [loadError, setLoadError] = useState<string | null>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -85,6 +87,9 @@ export default function CategoriesPage() {
         if (cancelled) return;
         setCats(catData);
         setSubs(subData);
+      })
+      .catch((err: Error) => {
+        if (!cancelled) setLoadError(err.message);
       })
       .finally(() => {
         if (!cancelled) setLoading(false);
@@ -216,6 +221,8 @@ export default function CategoriesPage() {
           ＋ New Category
         </button>
       </div>
+
+      {loadError && <ErrorBanner message={loadError} />}
 
       <div style={{ display: "grid", gridTemplateColumns: "repeat(3,1fr)", gap: 16, marginBottom: 22 }}>
         <div style={{ background: "#fff", border: "1px solid #e9edf3", borderRadius: 13, padding: "18px 20px" }}>

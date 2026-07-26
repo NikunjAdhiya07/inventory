@@ -1,11 +1,12 @@
 import { NextRequest, NextResponse } from "next/server";
 import { getDb } from "@/lib/mongodb";
 import { toClientList } from "@/lib/serialize";
+import { withErrors } from "@/lib/api-error";
 
 // Filtering happens in the query itself (not fetch-all-then-filter-in-JS) so
 // the response stays small and Mongo does the work via the ts/user/dataType
 // indexes instead of the Node process scanning every row.
-export async function GET(req: NextRequest) {
+export const GET = withErrors(async (req: NextRequest) => {
   const { searchParams } = new URL(req.url);
   const dataType = searchParams.get("dataType");
   const user = searchParams.get("user");
@@ -31,4 +32,4 @@ export async function GET(req: NextRequest) {
   const docs = await db.collection("auditLog").find(filter).sort({ ts: -1 }).limit(limit).toArray();
   const total = await db.collection("auditLog").estimatedDocumentCount();
   return NextResponse.json({ rows: toClientList(docs), total });
-}
+});

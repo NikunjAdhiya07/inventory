@@ -4,6 +4,7 @@ import { useEffect, useState } from "react";
 import PageShell from "@/components/page-shell";
 import { api } from "@/lib/api-client";
 import {
+  ErrorBanner,
   PageIntro,
   SearchInput,
   EmptyState,
@@ -51,6 +52,7 @@ export default function SubcategoriesPage() {
 
   const [delOpen, setDelOpen] = useState(false);
   const [delId, setDelId] = useState<string | null>(null);
+  const [loadError, setLoadError] = useState<string | null>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -60,6 +62,9 @@ export default function SubcategoriesPage() {
         setSubs(subData);
         setCategories(catData);
         setForm((f) => (f.parent ? f : { ...f, parent: catData[0]?.name || "" }));
+      })
+      .catch((err: Error) => {
+        if (!cancelled) setLoadError(err.message);
       })
       .finally(() => {
         if (!cancelled) setLoading(false);
@@ -122,6 +127,8 @@ export default function SubcategoriesPage() {
           ＋ New Subcategory
         </button>
       </div>
+
+      {loadError && <ErrorBanner message={loadError} />}
 
       <section style={{ background: "#fff", border: "1px solid #e9edf3", borderRadius: 14, overflow: "hidden", boxShadow: "0 1px 2px rgba(16,30,54,.04)" }}>
         <div style={{ padding: "15px 18px", display: "flex", alignItems: "center", justifyContent: "space-between", gap: 16, borderBottom: "1px solid #f1f4f8" }}>

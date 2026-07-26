@@ -4,6 +4,7 @@ import { useEffect, useState } from "react";
 import PageShell from "@/components/page-shell";
 import { api } from "@/lib/api-client";
 import {
+  ErrorBanner,
   PageIntro,
   EmptyState,
   Modal,
@@ -59,22 +60,27 @@ export default function WorkflowsPage() {
   const [versionsWf, setVersionsWf] = useState<Workflow | null>(null);
   const [versions, setVersions] = useState<Version[]>([]);
   const [delId, setDelId] = useState<string | null>(null);
+  const [loadError, setLoadError] = useState<string | null>(null);
 
   useEffect(() => {
     let cancelled = false;
+    const onError = (err: Error) => {
+      if (!cancelled) setLoadError(err.message);
+    };
     Promise.all([api.get<Workflow[]>("/api/workflows"), api.get<StepLibEntry[]>("/api/step-library")])
       .then(([wf, sl]) => {
         if (cancelled) return;
         setWorkflows(wf);
         setLib(sl);
       })
+      .catch(onError)
       .finally(() => !cancelled && setLoading(false));
     // Reference data for dropdowns.
-    api.get<Named[]>("/api/categories").then((d) => !cancelled && setCategories(d));
-    api.get<Named[]>("/api/units").then((d) => !cancelled && setUnits(d));
-    api.get<Named[]>("/api/locations").then((d) => !cancelled && setLocations(d));
-    api.get<Named[]>("/api/roles").then((d) => !cancelled && setRoles(d));
-    api.get<Group[]>("/api/telegram-groups").then((d) => !cancelled && setGroups(d));
+    api.get<Named[]>("/api/categories").then((d) => !cancelled && setCategories(d), onError);
+    api.get<Named[]>("/api/units").then((d) => !cancelled && setUnits(d), onError);
+    api.get<Named[]>("/api/locations").then((d) => !cancelled && setLocations(d), onError);
+    api.get<Named[]>("/api/roles").then((d) => !cancelled && setRoles(d), onError);
+    api.get<Group[]>("/api/telegram-groups").then((d) => !cancelled && setGroups(d), onError);
     return () => {
       cancelled = true;
     };
@@ -203,6 +209,8 @@ export default function WorkflowsPage() {
           ＋ New Workflow
         </button>
       </div>
+
+      {loadError && <ErrorBanner message={loadError} />}
 
       <div style={{ display: "grid", gridTemplateColumns: "repeat(3,1fr)", gap: 16, marginBottom: 22 }}>
         <Stat label="Total Workflows" value={workflows.length} />

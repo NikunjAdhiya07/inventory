@@ -4,6 +4,7 @@ import { getDb } from "./mongodb";
 import { toClientList, toClient } from "./serialize";
 import { logAudit } from "./audit";
 import { softDelete } from "./recycle";
+import { withErrors } from "./api-error";
 
 function fieldPairs(doc: Document): [string, string][] {
   return Object.entries(doc)
@@ -53,7 +54,7 @@ export function createCrudHandlers(opts: CrudOptions) {
     return NextResponse.json(toClient(doc), { status: 201 });
   }
 
-  return { GET, POST };
+  return { GET: withErrors(GET), POST: withErrors(POST) };
 }
 
 export function createItemHandlers(opts: CrudOptions) {
@@ -98,5 +99,5 @@ export function createItemHandlers(opts: CrudOptions) {
     return NextResponse.json({ ok: true });
   }
 
-  return { PATCH, DELETE };
+  return { PATCH: withErrors(PATCH), DELETE: withErrors(DELETE) };
 }
