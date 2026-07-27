@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { ObjectId } from "mongodb";
 import { getDb } from "@/lib/mongodb";
+import { invalidateCollection } from "@/lib/cache";
 
 // POST = restore the entry back into its original collection.
 export async function POST(_req: NextRequest, ctx: { params: Promise<{ id: string }> }) {
@@ -10,6 +11,7 @@ export async function POST(_req: NextRequest, ctx: { params: Promise<{ id: strin
   if (!entry) return NextResponse.json({ error: "Not found" }, { status: 404 });
   await db.collection(entry.originalCollection).insertOne(entry.originalDoc);
   await db.collection("recycleBin").deleteOne({ _id: entry._id });
+  invalidateCollection(String(entry.originalCollection));
   return NextResponse.json({ ok: true });
 }
 

@@ -116,13 +116,13 @@ export async function recordGroupActivity(
 ) {
   try {
     const now = new Date().toISOString();
-    const group = await db.collection("telegramGroups").findOne({ chatId });
-    if (group) {
-      await db.collection("telegramGroups").updateOne(
-        { _id: group._id },
-        { $set: { lastSeenAt: now, botHealth: "healthy", lastError: null } }
-      );
-    }
+    // One round trip instead of a read followed by a write. `returnDocument:
+    // "before"` still gives us the title/id needed for the log line.
+    const group = await db.collection("telegramGroups").findOneAndUpdate(
+      { chatId },
+      { $set: { lastSeenAt: now, botHealth: "healthy", lastError: null } },
+      { returnDocument: "before", projection: { _id: 1, title: 1 } }
+    );
     await logTelegram(db, {
       groupId: group?._id?.toString() ?? null,
       chatId,

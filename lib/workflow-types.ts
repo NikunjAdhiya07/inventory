@@ -16,6 +16,9 @@ export type StepConfig = {
   dataSource?: string;
   filterByCategory?: boolean;
   requireImage?: boolean;
+  // location_tree: name of the node the step opens inside, so the common case is
+  // reachable in one tap. The other top-level nodes stay one tap away too.
+  defaultLocation?: string;
   placeholder?: string;
   approvalMode?: "single" | "multi";
   approverRole?: string;

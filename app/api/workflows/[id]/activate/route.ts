@@ -3,6 +3,7 @@ import { ObjectId } from "mongodb";
 import { getDb } from "@/lib/mongodb";
 import { toClient } from "@/lib/serialize";
 import { logAudit } from "@/lib/audit";
+import { invalidateCollection } from "@/lib/cache";
 import { writeSnapshot } from "@/lib/workflow-versions";
 
 // Activate a workflow (or re-activate after edits). Bumps the version, writes an
@@ -34,6 +35,9 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string
     { _id: new ObjectId(id) },
     { $set: { status: "Active", version: nextVersion, isDefault: setDefault, updatedAt: new Date().toISOString() } }
   );
+
+  // New active version — every group's cached workflow resolution is now stale.
+  invalidateCollection("workflows");
 
   await logAudit({
     action: "Edited",

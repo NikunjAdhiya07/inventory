@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { ObjectId } from "mongodb";
 import { getDb } from "@/lib/mongodb";
 import { toClient, toClientList } from "@/lib/serialize";
+import { invalidateCollection } from "@/lib/cache";
 
 // Assignment edges for a workflow: which Telegram groups and/or categories it
 // applies to. GET lists them; POST creates one; DELETE (?assignmentId=) removes.
@@ -27,6 +28,7 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string
   };
   const db = await getDb();
   const result = await db.collection("workflowAssignments").insertOne(doc);
+  invalidateCollection("workflowAssignments");
   return NextResponse.json(toClient({ _id: result.insertedId, ...doc }), { status: 201 });
 }
 
@@ -36,5 +38,6 @@ export async function DELETE(req: NextRequest, ctx: { params: Promise<{ id: stri
   if (!assignmentId) return NextResponse.json({ error: "assignmentId required" }, { status: 400 });
   const db = await getDb();
   await db.collection("workflowAssignments").deleteOne({ _id: new ObjectId(assignmentId), workflowId: id });
+  invalidateCollection("workflowAssignments");
   return NextResponse.json({ ok: true });
 }

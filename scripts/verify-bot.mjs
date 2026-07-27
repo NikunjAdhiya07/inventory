@@ -144,18 +144,92 @@ async function main() {
   s = await session(CHAT_MAIN);
   check("5. subcategory chosen → location step", s?.stepIndex === 3, `stepIndex=${s?.stepIndex}`);
 
-  // 6. Location tree: drill in, Back climbs one level (stays in step), then select.
-  await cb(CHAT_MAIN, USER_ID, "loc:0");
-  s = await session(CHAT_MAIN);
-  check("6. location drill sets cursor", s?.locationCursor?.currentParent != null, `cur=${s?.locationCursor?.currentParent}`);
-  await cb(CHAT_MAIN, USER_ID, "cb:back");
-  s = await session(CHAT_MAIN);
-  check("6. Back in tree climbs a level (still in location step)", s?.stepIndex === 3 && s?.locationCursor?.currentParent == null, `stepIndex=${s?.stepIndex} cur=${s?.locationCursor?.currentParent}`);
-  await cb(CHAT_MAIN, USER_ID, "loc:0");
-  await cb(CHAT_MAIN, USER_ID, "locsel");
+  // 6. Location tree.
+  //
+  // The step opens INSIDE its configured `defaultLocation` (so the common case is
+  // one tap), the other top-level nodes are offered alongside that node's
+  // children as an escape, and a node with no children selects on tap instead of
+  // opening an empty level. Everything below is derived from the data so the
+  // checks hold whatever the tree currently looks like.
+  const activeLocs = await db.collection("locations").find({ status: "Active" }).sort({ name: 1 }).toArray();
+  const childrenOf = (pid) => activeLocs.filter((l) => String(l.parent ?? "") === String(pid ?? ""));
+  const rootLocs = activeLocs.filter((l) => (l.parent ?? null) === null);
+  const hasKids = (l) => childrenOf(l._id.toString()).length > 0;
+
   s = await session(CHAT_MAIN);
   const locStepId = s?.steps?.[3]?.instanceId;
-  check("6. location selected → quantity step", s?.stepIndex === 4, `stepIndex=${s?.stepIndex}`);
+  const defName = s?.steps?.[3]?.config?.defaultLocation;
+  const defNode = defName ? rootLocs.find((l) => String(l.name) === String(defName)) : null;
+
+  if (defNode) {
+    check(
+      "6. location step opens inside its default node",
+      s?.locationCursor?.currentParent === defNode._id.toString(),
+      `default=${defName} cursor=${s?.locationCursor?.currentParent}`
+    );
+
+    // Landing view = children of the default node, then the other roots.
+    const defKids = childrenOf(defNode._id.toString());
+    const otherRoots = rootLocs.filter((l) => l._id.toString() !== defNode._id.toString());
+    check("6. landing view offers the default node's children", defKids.length > 0, `${defKids.length} children`);
+
+    if (otherRoots.length) {
+      // Tapping a sibling root must jump cleanly, not nest under the default.
+      await cb(CHAT_MAIN, USER_ID, `loc:${defKids.length}`);
+      s = await session(CHAT_MAIN);
+      check(
+        "6. sibling root reachable from the landing view",
+        s?.locationCursor?.currentParent === otherRoots[0]._id.toString() && s?.locationCursor?.parentStack?.length === 0,
+        `cursor=${s?.locationCursor?.currentParent} stack=${s?.locationCursor?.parentStack?.length}`
+      );
+
+      // Back from there returns to the top level, still inside the step.
+      await cb(CHAT_MAIN, USER_ID, "cb:back");
+      s = await session(CHAT_MAIN);
+      check(
+        "6. Back from a sibling root returns to top level (still in step)",
+        s?.stepIndex === 3 && s?.locationCursor?.currentParent == null,
+        `stepIndex=${s?.stepIndex} cur=${s?.locationCursor?.currentParent}`
+      );
+
+      // Re-enter the default node from the top level to continue.
+      const defIdxAtRoot = rootLocs.findIndex((l) => l._id.toString() === defNode._id.toString());
+      await cb(CHAT_MAIN, USER_ID, `loc:${defIdxAtRoot}`);
+      s = await session(CHAT_MAIN);
+    }
+
+    // A childless child selects on tap and advances — no separate confirm.
+    const leafIdx = defKids.findIndex((l) => !hasKids(l));
+    if (leafIdx >= 0) {
+      const leaf = defKids[leafIdx];
+      await cb(CHAT_MAIN, USER_ID, `loc:${leafIdx}`);
+      s = await session(CHAT_MAIN);
+      check("6. tapping a leaf selects it and advances", s?.stepIndex === 4, `stepIndex=${s?.stepIndex}`);
+      check(
+        "6. selected path includes the full ancestry",
+        s?.answers?.[locStepId]?.display === `${defNode.name} › ${leaf.name}`,
+        s?.answers?.[locStepId]?.display
+      );
+    } else {
+      // Default node has only branch children — drill then confirm.
+      await cb(CHAT_MAIN, USER_ID, "loc:0");
+      await cb(CHAT_MAIN, USER_ID, "locsel");
+      s = await session(CHAT_MAIN);
+      check("6. location selected → quantity step", s?.stepIndex === 4, `stepIndex=${s?.stepIndex}`);
+    }
+  } else {
+    // No default configured: classic drill-down from the root.
+    await cb(CHAT_MAIN, USER_ID, "loc:0");
+    s = await session(CHAT_MAIN);
+    check("6. location drill sets cursor", s?.locationCursor?.currentParent != null, `cur=${s?.locationCursor?.currentParent}`);
+    await cb(CHAT_MAIN, USER_ID, "cb:back");
+    s = await session(CHAT_MAIN);
+    check("6. Back in tree climbs a level (still in location step)", s?.stepIndex === 3 && s?.locationCursor?.currentParent == null, `stepIndex=${s?.stepIndex} cur=${s?.locationCursor?.currentParent}`);
+    await cb(CHAT_MAIN, USER_ID, "loc:0");
+    await cb(CHAT_MAIN, USER_ID, "locsel");
+    s = await session(CHAT_MAIN);
+    check("6. location selected → quantity step", s?.stepIndex === 4, `stepIndex=${s?.stepIndex}`);
+  }
   check("6. location path stored", !!s?.answers?.[locStepId]?.display, s?.answers?.[locStepId]?.display);
 
   // 7. Quantity: invalid input rejected, valid input accepted.

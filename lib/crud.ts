@@ -3,6 +3,7 @@ import { ObjectId, type Document } from "mongodb";
 import { getDb } from "./mongodb";
 import { toClientList, toClient } from "./serialize";
 import { logAudit } from "./audit";
+import { invalidateCollection } from "./cache";
 import { softDelete } from "./recycle";
 import { withErrors } from "./api-error";
 
@@ -40,6 +41,7 @@ export function createCrudHandlers(opts: CrudOptions) {
     const body = await req.json();
     const db = await getDb();
     const result = await db.collection(opts.collection).insertOne(body);
+    invalidateCollection(opts.collection);
     const doc = { _id: result.insertedId, ...body };
     await logAudit({
       action: "Created",
@@ -65,6 +67,7 @@ export function createItemHandlers(opts: CrudOptions) {
     const before = await db.collection(opts.collection).findOne({ _id: new ObjectId(id) });
     if (!before) return NextResponse.json({ error: "Not found" }, { status: 404 });
     await db.collection(opts.collection).updateOne({ _id: new ObjectId(id) }, { $set: patch });
+    invalidateCollection(opts.collection);
     const after = { ...before, ...patch };
     await logAudit({
       action: "Edited",
@@ -86,6 +89,7 @@ export function createItemHandlers(opts: CrudOptions) {
     if (!doc) return NextResponse.json({ error: "Not found" }, { status: 404 });
     const name = opts.entityName(doc);
     await softDelete(opts.collection, opts.recycleType || opts.dataType, doc, name, opts.recycleDetail ? opts.recycleDetail(doc) : "");
+    invalidateCollection(opts.collection);
     await logAudit({
       action: "Deleted",
       dataType: opts.dataType,
