@@ -20,6 +20,28 @@ You can start editing the page by modifying `app/page.tsx`. The page auto-update
 
 This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
 
+## Bot response time
+
+The Telegram webhook (`app/api/telegram/webhook/route.ts`) is the latency-critical
+path — every millisecond there is time a user spends staring at a spinner. Things
+to keep in mind when changing it:
+
+- **Master data is cached** (`lib/cache.ts`, 30s TTL, override with `CACHE_TTL_MS`).
+  Categories, subcategories, units, locations, role permissions and the resolved
+  workflow are read once and reused. Console writes call `invalidateCollection()`
+  so edits show up immediately on that instance; other instances converge within
+  the TTL. **If you add a new write path for any of those collections, invalidate
+  it too.**
+- **Bookkeeping goes through `defer()`** (`lib/defer.ts`), which runs work after
+  the response via Next's `after()`. Audit rows, the group activity log and index
+  creation must never sit in front of the bot's reply.
+- **Deployment region matters most.** The Atlas cluster is in Mumbai
+  (`ap-south-1`), so `vercel.json` pins functions to `bom1`. Vercel otherwise
+  defaults to US East, which adds ~200ms to *every* database round trip.
+  If the cluster moves, change the region to match it.
+- **Indexes are created by `npm run ensure-indexes`**, not lazily per request.
+  Run it after a deploy that adds one.
+
 ## Learn More
 
 To learn more about Next.js, take a look at the following resources:

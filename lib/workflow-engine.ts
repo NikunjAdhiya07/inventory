@@ -1,6 +1,7 @@
-import type { Db, Document } from "mongodb";
-import { ObjectId } from "mongodb";
+import type { Db } from "mongodb";
 import { logAudit } from "./audit";
+import { cached } from "./cache";
+import { defer } from "./defer";
 import { buttonRows, type InlineKeyboard } from "./telegram";
 import type { BotSession, StepInstance } from "./workflow-types";
 
@@ -14,27 +15,99 @@ export type EngineResult = {
 
 // ---------------------------------------------------------------------------
 // Master-data readers (deterministic ordering so callback indices are stable)
+//
+// Each collection is read whole, ONCE, and cached; the per-parent slices are then
+// filtered in memory. `Array.filter` is stable, so a filtered slice is in exactly
+// the order Mongo returned — the callback indices these lists produce are
+// identical to what the per-parent queries used to give.
 // ---------------------------------------------------------------------------
 async function activeCategories(db: Db) {
-  return db.collection("categories").find({ status: "Active" }).sort({ order: 1, name: 1 }).toArray();
+  return cached("categories:active", () =>
+    db.collection("categories").find({ status: "Active" }).sort({ order: 1, name: 1 }).toArray()
+  );
 }
+
 async function activeSubcategories(db: Db, parentName?: string) {
-  const q: Document = { status: "Active" };
-  if (parentName) q.parent = parentName;
-  return db.collection("subcategories").find(q).sort({ order: 1, name: 1 }).toArray();
+  const all = await cached("subcategories:active", () =>
+    db.collection("subcategories").find({ status: "Active" }).sort({ order: 1, name: 1 }).toArray()
+  );
+  return parentName ? all.filter((s) => s.parent === parentName) : all;
 }
+
 async function activeUnits(db: Db) {
-  return db.collection("units").find({ status: "Active" }).sort({ name: 1 }).toArray();
+  return cached("units:active", () =>
+    db.collection("units").find({ status: "Active" }).sort({ name: 1 }).toArray()
+  );
 }
+
+// The whole active location tree in one query. It backs both child listings and
+// id lookups, so walking a path costs no round trips at all — it used to cost one
+// per level.
+async function activeLocations(db: Db) {
+  return cached("locations:active", () =>
+    db.collection("locations").find({ status: "Active" }).sort({ name: 1 }).toArray()
+  );
+}
+
 async function locationChildren(db: Db, parent: string | null) {
-  return db.collection("locations").find({ parent, status: "Active" }).sort({ name: 1 }).toArray();
+  const all = await activeLocations(db);
+  // Mongo's `{ parent: null }` matches a missing field too, so normalise here.
+  return all.filter((l) => (l.parent ?? null) === parent);
 }
-async function locationById(db: Db, id: string) {
-  try {
-    return await db.collection("locations").findOne({ _id: new ObjectId(id) });
-  } catch {
-    return null;
+
+async function locationsById(db: Db) {
+  const all = await activeLocations(db);
+  return new Map(all.map((l) => [l._id.toString(), l]));
+}
+
+// Ids that have at least one active child. Drives both the button icon and the
+// decision to select-on-tap, without a query per option.
+async function locationParentIds(db: Db): Promise<Set<string>> {
+  const all = await activeLocations(db);
+  const ids = new Set<string>();
+  for (const l of all) if (l.parent) ids.add(String(l.parent));
+  return ids;
+}
+
+// The node a location step opens inside, from `config.defaultLocation` (a name).
+async function defaultLocationNode(db: Db, step: StepInstance) {
+  const name = step.config.defaultLocation;
+  if (!name) return null;
+  const all = await activeLocations(db);
+  return all.find((l) => String(l.name) === String(name)) ?? null;
+}
+
+// The buttons offered for the current position in the tree — the single source
+// of truth for both rendering and resolving a `loc:<i>` tap, so the indices can
+// never disagree between the two.
+//
+// On the landing view (inside the default node, nothing drilled yet) the other
+// top-level nodes are appended, so "Others" is reachable without first backing
+// out to the root.
+async function locationOptions(db: Db, session: BotSession, step: StepInstance) {
+  const { currentParent, parentStack } = session.locationCursor;
+  const children = await locationChildren(db, currentParent);
+  if (!currentParent || parentStack.length) return children;
+
+  const fallback = await defaultLocationNode(db, step);
+  if (!fallback || fallback._id.toString() !== currentParent) return children;
+
+  const roots = await locationChildren(db, null);
+  return [...children, ...roots.filter((r) => r._id.toString() !== currentParent)];
+}
+
+// Full path of a node, walked up through its parents. Independent of how the
+// cursor arrived there, so it stays correct after a jump between branches.
+async function locationPathById(db: Db, id: string): Promise<string> {
+  const byId = await locationsById(db);
+  const names: string[] = [];
+  let node = byId.get(id);
+  // Guard against a cycle in the stored parent pointers.
+  for (let hops = 0; node && hops < 20; hops++) {
+    names.unshift(String(node.name));
+    node = node.parent ? byId.get(String(node.parent)) : undefined;
   }
+  return names.join(" › ");
 }
 
 // ---------------------------------------------------------------------------
@@ -87,13 +160,21 @@ export async function renderCurrentStep(db: Db, session: BotSession): Promise<Re
     }
 
     case "location_tree": {
-      const children = await locationChildren(db, session.locationCursor.currentParent);
-      const btns = children.map((c, i) => ({ text: `📁 ${c.name}`, callback_data: `loc:${i}` }));
+      const cursor = session.locationCursor.currentParent;
+      const [options, parents, here] = await Promise.all([
+        locationOptions(db, session, step),
+        locationParentIds(db),
+        cursor ? locationPathById(db, cursor) : Promise.resolve(""),
+      ]);
+      // 📁 drills in, 📍 selects on tap — the icon tells the user which it is.
+      const btns = options.map((c, i) => ({
+        text: `${parents.has(c._id.toString()) ? "📁" : "📍"} ${c.name}`,
+        callback_data: `loc:${i}`,
+      }));
       const rows: InlineKeyboard = buttonRows(btns, 2);
-      if (session.locationCursor.currentParent !== null) {
+      if (cursor !== null) {
         rows.push([{ text: "✔ Select this location", callback_data: "locsel" }]);
       }
-      const here = await locationPathText(db, session);
       const text = here ? `${label}\n<i>Current: ${here}</i>` : label;
       return { text, keyboard: [...rows, ...navRow(session)] };
     }
@@ -126,18 +207,6 @@ export async function renderCurrentStep(db: Db, session: BotSession): Promise<Re
     default:
       return { text: label, keyboard: navRow(session) };
   }
-}
-
-// The tree path for the location cursor's current node, e.g. "Ground Floor › Aisle A".
-async function locationPathText(db: Db, session: BotSession): Promise<string> {
-  const ids = [...session.locationCursor.parentStack];
-  if (session.locationCursor.currentParent) ids.push(session.locationCursor.currentParent);
-  const names: string[] = [];
-  for (const id of ids) {
-    const loc = await locationById(db, id);
-    if (loc) names.push(String(loc.name));
-  }
-  return names.join(" › ");
 }
 
 // ---------------------------------------------------------------------------
@@ -201,7 +270,13 @@ export async function applyCallback(db: Db, session: BotSession, data: string): 
   const step = currentStep(session);
   if (!step) return { finished: true };
 
-  if (data === "cb:cancel") return { cancelled: true };
+  // Status is set here rather than in the webhook's delivery step so that the
+  // session snapshot is final before it is written — the write now runs
+  // concurrently with the Telegram call.
+  if (data === "cb:cancel") {
+    session.status = "cancelled";
+    return { cancelled: true };
+  }
   if (data === "cb:back") return goBack(db, session);
   if (data === "cb:skip") {
     if (step.required) return { notice: "This step is required." };
@@ -239,16 +314,28 @@ export async function applyCallback(db: Db, session: BotSession, data: string): 
       if (data === "locsel") {
         const chosen = session.locationCursor.currentParent;
         if (!chosen) return { notice: "Drill into a location first." };
-        const path = await locationPathText(db, session);
-        session.answers[step.instanceId] = { type: "location_tree", value: chosen, display: path };
-        return advance(db, session);
+        return selectLocation(db, session, step, chosen);
       }
-      // Navigate into a child node.
-      const children = await locationChildren(db, session.locationCursor.currentParent);
-      const child = children[indexOf(data, "loc:")];
-      if (!child) return { notice: "That location is no longer available." };
-      if (session.locationCursor.currentParent) session.locationCursor.parentStack.push(session.locationCursor.currentParent);
-      session.locationCursor.currentParent = child._id.toString();
+
+      const options = await locationOptions(db, session, step);
+      const chosen = options[indexOf(data, "loc:")];
+      if (!chosen) return { notice: "That location is no longer available." };
+
+      const chosenId = chosen._id.toString();
+      const parents = await locationParentIds(db);
+      // A node with nothing under it can only ever be the answer, so tapping it
+      // selects rather than opening an empty level the user has to confirm.
+      if (!parents.has(chosenId)) return selectLocation(db, session, step, chosenId);
+
+      const cursor = session.locationCursor;
+      if ((chosen.parent ?? null) === cursor.currentParent) {
+        if (cursor.currentParent) cursor.parentStack.push(cursor.currentParent);
+      } else {
+        // Jumped out of the current branch — this is the landing view's escape to
+        // a different top-level node, so the old trail no longer applies.
+        cursor.parentStack = [];
+      }
+      cursor.currentParent = chosenId;
       return { render: await renderCurrentStep(db, session) };
     }
 
@@ -282,15 +369,44 @@ function indexOf(data: string, prefix: string): number {
   return parseInt(data.slice(prefix.length), 10);
 }
 
+// Record a chosen location and move on. Used by both a tap on a leaf and the
+// explicit "Select this location" on a branch.
+async function selectLocation(db: Db, session: BotSession, step: StepInstance, id: string): Promise<EngineResult> {
+  session.answers[step.instanceId] = {
+    type: "location_tree",
+    value: id,
+    display: await locationPathById(db, id),
+  };
+  return advance(db, session);
+}
+
+// Position the location cursor for a step that is about to be shown. A step
+// configured with a default node opens inside it, so the common case costs one
+// tap instead of two; everything else starts at the root as before.
+//
+// Exported so a session whose FIRST step is a location step is primed too — the
+// engine's own entry points (advance/goBack) cover every later step.
+export async function primeLocationCursor(db: Db, session: BotSession) {
+  session.locationCursor = { parentStack: [], currentParent: null };
+  const step = currentStep(session);
+  if (step?.type !== "location_tree") return;
+  const node = await defaultLocationNode(db, step);
+  if (node) session.locationCursor.currentParent = node._id.toString();
+}
+
 // ---------------------------------------------------------------------------
 // State transitions
 // ---------------------------------------------------------------------------
 async function advance(db: Db, session: BotSession): Promise<EngineResult> {
   session.stepIndex += 1;
-  // Reset the location cursor whenever we enter/leave a step.
-  session.locationCursor = { parentStack: [], currentParent: null };
 
-  if (session.stepIndex >= session.steps.length) return finalize(db, session);
+  if (session.stepIndex >= session.steps.length) {
+    session.locationCursor = { parentStack: [], currentParent: null };
+    return finalize(db, session);
+  }
+
+  // Reset the location cursor whenever we enter/leave a step.
+  await primeLocationCursor(db, session);
 
   const next = currentStep(session);
   if (next.type === "approval") {
@@ -310,7 +426,8 @@ async function goBack(db: Db, session: BotSession): Promise<EngineResult> {
   if (session.stepIndex === 0) return { notice: "You're at the first step." };
 
   session.stepIndex -= 1;
-  session.locationCursor = { parentStack: [], currentParent: null };
+  // Stepping back INTO a location step lands on its default view too.
+  await primeLocationCursor(db, session);
   session.status = "active";
   // Prior answers are intentionally preserved so nothing already entered is lost.
   return { render: await renderCurrentStep(db, session) };
@@ -349,25 +466,30 @@ async function finalize(db: Db, session: BotSession): Promise<EngineResult> {
     createdAt: new Date().toISOString(),
   };
 
+  // The entry write stays awaited — "Inventory Successfully Added" must not be
+  // sent before the row is durable. The audit row is bookkeeping, so it moves
+  // behind the response instead of adding a second round trip to the wait.
   await db.collection("inventoryEntries").insertOne(entry);
   session.status = "completed";
-  await logAudit(
-    {
-      action: "Created",
-      dataType: "Inventory Entry",
-      entity: entry.fields.itemName || "(unnamed item)",
-      field: "New entry",
-      before: "—",
-      after: entry.fields.itemName || "(unnamed item)",
-      beforeFields: [["Item", "—"]],
-      afterFields: [
-        ["Item", entry.fields.itemName || "—"],
-        ["Category", String(entry.fields.category)],
-        ["Location", String(entry.fields.locationPath)],
-        ["Quantity", `${entry.fields.quantity} ${entry.fields.unit}`],
-      ],
-    },
-    session.submittedByName
+  defer(() =>
+    logAudit(
+      {
+        action: "Created",
+        dataType: "Inventory Entry",
+        entity: entry.fields.itemName || "(unnamed item)",
+        field: "New entry",
+        before: "—",
+        after: entry.fields.itemName || "(unnamed item)",
+        beforeFields: [["Item", "—"]],
+        afterFields: [
+          ["Item", entry.fields.itemName || "—"],
+          ["Category", String(entry.fields.category)],
+          ["Location", String(entry.fields.locationPath)],
+          ["Quantity", `${entry.fields.quantity} ${entry.fields.unit}`],
+        ],
+      },
+      session.submittedByName
+    )
   );
 
   return {

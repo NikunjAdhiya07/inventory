@@ -9,7 +9,9 @@
     "lint": "eslint",
     "seed": "node scripts/seed.mjs",
     "seed:real": "node scripts/seed-real-data.mjs",
-    "seed:workflows": "node scripts/seed-workflows.mjs"
+    "seed:workflows": "node scripts/seed-workflows.mjs",
+    "ensure-indexes": "node scripts/ensure-indexes.mjs",
+    "migrate:locations": "node scripts/migrate-locations-canteen.mjs"
   },
   "dependencies": {
     "dotenv": "^17.4.2",

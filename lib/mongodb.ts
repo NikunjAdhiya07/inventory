@@ -1,4 +1,4 @@
-import { MongoClient, type Db } from "mongodb";
+import { MongoClient, type Db, type Document } from "mongodb";
 
 const uri = process.env.MONGODB_URI;
 const dbName = process.env.MONGODB_DB || "inventory";
@@ -24,6 +24,10 @@ function createClient() {
     // unreachable cluster shows up as a hung request rather than a readable
     // error. Fail inside the function's budget so the reason reaches the logs.
     serverSelectionTimeoutMS: 8000,
+    // Every query this app issues is a small indexed lookup, so anything still
+    // outstanding after 10s is a dead socket, not slow work. Without this the
+    // driver waits out the whole function budget on a half-open connection.
+    socketTimeoutMS: 10000,
   });
   return client.connect();
 }
@@ -44,45 +48,57 @@ function getClient(): Promise<MongoClient> {
   return promise;
 }
 
+// One `createIndexes` command per collection rather than one per index: same
+// result, a third of the round trips.
+const INDEX_SPECS: Record<string, { key: Document; unique?: boolean }[]> = {
+  categories: [{ key: { order: 1 } }],
+  subcategories: [{ key: { parent: 1 } }],
+  locations: [{ key: { parent: 1 } }],
+  statuses: [{ key: { order: 1 } }],
+  colors: [{ key: { group: 1 } }],
+  users: [{ key: { tgId: 1 }, unique: true }],
+  apiKeys: [{ key: { name: 1 } }],
+  auditLog: [{ key: { ts: -1 } }],
+  recycleBin: [{ key: { deletedAt: -1 } }],
+  importJobs: [{ key: { when: -1 } }],
+  // Workflow builder + Telegram bot engine collections.
+  stepLibrary: [{ key: { order: 1 } }],
+  workflows: [{ key: { status: 1 } }, { key: { isDefault: 1 } }],
+  workflowVersions: [{ key: { workflowId: 1, version: 1 }, unique: true }],
+  telegramGroups: [{ key: { chatId: 1 }, unique: true }],
+  telegramLogs: [{ key: { ts: -1 } }, { key: { chatId: 1, ts: -1 } }],
+  workflowAssignments: [{ key: { chatId: 1 } }, { key: { category: 1 } }],
+  // The bot's session lookup runs on every single update, filtered by all three
+  // fields — a compound index makes it a single index hit.
+  botSessions: [{ key: { chatId: 1, userId: 1, status: 1 } }, { key: { status: 1 } }],
+  inventoryEntries: [{ key: { createdAt: -1 } }],
+};
+
+export async function ensureIndexes(db?: Db): Promise<void> {
+  const target = db ?? (await getClient()).db(dbName);
+  await Promise.all(
+    Object.entries(INDEX_SPECS).map(([collection, specs]) =>
+      target.collection(collection).createIndexes(specs as never)
+    )
+  );
+}
+
 let indexesEnsured: Promise<void> | null = null;
 
-async function ensureIndexes(db: Db) {
-  await Promise.all([
-    db.collection("categories").createIndex({ order: 1 }),
-    db.collection("subcategories").createIndex({ parent: 1 }),
-    db.collection("locations").createIndex({ parent: 1 }),
-    db.collection("statuses").createIndex({ order: 1 }),
-    db.collection("colors").createIndex({ group: 1 }),
-    db.collection("users").createIndex({ tgId: 1 }, { unique: true }),
-    db.collection("apiKeys").createIndex({ name: 1 }),
-    db.collection("auditLog").createIndex({ ts: -1 }),
-    db.collection("recycleBin").createIndex({ deletedAt: -1 }),
-    db.collection("importJobs").createIndex({ when: -1 }),
-    // Workflow builder + Telegram bot engine collections.
-    db.collection("stepLibrary").createIndex({ order: 1 }),
-    db.collection("workflows").createIndex({ status: 1 }),
-    db.collection("workflows").createIndex({ isDefault: 1 }),
-    db.collection("workflowVersions").createIndex({ workflowId: 1, version: 1 }, { unique: true }),
-    db.collection("telegramGroups").createIndex({ chatId: 1 }, { unique: true }),
-    db.collection("telegramLogs").createIndex({ ts: -1 }),
-    db.collection("telegramLogs").createIndex({ chatId: 1, ts: -1 }),
-    db.collection("workflowAssignments").createIndex({ chatId: 1 }),
-    db.collection("workflowAssignments").createIndex({ category: 1 }),
-    db.collection("botSessions").createIndex({ chatId: 1, userId: 1 }),
-    db.collection("botSessions").createIndex({ status: 1 }),
-    db.collection("inventoryEntries").createIndex({ createdAt: -1 }),
-  ]);
+// Idempotent, once per process. Callers schedule this OFF the request path (see
+// `defer`) — firing 18 index commands into a 10-connection pool while a user is
+// waiting on their reply is exactly the cold-start stall it used to cause.
+export function ensureIndexesOnce(db: Db): Promise<void> {
+  if (!indexesEnsured) {
+    indexesEnsured = ensureIndexes(db).catch((err) => {
+      console.error("[mongodb] ensureIndexes failed:", err);
+      indexesEnsured = null;
+    });
+  }
+  return indexesEnsured;
 }
 
 export async function getDb(): Promise<Db> {
   const client = await getClient();
-  const db = client.db(dbName);
-  // Index creation is idempotent and cheap once created; only ever run it once
-  // per server process instead of on every request.
-  if (!indexesEnsured) {
-    indexesEnsured = ensureIndexes(db).catch(() => {
-      indexesEnsured = null;
-    });
-  }
-  return db;
+  return client.db(dbName);
 }

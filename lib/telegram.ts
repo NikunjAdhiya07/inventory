@@ -7,6 +7,7 @@
 
 const TOKEN = process.env.TELEGRAM_BOT_TOKEN || "";
 const API = `https://api.telegram.org/bot${TOKEN}`;
+const TELEGRAM_TIMEOUT_MS = Number(process.env.TELEGRAM_TIMEOUT_MS) || 6000;
 
 export type InlineButton = { text: string; callback_data: string };
 export type InlineKeyboard = InlineButton[][];
@@ -25,6 +26,10 @@ async function callRaw<T = unknown>(method: string, payload: Record<string, unkn
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
+      // Without a timeout a stalled Telegram connection holds the whole function
+      // until the platform kills it, and the user sees nothing at all. Failing at
+      // 6s lets `render` fall back to a fresh send instead.
+      signal: AbortSignal.timeout(TELEGRAM_TIMEOUT_MS),
     });
     const data = await res.json();
     if (!data.ok) {
