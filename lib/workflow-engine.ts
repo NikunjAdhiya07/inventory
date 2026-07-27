@@ -123,6 +123,55 @@ function canGoBack(session: BotSession): boolean {
   return session.stepIndex > 0;
 }
 
+// ---------------------------------------------------------------------------
+// Number keypad
+//
+// Numbers are entered on an inline keypad rather than by typing a message.
+// Telegram gives bots no native numeric input dialog, and a typed answer is a
+// second chat message — which is exactly what the single-anchor-message design
+// exists to avoid. Taps are callbacks, so every digit edits the anchor in place
+// and the group sees one message for the whole entry.
+// ---------------------------------------------------------------------------
+function numberPadText(step: StepInstance, draft: string): string {
+  const label = step.label || step.type;
+  const min = Number(step.config.numberMin) || 0;
+  const max = Number(step.config.numberMax) || 0;
+  const hint = min && max ? `Allowed: ${min}–${max}` : min ? `Minimum: ${min}` : max ? `Maximum: ${max}` : "";
+  // The draft is echoed so the user can see what they've keyed before committing.
+  return `${label}\n\n<b>${draft || "—"}</b>${hint ? `\n<i>${hint}</i>` : ""}`;
+}
+
+function numberPad(session: BotSession): InlineKeyboard {
+  const key = (d: string) => ({ text: d, callback_data: `num:${d}` });
+  return [
+    ["1", "2", "3"].map(key),
+    ["4", "5", "6"].map(key),
+    ["7", "8", "9"].map(key),
+    // The decimal point keeps fractional quantities (1.5 kg) enterable — typing
+    // used to allow them, so the keypad has to as well.
+    [key("."), key("0"), { text: "⌫", callback_data: "num:del" }],
+    [{ text: "✔ Done", callback_data: "num:ok" }],
+    ...navRow(session),
+  ];
+}
+
+// Validate and record a number answer. The keypad's Done key is the only caller
+// today, but bounds checking lives here rather than inline so there is exactly
+// one definition of what counts as a valid answer for a number step.
+async function commitNumber(db: Db, session: BotSession, step: StepInstance, raw: string): Promise<EngineResult> {
+  const text = raw.trim();
+  if (!text) return { notice: "Enter a number first." };
+  const n = Number(text);
+  if (!Number.isFinite(n)) return { notice: "That isn't a valid number." };
+  const min = Number(step.config.numberMin) || 0;
+  const max = Number(step.config.numberMax) || 0;
+  if (min && n < min) return { notice: `Must be at least ${min}.` };
+  if (max && n > max) return { notice: `Must be at most ${max}.` };
+  session.answers[step.instanceId] = { type: step.type, value: n, display: String(n) };
+  session.numberDraft = "";
+  return advance(db, session);
+}
+
 // Standard footer: [Back?] [Skip?] [Cancel]
 function navRow(session: BotSession): InlineKeyboard {
   const step = currentStep(session);
@@ -181,7 +230,7 @@ export async function renderCurrentStep(db: Db, session: BotSession): Promise<Re
 
     case "quantity":
     case "custom_number":
-      return { text: `${label}\n<i>Send a number.</i>`, keyboard: navRow(session) };
+      return { text: numberPadText(step, session.numberDraft ?? ""), keyboard: numberPad(session) };
 
     case "unit_select": {
       const units = await activeUnits(db);
@@ -239,18 +288,6 @@ export async function applyMessage(
       return advance(db, session);
     }
 
-    case "quantity":
-    case "custom_number": {
-      const n = Number((input.text ?? "").trim());
-      if (!Number.isFinite(n)) return { notice: "Please send a valid number." };
-      const min = Number(step.config.numberMin) || 0;
-      const max = Number(step.config.numberMax) || 0;
-      if (min && n < min) return { notice: `Must be at least ${min}.` };
-      if (max && n > max) return { notice: `Must be at most ${max}.` };
-      session.answers[step.instanceId] = { type: step.type, value: n, display: String(n) };
-      return advance(db, session);
-    }
-
     case "custom_text": {
       const t = (input.text ?? "").trim();
       if (!t) return { notice: "Please send some text." };
@@ -259,9 +296,10 @@ export async function applyMessage(
     }
 
     default:
-      // Button-only step. A typed message can't answer it, so re-render the step
-      // rather than emit a nudge: the webhook redraws the anchor message in place,
-      // which leaves the existing prompt and its buttons exactly as they are.
+      // Button-only step — number steps included, now that they are keypad-driven.
+      // A typed message can't answer it, so re-render the step rather than emit a
+      // nudge: the webhook redraws the anchor message in place, which leaves the
+      // existing prompt and its buttons exactly as they are.
       return { render: await renderCurrentStep(db, session) };
   }
 }
@@ -285,6 +323,31 @@ export async function applyCallback(db: Db, session: BotSession, data: string): 
   }
 
   switch (step.type) {
+    case "quantity":
+    case "custom_number": {
+      if (!data.startsWith("num:")) return { notice: "Use the keypad above." };
+      const pressed = data.slice(4);
+      let draft = session.numberDraft ?? "";
+
+      if (pressed === "ok") return commitNumber(db, session, step, draft);
+
+      if (pressed === "del") {
+        draft = draft.slice(0, -1);
+      } else if (pressed === ".") {
+        if (draft.includes(".")) return { notice: "Only one decimal point." };
+        draft = draft === "" ? "0." : `${draft}.`;
+      } else {
+        // A 15-digit quantity is a mis-tap, not an entry, and the draft has to
+        // stay well inside Telegram's message limits.
+        if (draft.replace(".", "").length >= 12) return { notice: "That's as long as a number can get." };
+        // Keeps a leading tap of 0 from turning 5 into "05".
+        draft = draft === "0" ? pressed : draft + pressed;
+      }
+
+      session.numberDraft = draft;
+      return { render: await renderCurrentStep(db, session) };
+    }
+
     case "category_select": {
       const cats = await activeCategories(db);
       const c = cats[indexOf(data, "cat:")];
@@ -380,16 +443,27 @@ async function selectLocation(db: Db, session: BotSession, step: StepInstance, i
   return advance(db, session);
 }
 
-// Position the location cursor for a step that is about to be shown. A step
-// configured with a default node opens inside it, so the common case costs one
-// tap instead of two; everything else starts at the root as before.
+// Reset the per-step scratch state for a step that is about to be shown: the
+// location cursor and the number keypad's draft. A location step configured with
+// a default node opens inside it, so the common case costs one tap instead of
+// two; everything else starts at the root as before.
 //
-// Exported so a session whose FIRST step is a location step is primed too — the
+// Exported so a session whose FIRST step needs priming is covered too — the
 // engine's own entry points (advance/goBack) cover every later step.
-export async function primeLocationCursor(db: Db, session: BotSession) {
+export async function primeStep(db: Db, session: BotSession) {
   session.locationCursor = { parentStack: [], currentParent: null };
   const step = currentStep(session);
-  if (step?.type !== "location_tree") return;
+  if (!step) return;
+
+  // Stepping back INTO a number step reopens the keypad on the value already
+  // entered, so Back preserves it the same way it preserves every other answer.
+  const prior = session.answers[step.instanceId]?.value;
+  session.numberDraft =
+    (step.type === "quantity" || step.type === "custom_number") && (typeof prior === "number" || typeof prior === "string")
+      ? String(prior)
+      : "";
+
+  if (step.type !== "location_tree") return;
   const node = await defaultLocationNode(db, step);
   if (node) session.locationCursor.currentParent = node._id.toString();
 }
@@ -406,7 +480,7 @@ async function advance(db: Db, session: BotSession): Promise<EngineResult> {
   }
 
   // Reset the location cursor whenever we enter/leave a step.
-  await primeLocationCursor(db, session);
+  await primeStep(db, session);
 
   const next = currentStep(session);
   if (next.type === "approval") {
@@ -427,7 +501,7 @@ async function goBack(db: Db, session: BotSession): Promise<EngineResult> {
 
   session.stepIndex -= 1;
   // Stepping back INTO a location step lands on its default view too.
-  await primeLocationCursor(db, session);
+  await primeStep(db, session);
   session.status = "active";
   // Prior answers are intentionally preserved so nothing already entered is lost.
   return { render: await renderCurrentStep(db, session) };

@@ -232,15 +232,45 @@ async function main() {
   }
   check("6. location path stored", !!s?.answers?.[locStepId]?.display, s?.answers?.[locStepId]?.display);
 
-  // 7. Quantity: invalid input rejected, valid input accepted.
-  await sendText(CHAT_MAIN, USER_ID, "abc");
-  s = await session(CHAT_MAIN);
-  check("7. invalid quantity does not advance", s?.stepIndex === 4, `stepIndex=${s?.stepIndex}`);
+  // 7. Quantity: entered on the inline keypad, not by typing a message.
+  const qtyStepId = s?.steps?.[4]?.instanceId;
+
+  // A typed number is no longer an answer — the keypad is the only input.
   await sendText(CHAT_MAIN, USER_ID, "10");
   s = await session(CHAT_MAIN);
-  const qtyStepId = s?.steps?.[4]?.instanceId;
-  check("7. valid quantity → unit step", s?.stepIndex === 5, `stepIndex=${s?.stepIndex}`);
+  check("7. typed number does not answer the step", s?.stepIndex === 4 && !s?.answers?.[qtyStepId], `stepIndex=${s?.stepIndex} answer=${JSON.stringify(s?.answers?.[qtyStepId])}`);
+
+  // Done with an empty draft is a nudge, not an advance.
+  await cb(CHAT_MAIN, USER_ID, "num:ok");
+  s = await session(CHAT_MAIN);
+  check("7. Done on an empty keypad does not advance", s?.stepIndex === 4, `stepIndex=${s?.stepIndex}`);
+
+  // Key 1, 5, then backspace → draft "1"; key 0 → "10".
+  await cb(CHAT_MAIN, USER_ID, "num:1");
+  await cb(CHAT_MAIN, USER_ID, "num:5");
+  s = await session(CHAT_MAIN);
+  check("7. keypad digits accumulate in the draft", s?.numberDraft === "15", `draft=${s?.numberDraft}`);
+  await cb(CHAT_MAIN, USER_ID, "num:del");
+  s = await session(CHAT_MAIN);
+  check("7. backspace drops the last digit", s?.numberDraft === "1", `draft=${s?.numberDraft}`);
+  await cb(CHAT_MAIN, USER_ID, "num:0");
+  s = await session(CHAT_MAIN);
+  check("7. draft holds the full number before commit", s?.numberDraft === "10" && s?.stepIndex === 4, `draft=${s?.numberDraft} stepIndex=${s?.stepIndex}`);
+
+  // Done commits and advances.
+  await cb(CHAT_MAIN, USER_ID, "num:ok");
+  s = await session(CHAT_MAIN);
+  check("7. Done commits the quantity → unit step", s?.stepIndex === 5, `stepIndex=${s?.stepIndex}`);
   check("7. quantity value stored", Number(s?.answers?.[qtyStepId]?.value) === 10, String(s?.answers?.[qtyStepId]?.value));
+  check("7. draft cleared after commit", !s?.numberDraft, `draft=${s?.numberDraft}`);
+
+  // Back into the quantity step reopens the keypad on the committed value.
+  await cb(CHAT_MAIN, USER_ID, "cb:back");
+  s = await session(CHAT_MAIN);
+  check("7. Back into a number step prefills the keypad", s?.stepIndex === 4 && s?.numberDraft === "10", `stepIndex=${s?.stepIndex} draft=${s?.numberDraft}`);
+  await cb(CHAT_MAIN, USER_ID, "num:ok");
+  s = await session(CHAT_MAIN);
+  check("7. re-commit returns to the unit step", s?.stepIndex === 5, `stepIndex=${s?.stepIndex}`);
 
   // 8. Unit → review; Back from review → unit (preserved); re-select; confirm.
   await cb(CHAT_MAIN, USER_ID, "unit:0");

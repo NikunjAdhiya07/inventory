@@ -63,7 +63,7 @@ const stepLibrary = [
   {
     type: "quantity",
     name: "Quantity Entry",
-    desc: "User types a numeric quantity.",
+    desc: "Enter a quantity on an inline number keypad.",
     icon: "#",
     category: "capture",
     configSchema: [
@@ -96,7 +96,7 @@ const stepLibrary = [
   {
     type: "custom_number",
     name: "Custom Number Field",
-    desc: "A free-form labelled numeric input.",
+    desc: "A labelled numeric input on an inline keypad.",
     icon: "№",
     category: "custom",
     configSchema: [
