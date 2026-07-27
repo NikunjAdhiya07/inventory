@@ -3,13 +3,21 @@
 import { useEffect, useState } from "react";
 import PageShell from "@/components/page-shell";
 import { api } from "@/lib/api-client";
-import { PageIntro, Modal, ModalHeader, ModalFooter, thStyle, tdStyle, labelStyle, inputStyle, secondaryBtnStyle, primaryBtnStyle, addBtnStyle, chipStyle, EmptyState, SortTh } from "@/components/dc-ui";
+import { PageIntro, Modal, ModalHeader, ModalFooter, thStyle, tdStyle, labelStyle, inputStyle, secondaryBtnStyle, primaryBtnStyle, addBtnStyle, chipStyle, EmptyState, SortTh, toggleStyle, toggleKnobStyle } from "@/components/dc-ui";
 import { useSort } from "@/lib/use-sort";
 
 const PERMS = ["Add Inventory", "Manage Masters", "Manage Workflows", "Approve Entries", "View Reports"];
 
+// The permission the Telegram webhook actually gates messaging on
+// (`app/api/telegram/webhook/route.ts`). A person can only talk to the bot when
+// they are an Active user AND their role carries this — the Access section below
+// reports exactly that pair, so what it shows is what the bot will do.
+const MESSAGE_PERM = "Add Inventory";
+
 type Role = { id: string; name: string; desc: string; color: string; users: number; status: "Active" | "Inactive"; perms: string[] };
 type RoleForm = { name: string; desc: string; perms: string[]; status: "Active" | "Inactive" };
+type User = { id: string; username: string; handle: string; tgId: string; role: string; status: "Active" | "Inactive" };
+type GrantForm = { username: string; tgId: string; handle: string; role: string };
 
 const EMPTY_FORM: RoleForm = { name: "", desc: "", perms: [], status: "Active" };
 
@@ -33,19 +41,25 @@ function cellStyle(on: boolean) {
 
 export default function RolesPage() {
   const [roles, setRoles] = useState<Role[]>([]);
+  const [users, setUsers] = useState<User[]>([]);
   const [loading, setLoading] = useState(true);
   const [modalOpen, setModalOpen] = useState(false);
   const [editingId, setEditingId] = useState<string | null>(null);
   const [form, setForm] = useState<RoleForm>(EMPTY_FORM);
   const [delOpen, setDelOpen] = useState(false);
   const [delId, setDelId] = useState<string | null>(null);
+  const [accessError, setAccessError] = useState("");
+  const [grantOpen, setGrantOpen] = useState(false);
+  const [grantForm, setGrantForm] = useState<GrantForm>({ username: "", tgId: "", handle: "", role: "" });
+  const [grantError, setGrantError] = useState("");
 
   useEffect(() => {
     let cancelled = false;
-    api
-      .get<Role[]>("/api/roles")
-      .then((data) => {
-        if (!cancelled) setRoles(data);
+    Promise.all([api.get<Role[]>("/api/roles"), api.get<User[]>("/api/users")])
+      .then(([roleData, userData]) => {
+        if (cancelled) return;
+        setRoles(roleData);
+        setUsers(userData);
       })
       .finally(() => {
         if (!cancelled) setLoading(false);
@@ -90,6 +104,74 @@ export default function RolesPage() {
     setModalOpen(false);
   }
 
+  // ---- Access section ----------------------------------------------------
+
+  function roleCanMessage(roleName: string) {
+    return roles.some((r) => r.name === roleName && r.perms.includes(MESSAGE_PERM));
+  }
+
+  function hasAccess(u: User) {
+    return u.status === "Active" && roleCanMessage(u.role);
+  }
+
+  // Flipping the switch writes the user's status. The webhook reads the user
+  // record uncached on every update, so an off here takes the person's access
+  // away on their very next message rather than at the end of a cache TTL.
+  async function toggleAccess(u: User) {
+    const status = u.status === "Active" ? "Inactive" : "Active";
+    setAccessError("");
+    setUsers((prev) => prev.map((x) => (x.id === u.id ? { ...x, status } : x)));
+    try {
+      await api.patch(`/api/users/${u.id}`, { status });
+    } catch (e) {
+      // An access control that silently fails to save is worse than one that
+      // refuses — put the row back where it was and say so.
+      setUsers((prev) => prev.map((x) => (x.id === u.id ? { ...x, status: u.status } : x)));
+      setAccessError(e instanceof Error ? e.message : "Couldn't update access. Try again.");
+    }
+  }
+
+  // The switch alone can't grant messaging to someone whose role lacks the
+  // permission, so the role is editable inline — that's the lever that fixes it.
+  async function changeUserRole(u: User, role: string) {
+    setAccessError("");
+    setUsers((prev) => prev.map((x) => (x.id === u.id ? { ...x, role } : x)));
+    try {
+      await api.patch(`/api/users/${u.id}`, { role });
+    } catch (e) {
+      setUsers((prev) => prev.map((x) => (x.id === u.id ? { ...x, role: u.role } : x)));
+      setAccessError(e instanceof Error ? e.message : "Couldn't update role. Try again.");
+    }
+  }
+
+  function openGrant() {
+    setGrantForm({ username: "", tgId: "", handle: "", role: roles.find((r) => r.perms.includes(MESSAGE_PERM))?.name ?? roles[0]?.name ?? "" });
+    setGrantError("");
+    setGrantOpen(true);
+  }
+
+  async function saveGrant() {
+    const username = grantForm.username.trim();
+    const tgId = grantForm.tgId.trim();
+    if (!username || !tgId) {
+      setGrantError("Name and Telegram number are both required.");
+      return;
+    }
+    setGrantError("");
+    try {
+      const created = await api.post<User>("/api/users", { ...grantForm, username, tgId, handle: grantForm.handle.trim(), status: "Active" });
+      setUsers((prev) => [...prev, created]);
+      setGrantOpen(false);
+    } catch (e) {
+      setGrantError(e instanceof Error ? e.message : "Failed to grant access.");
+    }
+  }
+
+  const withAccess = users.filter(hasAccess);
+  // People who can message float to the top — the question this section answers
+  // most often is "who has access right now".
+  const accessRows = [...users].sort((a, b) => Number(hasAccess(b)) - Number(hasAccess(a)) || a.username.localeCompare(b.username));
+
   const del = roles.find((r) => r.id === delId);
   const blocked = (del?.users || 0) > 0;
   const { sorted: sortedRoles, sortKey, dir, toggleSort } = useSort<Role, keyof Role>(roles);
@@ -99,7 +181,7 @@ export default function RolesPage() {
       <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", gap: 20, marginBottom: 22 }}>
         <PageIntro
           title="Roles & Permissions"
-          description="Define what each role can do. Toggle a cell to grant or revoke a permission — changes apply the moment you save."
+          description="Define what each role can do. Toggle a cell to grant or revoke a permission — changes apply the moment you save. The Access section at the bottom shows who can message the bot right now."
         />
         <button
           onClick={() => {
@@ -216,6 +298,123 @@ export default function RolesPage() {
         {loading ? <EmptyState text="Loading…" /> : null}
       </section>
 
+      <section style={{ background: "#fff", border: "1px solid #e9edf3", borderRadius: 14, overflow: "hidden", boxShadow: "0 1px 2px rgba(16,30,54,.04)", marginTop: 24 }}>
+        <div style={{ padding: "15px 18px", borderBottom: "1px solid #f1f4f8", display: "flex", alignItems: "center", justifyContent: "space-between", gap: 16 }}>
+          <div>
+            <div style={{ fontSize: 14, fontWeight: 700, color: "#0b1b45" }}>Access</div>
+            <div style={{ fontSize: 12, color: "#8a97b0", marginTop: 2 }}>
+              Who can message the bot. Switching someone off blocks them on their very next message.
+            </div>
+          </div>
+          <button onClick={openGrant} style={addBtnStyle}>
+            ＋ Give Access
+          </button>
+        </div>
+
+        <div style={{ padding: "14px 18px", borderBottom: "1px solid #f1f4f8", background: "#fafbfd" }}>
+          <div style={{ fontSize: 11.5, fontWeight: 700, letterSpacing: ".3px", textTransform: "uppercase", color: "#8a97b0", marginBottom: 9 }}>
+            Currently has access — {withAccess.length} {withAccess.length === 1 ? "person" : "people"}
+          </div>
+          {withAccess.length ? (
+            <div style={{ display: "flex", flexWrap: "wrap", gap: 7 }}>
+              {withAccess.map((u) => (
+                <span
+                  key={u.id}
+                  style={{
+                    display: "inline-flex",
+                    alignItems: "center",
+                    gap: 7,
+                    padding: "5px 11px",
+                    borderRadius: 20,
+                    fontSize: 12.5,
+                    fontWeight: 600,
+                    background: "#eafaf1",
+                    border: "1px solid #c7ecd8",
+                    color: "#0f7a4f",
+                  }}
+                >
+                  <span style={{ width: 6, height: 6, borderRadius: "50%", background: "#0f9d63" }} />
+                  {u.username}
+                  <span style={{ fontFamily: "var(--font-mono)", fontWeight: 500, color: "#5aa886" }}>{u.tgId}</span>
+                </span>
+              ))}
+            </div>
+          ) : (
+            <div style={{ fontSize: 13, color: "#98a4bd" }}>No one can message the bot right now.</div>
+          )}
+        </div>
+
+        {accessError ? (
+          <div style={{ margin: "14px 18px 0", background: "#fdecec", color: "#d63a3a", padding: "10px 12px", borderRadius: 9, fontSize: 12.5 }}>{accessError}</div>
+        ) : null}
+
+        <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13 }}>
+          <thead>
+            <tr style={{ background: "#fafbfd", color: "#8a97b0", textAlign: "left" }}>
+              <th style={thStyle("18px")}>Name</th>
+              <th style={thStyle()}>Telegram Number</th>
+              <th style={thStyle()}>Role</th>
+              <th style={{ ...thStyle(), padding: "11px 18px 11px 14px", textAlign: "right" }}>Message Access</th>
+            </tr>
+          </thead>
+          <tbody>
+            {accessRows.map((u) => {
+              const on = u.status === "Active";
+              const granted = hasAccess(u);
+              // Active but the role can't message: the switch is on and still
+              // nothing works. Say which of the two is missing rather than
+              // showing a green light the bot won't honour.
+              const roleBlocks = on && !granted;
+              return (
+                <tr key={u.id}>
+                  <td style={tdStyle("18px")}>
+                    <div style={{ lineHeight: 1.3 }}>
+                      <div style={{ fontWeight: 600, color: "#1a2b4a" }}>{u.username}</div>
+                      {u.handle ? <div style={{ fontSize: 11.5, color: "#98a4bd" }}>{u.handle}</div> : null}
+                    </div>
+                  </td>
+                  <td style={{ ...tdStyle(), color: "#8a97b0", fontFamily: "var(--font-mono)" }}>{u.tgId}</td>
+                  <td style={tdStyle()}>
+                    <select
+                      value={u.role}
+                      onChange={(e) => changeUserRole(u, e.target.value)}
+                      style={{
+                        padding: "6px 9px",
+                        border: `1px solid ${roleBlocks ? "#f0d3a4" : "#dfe5ee"}`,
+                        borderRadius: 8,
+                        fontSize: 12.5,
+                        background: roleBlocks ? "#fff8ec" : "#fbfcfe",
+                        color: "#3a4a68",
+                      }}
+                    >
+                      {roles.map((r) => (
+                        <option key={r.id} value={r.name}>
+                          {r.name}
+                          {r.perms.includes(MESSAGE_PERM) ? "" : " — can't message"}
+                        </option>
+                      ))}
+                      {roles.some((r) => r.name === u.role) ? null : <option value={u.role}>{u.role} — unknown role</option>}
+                    </select>
+                  </td>
+                  <td style={{ ...tdStyle(), padding: "12px 18px 12px 14px" }}>
+                    <div style={{ display: "flex", alignItems: "center", gap: 11, justifyContent: "flex-end" }}>
+                      <span style={{ fontSize: 12, fontWeight: 600, color: granted ? "#0f9d63" : roleBlocks ? "#c07d10" : "#98a4bd", textAlign: "right" }}>
+                        {granted ? "Can message" : roleBlocks ? `${u.role} can't message` : "Off"}
+                      </span>
+                      <button onClick={() => toggleAccess(u)} style={toggleStyle(on)} aria-label={`Toggle bot access for ${u.username}`} aria-pressed={on}>
+                        <span style={toggleKnobStyle(on)} />
+                      </button>
+                    </div>
+                  </td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+        {!loading && users.length === 0 ? <EmptyState text="No one has been given access yet." /> : null}
+        {loading ? <EmptyState text="Loading…" /> : null}
+      </section>
+
       {modalOpen ? (
         <Modal onClose={() => setModalOpen(false)} maxWidth={520}>
           <ModalHeader title={editingId ? "Edit Role" : "New Role"} onClose={() => setModalOpen(false)} />
@@ -294,6 +493,85 @@ export default function RolesPage() {
             </button>
             <button onClick={save} style={primaryBtnStyle}>
               Save Role
+            </button>
+          </ModalFooter>
+        </Modal>
+      ) : null}
+
+      {grantOpen ? (
+        <Modal onClose={() => setGrantOpen(false)} maxWidth={520}>
+          <ModalHeader
+            title="Give Access"
+            subtitle="The person must have started a chat with the bot at least once."
+            onClose={() => setGrantOpen(false)}
+          />
+          <div style={{ padding: "22px 24px", display: "flex", flexDirection: "column", gap: 16 }}>
+            {grantError ? (
+              <div style={{ background: "#fdecec", color: "#d63a3a", padding: "10px 12px", borderRadius: 9, fontSize: 12.5 }}>{grantError}</div>
+            ) : null}
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14 }}>
+              <div>
+                <label style={labelStyle}>
+                  Name <span style={{ color: "#e0524f" }}>*</span>
+                </label>
+                <input
+                  value={grantForm.username}
+                  onChange={(e) => setGrantForm((f) => ({ ...f, username: e.target.value }))}
+                  placeholder="Full name"
+                  style={inputStyle}
+                />
+              </div>
+              <div>
+                <label style={labelStyle}>
+                  Telegram Number <span style={{ color: "#e0524f" }}>*</span>
+                </label>
+                <input
+                  value={grantForm.tgId}
+                  onChange={(e) => setGrantForm((f) => ({ ...f, tgId: e.target.value }))}
+                  placeholder="e.g. 584920113"
+                  style={{ ...inputStyle, fontFamily: "var(--font-mono)" }}
+                />
+              </div>
+            </div>
+            <div>
+              <label style={labelStyle}>Username</label>
+              <input
+                value={grantForm.handle}
+                onChange={(e) => setGrantForm((f) => ({ ...f, handle: e.target.value }))}
+                placeholder="@vedant"
+                style={inputStyle}
+              />
+            </div>
+            <div>
+              <label style={labelStyle}>
+                Role <span style={{ color: "#e0524f" }}>*</span>
+              </label>
+              <select
+                value={grantForm.role}
+                onChange={(e) => setGrantForm((f) => ({ ...f, role: e.target.value }))}
+                style={{ ...inputStyle, background: "#fff" }}
+              >
+                {roles.map((r) => (
+                  <option key={r.id} value={r.name}>
+                    {r.name}
+                    {r.perms.includes(MESSAGE_PERM) ? "" : " — can't message"}
+                  </option>
+                ))}
+              </select>
+              {grantForm.role && !roleCanMessage(grantForm.role) ? (
+                <div style={{ marginTop: 7, fontSize: 12, color: "#c07d10" }}>
+                  “{grantForm.role}” doesn&apos;t have the “{MESSAGE_PERM}” permission, so this person still won&apos;t be able to message the bot. Pick another
+                  role, or grant that permission in the matrix above.
+                </div>
+              ) : null}
+            </div>
+          </div>
+          <ModalFooter>
+            <button onClick={() => setGrantOpen(false)} style={secondaryBtnStyle}>
+              Cancel
+            </button>
+            <button onClick={saveGrant} style={primaryBtnStyle}>
+              Give Access
             </button>
           </ModalFooter>
         </Modal>

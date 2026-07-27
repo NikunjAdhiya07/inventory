@@ -80,6 +80,10 @@ export type BotSession = {
   stepIndex: number;
   answers: Record<string, Answer>;
   locationCursor: LocationCursor;
+  // Digits typed so far on a number step's inline keypad. Per-step scratch, like
+  // `locationCursor` — reset by `primeStep` on every entry into a step. The
+  // committed value lands in `answers` only when the user taps Done.
+  numberDraft: string;
   approval?: { stepInstanceId: string; awaitingRole: string; decidedBy?: string; decision?: "ok" | "no" };
   status: "active" | "awaiting_approval" | "completed" | "cancelled";
   lastMessageId?: number;

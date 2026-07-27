@@ -4,7 +4,7 @@ import { getDb, ensureIndexesOnce } from "@/lib/mongodb";
 import { cached } from "@/lib/cache";
 import { defer } from "@/lib/defer";
 import { resolveWorkflow } from "@/lib/workflow-resolver";
-import { renderCurrentStep, applyMessage, applyCallback, primeLocationCursor, type EngineResult } from "@/lib/workflow-engine";
+import { renderCurrentStep, applyMessage, applyCallback, primeStep, type EngineResult } from "@/lib/workflow-engine";
 import { sendMessage, editMessageText, answerCallbackQuery, type InlineKeyboard } from "@/lib/telegram";
 import { recordGroupActivity } from "@/lib/telegram-health";
 import type { BotSession } from "@/lib/workflow-types";
@@ -59,6 +59,7 @@ function newSession(chatId: string, userId: string, name: string, resolved: { wo
     stepIndex: 0,
     answers: {},
     locationCursor: { parentStack: [], currentParent: null },
+    numberDraft: "",
     status: "active",
     processedUpdateIds: [],
     createdAt: now,
@@ -263,9 +264,9 @@ export async function POST(req: NextRequest) {
     }
     session = newSession(chatId, userId, name, resolved);
     session.dbUserId = auth.user._id.toString();
-    // Covers a workflow whose very first step is a location step; every later
-    // step is primed by the engine as it advances into it.
-    await primeLocationCursor(db, session);
+    // Covers a workflow whose very first step needs priming (a location step, a
+    // number step); every later step is primed by the engine as it advances into it.
+    await primeStep(db, session);
 
     const isCommand = text && text.startsWith("/");
     const firstStep = session.steps[0];
