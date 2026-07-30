@@ -28,6 +28,7 @@ type Group = {
   chatId: string;
   title: string;
   status: "Active" | "Inactive";
+  approved: boolean;
   manualInactive: boolean;
   botHealth: BotHealth;
   lastSeenAt: string | null;
@@ -49,9 +50,10 @@ const EMPTY: GroupForm = { chatId: "", title: "", manualInactive: false };
 // cron jobs or server-side timers — health pings only run on demand.
 const REFRESH_MS = 30000;
 
-// Mirrors lib/telegram-health.deriveStatus so an optimistic manual toggle can
-// recompute the badge instantly without waiting for a server round trip.
-function effStatus(g: Pick<Group, "manualInactive" | "botHealth" | "status">): "Active" | "Inactive" {
+// Mirrors lib/telegram-health.deriveStatus so an optimistic approve or manual
+// toggle can recompute the badge instantly without waiting for a server round trip.
+function effStatus(g: Pick<Group, "approved" | "manualInactive" | "botHealth" | "status">): "Active" | "Inactive" {
+  if (g.approved === false) return "Inactive";
   if (g.manualInactive) return "Inactive";
   if (g.botHealth === "unhealthy") return "Inactive";
   if (g.botHealth === "healthy") return "Active";
@@ -179,7 +181,9 @@ export default function TelegramGroupsPage() {
     if (editingId) {
       await api.patch<Group>(`/api/telegram-groups/${editingId}`, form);
     } else {
-      await api.post<Group>("/api/telegram-groups", { ...form, status: "Active", botHealth: "unknown" });
+      // Entered by hand in the console, so it is approved by the act of adding
+      // it. Only groups the bot discovers on its own start pending.
+      await api.post<Group>("/api/telegram-groups", { ...form, status: "Active", approved: true, botHealth: "unknown" });
     }
     setModalOpen(false);
     await load().catch(() => {});
@@ -217,6 +221,16 @@ export default function TelegramGroupsPage() {
     }
   }
 
+  // Let a discovered group start serving entries. Until this is done the bot
+  // refuses every update from the chat, so this is the only way a group the bot
+  // was added to becomes usable.
+  async function setApproved(g: Group, next: boolean) {
+    setGroups((prev) =>
+      prev.map((x) => (x.id === g.id ? { ...x, approved: next, status: effStatus({ ...x, approved: next }) } : x))
+    );
+    await api.patch(`/api/telegram-groups/${g.id}`, { approved: next }).catch(() => load());
+  }
+
   // Admin override — force a group inactive (or release it) even when healthy.
   async function toggleManual(g: Group) {
     const next = !g.manualInactive;
@@ -243,7 +257,10 @@ export default function TelegramGroupsPage() {
   return (
     <PageShell section="Automation" page="Telegram Groups">
       <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", gap: 20, marginBottom: 22 }}>
-        <PageIntro title="Telegram Groups" description="The chats the bot listens in. Assign workflows to a group so entries started there follow the right flow." />
+        <PageIntro
+          title="Telegram Groups"
+          description="The chats the bot listens in. A group the bot is added to shows up here pending approval and is refused until you approve it; approved groups let any member add inventory."
+        />
         <button onClick={openAdd} style={addBtnStyle}>
           ＋ New Group
         </button>
@@ -305,6 +322,11 @@ export default function TelegramGroupsPage() {
                   <tr key={g.id}>
                     <td style={{ ...tdStyle("16px"), fontWeight: 600, color: "#1a2b4a" }}>
                       {g.title}
+                      {!g.approved ? (
+                        <span style={{ marginLeft: 8, fontSize: 10.5, fontWeight: 700, color: "#b04a00", background: "#fff1e6", border: "1px solid #ffd2b0", padding: "1px 7px", borderRadius: 20 }}>
+                          PENDING APPROVAL
+                        </span>
+                      ) : null}
                       {g.manualInactive ? (
                         <span style={{ marginLeft: 8, fontSize: 10.5, fontWeight: 700, color: "#b06a00", background: "#fff4e2", border: "1px solid #ffe1b0", padding: "1px 7px", borderRadius: 20 }}>
                           OVERRIDDEN
@@ -313,7 +335,10 @@ export default function TelegramGroupsPage() {
                     </td>
                     <td style={{ ...tdStyle(), color: "#4a5878", fontFamily: "var(--font-mono)" }}>{g.chatId}</td>
                     <td style={tdStyle()}>
-                      <span style={statusChip(active)} title={g.lastError || (active ? "Bot reachable" : "Bot unreachable")}>
+                      <span
+                        style={statusChip(active)}
+                        title={!g.approved ? "Waiting for approval — the bot refuses this chat" : g.lastError || (active ? "Bot reachable" : "Bot unreachable")}
+                      >
                         <span style={{ width: 7, height: 7, borderRadius: "50%", background: active ? "#0f9d63" : "#d63a3a" }} />
                         {g.status}
                       </span>
@@ -332,6 +357,9 @@ export default function TelegramGroupsPage() {
                     </td>
                     <td style={{ ...tdStyle(), padding: "12px 16px 12px 14px" }}>
                       <div style={{ display: "flex", gap: 6, justifyContent: "flex-end", flexWrap: "wrap" }}>
+                        <button onClick={() => setApproved(g, !g.approved)} style={actionBtnStyle(g.approved ? "#b04a00" : "#0f9d63", g.approved ? "#ffd2b0" : "#c7ecd8")}>
+                          {g.approved ? "Revoke" : "Approve"}
+                        </button>
                         <button onClick={() => checkOne(g.id)} disabled={busyId === g.id} style={actionBtnStyle("#2b5fd0", "#c8d8f5")}>
                           {busyId === g.id ? "…" : "Check"}
                         </button>

@@ -33,8 +33,16 @@ async function callRaw<T = unknown>(method: string, payload: Record<string, unkn
     });
     const data = await res.json();
     if (!data.ok) {
-      console.error(`[telegram] ${method} failed:`, data.description);
-      return { ok: false, description: String(data.description ?? "unknown error") };
+      const description = String(data.description ?? "unknown error");
+      // "message is not modified" is a no-op, not a failure: the anchor already
+      // shows exactly what we were about to draw, which is what a double-tap
+      // looks like. `editMessageText` reports it as `notModified` and `render`
+      // treats it as a successful redraw, so logging it at error level only
+      // sent people chasing an incident that never happened.
+      if (!/message is not modified/i.test(description)) {
+        console.error(`[telegram] ${method} failed:`, description);
+      }
+      return { ok: false, description };
     }
     return { ok: true, result: data.result as T };
   } catch (err) {

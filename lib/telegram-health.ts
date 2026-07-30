@@ -1,5 +1,6 @@
 import type { Db, Document, ObjectId } from "mongodb";
 import { getChat } from "./telegram";
+import { cached } from "./cache";
 
 // ------------------------------------------------------------------
 // Telegram group monitoring: health checks, effective-status derivation
@@ -10,19 +11,29 @@ export type BotHealth = "healthy" | "unhealthy" | "unknown";
 export type LogType = "health" | "command" | "update" | "error";
 export type LogLevel = "info" | "error";
 
-// The status the console displays. A manual override always wins so an admin can
-// force a group offline even when the bot is perfectly healthy; otherwise the
-// last health-check result decides, falling back to any stored status until the
-// first probe has run.
+// The status the console displays. Approval and a manual override both win over
+// health so an admin can hold a group offline even when the bot is perfectly
+// reachable; otherwise the last health-check result decides, falling back to any
+// stored status until the first probe has run.
 export function deriveStatus(g: {
+  approved?: boolean;
   manualInactive?: boolean;
   botHealth?: BotHealth;
   status?: string;
 }): "Active" | "Inactive" {
+  if (isApproved(g) === false) return "Inactive";
   if (g.manualInactive) return "Inactive";
   if (g.botHealth === "unhealthy") return "Inactive";
   if (g.botHealth === "healthy") return "Active";
   return g.status === "Inactive" ? "Inactive" : "Active";
+}
+
+// A group with no `approved` field predates the approval gate — it could only
+// have got into the collection through the console, so it stays approved. Only
+// an explicit `false`, which is what a self-registering group is inserted with,
+// means "waiting for an admin".
+export function isApproved(g: { approved?: boolean }): boolean {
+  return g.approved !== false;
 }
 
 // Shape returned to the client — the stored doc plus the computed status so the
@@ -30,13 +41,89 @@ export function deriveStatus(g: {
 export function deriveGroup<T extends Document & { id: string }>(g: T) {
   return {
     ...g,
+    approved: isApproved(g as { approved?: boolean }),
     manualInactive: Boolean(g.manualInactive),
     botHealth: (g.botHealth as BotHealth) ?? "unknown",
     lastSeenAt: (g.lastSeenAt as string | null) ?? null,
     lastCheckedAt: (g.lastCheckedAt as string | null) ?? null,
     lastError: (g.lastError as string | null) ?? null,
-    status: deriveStatus(g as { manualInactive?: boolean; botHealth?: BotHealth; status?: string }),
+    status: deriveStatus(g as { approved?: boolean; manualInactive?: boolean; botHealth?: BotHealth; status?: string }),
   };
+}
+
+// Fields a group is created with when the bot discovers it rather than an admin
+// entering it. `approved: false` is the whole point: the bot can be added to any
+// chat by anyone, so a chat it has never been authorized for starts blocked.
+function discoveredGroupDefaults(chatId: string, title: string | undefined, now: string) {
+  return {
+    chatId,
+    title: title || `Chat ${chatId}`,
+    status: "Active",
+    manualInactive: false,
+    approved: false,
+    source: "telegram",
+    createdAt: now,
+  };
+}
+
+// May this chat drive the bot? Checked before anything else the webhook does for
+// a group, so an unapproved chat never enrols anyone or opens an entry.
+//
+// Cached like the other read-mostly admin data: it is read on every single
+// update and only changes when someone approves, force-inactivates or deletes a
+// group — all of which run through the console's write path and invalidate it.
+export async function isGroupAllowed(db: Db, chatId: string): Promise<boolean> {
+  return cached(`telegramGroups:allowed:${chatId}`, async () => {
+    const g = await db
+      .collection("telegramGroups")
+      .findOne({ chatId }, { projection: { approved: 1, manualInactive: 1, status: 1 } });
+    // Never seen before: not approved, by definition.
+    if (!g) return false;
+    // Health is deliberately not consulted here. An update arriving IS the bot
+    // being reachable, so a stale "unhealthy" probe must not lock a live group
+    // out of its own entries.
+    return isApproved(g as { approved?: boolean }) && !g.manualInactive && g.status !== "Inactive";
+  });
+}
+
+// How long a blocked group waits between "an admin has to approve this" replies.
+// Without it every message in an unapproved chat would draw one.
+const BLOCKED_NOTICE_MS = 60 * 60 * 1000;
+
+// Record an update from a group the bot is not allowed to serve. The group is
+// upserted so it shows up in the console as pending — an admin cannot approve a
+// chat they cannot see — and the caller is told whether to say so in the chat.
+export async function noteBlockedGroup(db: Db, chatId: string, title?: string): Promise<boolean> {
+  const now = new Date().toISOString();
+  try {
+    const before = await db.collection("telegramGroups").findOneAndUpdate(
+      { chatId },
+      {
+        $set: { lastSeenAt: now, blockedNoticeAt: now },
+        $setOnInsert: { ...discoveredGroupDefaults(chatId, title, now), botHealth: "unknown" },
+      },
+      { returnDocument: "before", upsert: true, projection: { _id: 1, title: 1, blockedNoticeAt: 1 } }
+    );
+    const last = before?.blockedNoticeAt ? Date.parse(String(before.blockedNoticeAt)) : 0;
+    const notify = !before || Date.now() - last > BLOCKED_NOTICE_MS;
+    if (notify) {
+      await logTelegram(db, {
+        groupId: before?._id?.toString() ?? null,
+        chatId,
+        title: (before?.title as string) ?? title ?? null,
+        type: "error",
+        level: "error",
+        message: before
+          ? "Update refused — this group is not approved for the bot."
+          : "New group discovered. Blocked until an admin approves it.",
+      }).catch(() => {});
+    }
+    return notify;
+  } catch {
+    // Monitoring must never decide whether an update is served. The gate has
+    // already said no; failing to write the log does not change that.
+    return false;
+  }
 }
 
 // Append one entry to the per-group activity log. Failures here must never break
@@ -106,22 +193,49 @@ export async function runHealthCheck(
   return healthy ? "healthy" : "unhealthy";
 }
 
+// Register a group the bot is in but the console has never seen. Called when the
+// bot is added to a chat and on the first update from any unregistered one, so a
+// group that is live in Telegram is never invisible in the console. Only fills
+// in what is missing — an admin's approval, title edit or manual override is
+// left alone.
+export async function registerGroup(db: Db, chatId: string, title?: string) {
+  const now = new Date().toISOString();
+  await db.collection("telegramGroups").updateOne(
+    { chatId },
+    {
+      $set: { lastSeenAt: now, botHealth: "healthy", lastError: null },
+      $setOnInsert: discoveredGroupDefaults(chatId, title, now),
+    },
+    { upsert: true }
+  );
+}
+
 // Called from the webhook on every authorized update. Marks the group as seen
 // (which also flips a previously-unhealthy group back to healthy) and records a
 // command/update log line. Best-effort: never throws into the webhook path.
 export async function recordGroupActivity(
   db: Db,
   chatId: string,
-  info: { isCommand: boolean; text?: string; actor: string }
+  info: { isCommand: boolean; text?: string; actor: string; title?: string }
 ) {
   try {
     const now = new Date().toISOString();
     // One round trip instead of a read followed by a write. `returnDocument:
     // "before"` still gives us the title/id needed for the log line.
+    //
+    // Upserted rather than updated: with anyone in an approved group able to
+    // make an entry, the first sign of a group is usually someone using it, and
+    // a group nobody registered by hand would otherwise log activity against
+    // nothing and never appear in the console. Reaching here means the gate
+    // already allowed the chat, so the insert branch is only for a group whose
+    // row was deleted out from under a live approval.
     const group = await db.collection("telegramGroups").findOneAndUpdate(
       { chatId },
-      { $set: { lastSeenAt: now, botHealth: "healthy", lastError: null } },
-      { returnDocument: "before", projection: { _id: 1, title: 1 } }
+      {
+        $set: { lastSeenAt: now, botHealth: "healthy", lastError: null },
+        $setOnInsert: discoveredGroupDefaults(chatId, info.title, now),
+      },
+      { returnDocument: "before", upsert: true, projection: { _id: 1, title: 1 } }
     );
     await logTelegram(db, {
       groupId: group?._id?.toString() ?? null,

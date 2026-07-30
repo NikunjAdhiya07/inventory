@@ -50,10 +50,18 @@ function getClient(): Promise<MongoClient> {
 
 // One `createIndexes` command per collection rather than one per index: same
 // result, a third of the round trips.
-const INDEX_SPECS: Record<string, { key: Document; unique?: boolean }[]> = {
+const INDEX_SPECS: Record<string, { key: Document; unique?: boolean; partialFilterExpression?: Document }[]> = {
   categories: [{ key: { order: 1 } }],
   subcategories: [{ key: { parent: 1 } }],
   locations: [{ key: { parent: 1 } }],
+  // The Product Master. Uniqueness is enforced on the normalised key, not the
+  // typed-in number, so "pn 1024" can't be added alongside "PN-1024".
+  products: [
+    { key: { productNumberKey: 1 }, unique: true },
+    { key: { status: 1, name: 1 } },
+    { key: { category: 1 } },
+  ],
+  productAttributes: [{ key: { order: 1 } }],
   statuses: [{ key: { order: 1 } }],
   colors: [{ key: { group: 1 } }],
   users: [{ key: { tgId: 1 }, unique: true }],
@@ -71,7 +79,16 @@ const INDEX_SPECS: Record<string, { key: Document; unique?: boolean }[]> = {
   // The bot's session lookup runs on every single update, filtered by all three
   // fields — a compound index makes it a single index hit.
   botSessions: [{ key: { chatId: 1, userId: 1, status: 1 } }, { key: { status: 1 } }],
-  inventoryEntries: [{ key: { createdAt: -1 } }],
+  // A generated ticket number identifies exactly one entry, and one bot session
+  // produces exactly one entry — both are enforced here rather than trusted from
+  // application code, because a retried webhook update is a routine event. The
+  // partial filters keep the indexes off entries written before ticketing
+  // existed, which carry neither field.
+  inventoryEntries: [
+    { key: { createdAt: -1 } },
+    { key: { ticketNumber: 1 }, unique: true, partialFilterExpression: { ticketNumber: { $type: "string" } } },
+    { key: { sessionId: 1 }, unique: true, partialFilterExpression: { sessionId: { $type: "string" } } },
+  ],
 };
 
 export async function ensureIndexes(db?: Db): Promise<void> {
@@ -96,6 +113,14 @@ export function ensureIndexesOnce(db: Db): Promise<void> {
     });
   }
   return indexesEnsured;
+}
+
+// A unique-index violation, as opposed to any other write failure. Callers that
+// rely on an index to enforce a rule (one ticket per session, one product per
+// number) use this to turn the driver's error into the right answer for a
+// racing caller instead of a 500.
+export function isDuplicateKeyError(err: unknown): boolean {
+  return Boolean(err && typeof err === "object" && (err as { code?: number }).code === 11000);
 }
 
 export async function getDb(): Promise<Db> {

@@ -42,6 +42,7 @@ export default function WorkflowsPage() {
   const [units, setUnits] = useState<Named[]>([]);
   const [locations, setLocations] = useState<Named[]>([]);
   const [roles, setRoles] = useState<Named[]>([]);
+  const [products, setProducts] = useState<Named[]>([]);
   const [groups, setGroups] = useState<Group[]>([]);
 
   const [createOpen, setCreateOpen] = useState(false);
@@ -80,6 +81,7 @@ export default function WorkflowsPage() {
     api.get<Named[]>("/api/units").then((d) => !cancelled && setUnits(d), onError);
     api.get<Named[]>("/api/locations").then((d) => !cancelled && setLocations(d), onError);
     api.get<Named[]>("/api/roles").then((d) => !cancelled && setRoles(d), onError);
+    api.get<Named[]>("/api/products").then((d) => !cancelled && setProducts(d), onError);
     api.get<Group[]>("/api/telegram-groups").then((d) => !cancelled && setGroups(d), onError);
     return () => {
       cancelled = true;
@@ -91,6 +93,7 @@ export default function WorkflowsPage() {
     if (source === "units") return units;
     if (source === "locations") return locations;
     if (source === "roles") return roles;
+    if (source === "products") return products;
     return [];
   }
 
@@ -501,6 +504,7 @@ export default function WorkflowsPage() {
 function defaultLabel(entry: StepLibEntry): string {
   const map: Record<string, string> = {
     item_capture: "Send the item name and/or a photo of the product.",
+    product_select: "Select the product:",
     category_select: "Select a category:",
     subcategory_select: "Select a subcategory:",
     location_tree: "Choose the storage location:",

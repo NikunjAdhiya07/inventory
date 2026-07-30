@@ -59,10 +59,16 @@ const CACHED_COLLECTIONS = new Set([
   "subcategories",
   "units",
   "locations",
+  "products",
+  "productAttributes",
   "roles",
   "workflows",
   "workflowVersions",
   "workflowAssignments",
+  // Not a keyboard source — this is the per-chat access gate, cached because the
+  // webhook reads it on every update. Approving or force-inactivating a group
+  // has to take effect on the next message, not at the end of the TTL.
+  "telegramGroups",
 ]);
 
 export function invalidateCollection(collection: string) {

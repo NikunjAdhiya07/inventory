@@ -16,8 +16,11 @@ const MESSAGE_PERM = "Add Inventory";
 
 type Role = { id: string; name: string; desc: string; color: string; users: number; status: "Active" | "Inactive"; perms: string[] };
 type RoleForm = { name: string; desc: string; perms: string[]; status: "Active" | "Inactive" };
+// `tgId` is the Telegram user ID from `message.from.id` — the only identifier
+// Telegram puts in a bot update, and therefore the only thing the webhook can
+// authorize against.
 type User = { id: string; username: string; handle: string; tgId: string; role: string; status: "Active" | "Inactive" };
-type GrantForm = { username: string; tgId: string; handle: string; role: string };
+type GrantForm = { username: string; handle: string; tgId: string; role: string };
 
 const EMPTY_FORM: RoleForm = { name: "", desc: "", perms: [], status: "Active" };
 
@@ -50,7 +53,7 @@ export default function RolesPage() {
   const [delId, setDelId] = useState<string | null>(null);
   const [accessError, setAccessError] = useState("");
   const [grantOpen, setGrantOpen] = useState(false);
-  const [grantForm, setGrantForm] = useState<GrantForm>({ username: "", tgId: "", handle: "", role: "" });
+  const [grantForm, setGrantForm] = useState<GrantForm>({ username: "", handle: "", tgId: "", role: "" });
   const [grantError, setGrantError] = useState("");
 
   useEffect(() => {
@@ -145,21 +148,35 @@ export default function RolesPage() {
   }
 
   function openGrant() {
-    setGrantForm({ username: "", tgId: "", handle: "", role: roles.find((r) => r.perms.includes(MESSAGE_PERM))?.name ?? roles[0]?.name ?? "" });
+    setGrantForm({ username: "", handle: "", tgId: "", role: roles.find((r) => r.perms.includes(MESSAGE_PERM))?.name ?? roles[0]?.name ?? "" });
     setGrantError("");
     setGrantOpen(true);
   }
 
   async function saveGrant() {
     const username = grantForm.username.trim();
+    const handle = grantForm.handle.trim();
     const tgId = grantForm.tgId.trim();
     if (!username || !tgId) {
-      setGrantError("Name and Telegram number are both required.");
+      setGrantError("Name and Telegram user ID are both required.");
+      return;
+    }
+    // The id is what the webhook matches `message.from.id` against, so a
+    // non-numeric value can never authorize anyone — catch it here rather than
+    // storing a record that silently never works.
+    if (!/^\d+$/.test(tgId)) {
+      setGrantError("Telegram user ID must be digits only — it isn't a phone number. See the note below the field.");
       return;
     }
     setGrantError("");
     try {
-      const created = await api.post<User>("/api/users", { ...grantForm, username, tgId, handle: grantForm.handle.trim(), status: "Active" });
+      const created = await api.post<User>("/api/users", {
+        username,
+        handle: handle && !handle.startsWith("@") ? `@${handle}` : handle,
+        tgId,
+        role: grantForm.role,
+        status: "Active",
+      });
       setUsers((prev) => [...prev, created]);
       setGrantOpen(false);
     } catch (e) {
@@ -335,7 +352,7 @@ export default function RolesPage() {
                 >
                   <span style={{ width: 6, height: 6, borderRadius: "50%", background: "#0f9d63" }} />
                   {u.username}
-                  <span style={{ fontFamily: "var(--font-mono)", fontWeight: 500, color: "#5aa886" }}>{u.tgId}</span>
+                  <span style={{ fontFamily: "var(--font-mono)", fontWeight: 500, color: "#5aa886" }}>{u.handle || u.tgId}</span>
                 </span>
               ))}
             </div>
@@ -352,7 +369,7 @@ export default function RolesPage() {
           <thead>
             <tr style={{ background: "#fafbfd", color: "#8a97b0", textAlign: "left" }}>
               <th style={thStyle("18px")}>Name</th>
-              <th style={thStyle()}>Telegram Number</th>
+              <th style={thStyle()}>Telegram User ID</th>
               <th style={thStyle()}>Role</th>
               <th style={{ ...thStyle(), padding: "11px 18px 11px 14px", textAlign: "right" }}>Message Access</th>
             </tr>
@@ -522,25 +539,30 @@ export default function RolesPage() {
                 />
               </div>
               <div>
-                <label style={labelStyle}>
-                  Telegram Number <span style={{ color: "#e0524f" }}>*</span>
-                </label>
+                <label style={labelStyle}>Telegram Username</label>
                 <input
-                  value={grantForm.tgId}
-                  onChange={(e) => setGrantForm((f) => ({ ...f, tgId: e.target.value }))}
-                  placeholder="e.g. 584920113"
-                  style={{ ...inputStyle, fontFamily: "var(--font-mono)" }}
+                  value={grantForm.handle}
+                  onChange={(e) => setGrantForm((f) => ({ ...f, handle: e.target.value }))}
+                  placeholder="@vedant"
+                  style={inputStyle}
                 />
               </div>
             </div>
             <div>
-              <label style={labelStyle}>Username</label>
+              <label style={labelStyle}>
+                Telegram User ID <span style={{ color: "#e0524f" }}>*</span>
+              </label>
               <input
-                value={grantForm.handle}
-                onChange={(e) => setGrantForm((f) => ({ ...f, handle: e.target.value }))}
-                placeholder="@vedant"
-                style={inputStyle}
+                value={grantForm.tgId}
+                onChange={(e) => setGrantForm((f) => ({ ...f, tgId: e.target.value }))}
+                placeholder="e.g. 584920113"
+                style={{ ...inputStyle, fontFamily: "var(--font-mono)" }}
               />
+              <div style={{ marginTop: 7, background: "#f2f7ff", border: "1px solid #d8e6ff", borderRadius: 9, padding: "9px 11px", fontSize: 11.5, color: "#3a4a68", lineHeight: 1.6 }}>
+                <strong style={{ fontWeight: 700 }}>This is not a phone number.</strong> It&apos;s the permanent numeric ID Telegram gives every
+                account, and it&apos;s the only thing the bot can identify someone by. To find it: ask the person to open{" "}
+                <strong style={{ fontWeight: 700 }}>@userinfobot</strong> on Telegram and send it any message — it replies with their ID.
+              </div>
             </div>
             <div>
               <label style={labelStyle}>

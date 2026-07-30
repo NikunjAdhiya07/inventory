@@ -17,10 +17,18 @@ type NavGroup = {
 };
 
 const GROUPS: NavGroup[] = [
-  { title: "Overview", items: [{ key: "dashboard", label: "Dashboard", href: "/", icon: "▤" }] },
+  {
+    title: "Overview",
+    items: [
+      { key: "dashboard", label: "Dashboard", href: "/", icon: "▤" },
+      { key: "tickets", label: "Tickets", href: "/tickets", icon: "🎫" },
+    ],
+  },
   {
     title: "Catalog",
     items: [
+      { key: "products", label: "Product Master", href: "/products", icon: "❐" },
+      { key: "product-attributes", label: "Product Attributes", href: "/product-attributes", icon: "≡" },
       { key: "categories", label: "Categories", href: "/categories", icon: "▦" },
       { key: "subcategories", label: "Subcategories", href: "/subcategories", icon: "▩" },
       { key: "locations", label: "Storage Locations", href: "/locations", icon: "▧" },

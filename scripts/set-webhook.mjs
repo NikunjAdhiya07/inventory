@@ -38,12 +38,35 @@ function show(label, data) {
   console.log(JSON.stringify(data, null, 2));
 }
 
+// The single Telegram-side setting that decides whether the bot sees what people
+// type in a group. With privacy mode ON (Telegram's default) a bot only receives
+// commands, replies to itself and @mentions — so plain "MS Pipe" messages never
+// arrive and the bot looks broken while being perfectly healthy. It cannot be
+// changed over the API: BotFather → /setprivacy → Disable, then remove and
+// re-add the bot to each group for it to take effect.
+async function reportPrivacy() {
+  const me = await tg("getMe");
+  const canReadAll = me?.result?.can_read_all_group_messages;
+  console.log(`\n=== group message access ===`);
+  if (canReadAll) {
+    console.log("✔ Privacy mode is DISABLED — the bot receives every message in its groups.");
+  } else {
+    console.log("✖ Privacy mode is ENABLED — the bot only receives commands, replies and @mentions.");
+    console.log("  Fix: BotFather → /setprivacy → Disable, then remove and re-add the bot to the group.");
+  }
+  if (me?.result?.can_join_groups === false) {
+    console.log("✖ This bot is not allowed to join groups (BotFather → /setjoingroups → Enable).");
+  }
+  return Boolean(canReadAll);
+}
+
 async function main() {
   const cmd = (process.argv[2] || "info").toLowerCase();
 
   if (cmd === "info") {
     show("getMe", await tg("getMe"));
     show("getWebhookInfo", await tg("getWebhookInfo"));
+    await reportPrivacy();
     return;
   }
 
@@ -58,6 +81,9 @@ async function main() {
     else console.warn("WARNING: TELEGRAM_WEBHOOK_SECRET is not set — the webhook route's secret check will be skipped.");
     show("setWebhook", await tg("setWebhook", payload));
     show("getWebhookInfo", await tg("getWebhookInfo"));
+    // Registering the webhook is the moment someone is setting the bot up, so
+    // it is also the moment to say whether it will actually hear anyone.
+    await reportPrivacy();
     return;
   }
 

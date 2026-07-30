@@ -42,6 +42,11 @@ const seeds = {
     { name: "Inventory Manager", desc: "Runs day-to-day stock operations", color: "#0d9488", users: 5, status: "Active", perms: ["Add Inventory", "Approve Entries", "View Reports"] },
     { name: "Workflow Designer", desc: "Builds and edits custom workflows", color: "#8b5cf6", users: 3, status: "Active", perms: ["Manage Workflows", "View Reports"] },
     { name: "Viewer", desc: "Read-only access to reports", color: "#f59e0b", users: 11, status: "Active", perms: ["View Reports"] },
+    // Given to anyone who joins a connected Telegram group (see lib/enrollment.ts).
+    // Least privilege on purpose: enough to log an entry, nothing else. The bot
+    // creates this role itself if it is missing, so editing the permissions here
+    // — or in the console — is the one place that decides what a member can do.
+    { name: "Group Member", desc: "Anyone who joins a connected Telegram group. Can add inventory, nothing else.", color: "#0ea5e9", users: 0, status: "Active", perms: ["Add Inventory"] },
   ],
   users: [
     { username: "Asha Sharma", handle: "@asha", tgId: "584920113", role: "Admin", status: "Active" },
