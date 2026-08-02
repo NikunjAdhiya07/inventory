@@ -1,12 +1,13 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from "react";
+import Link from "next/link";
 import PageShell from "@/components/page-shell";
 import TicketCard, { type TicketCardModel } from "@/components/ticket-card";
 import { api } from "@/lib/api-client";
 import { ErrorBanner, PageIntro, SearchInput, EmptyState } from "@/components/dc-ui";
 
-type KindFilter = "all" | "request" | "entry" | "purchase";
+type KindFilter = "all" | "request" | "purchase";
 
 const CATEGORY_COLORS = ["#1560f0", "#0d9488", "#6d5bd0", "#d97706", "#e11d48", "#0891b2", "#4f46e5", "#059669"];
 
@@ -28,7 +29,6 @@ function CategoryCapsule({
   title,
   total,
   req,
-  inv,
   pur,
   color,
   active,
@@ -37,7 +37,6 @@ function CategoryCapsule({
   title: string;
   total: number;
   req: number;
-  inv: number;
   pur: number;
   color: string;
   active?: boolean;
@@ -74,7 +73,6 @@ function CategoryCapsule({
           Series
         </div>
         <Row label="REQ" value={req} color="#1560f0" />
-        <Row label="INV" value={inv} color="#6d5bd0" />
         <Row label="PUR" value={pur} color="#0d9488" />
       </div>
       <div
@@ -102,7 +100,7 @@ function CategoryCapsule({
           {total === 0 ? "No tickets" : `${Math.round((req / Math.max(total, 1)) * 100)}% issues`}
         </div>
         <div style={{ fontSize: 11, color: "#4a5878", marginTop: 4 }}>
-          {total === 0 ? "—" : `${Math.round((inv / Math.max(total, 1)) * 100)}% entries`}
+          {total === 0 ? "—" : `${Math.round((pur / Math.max(total, 1)) * 100)}% purchase`}
         </div>
       </div>
     </button>
@@ -147,7 +145,8 @@ export default function TicketsPage() {
         api.get<TicketCardModel[]>("/api/tickets"),
         api.get<{ name: string; color?: string }[]>("/api/categories").catch(() => []),
       ]);
-      setTickets(d);
+      // INV stock-in entries live on Item Master — tickets = operational REQ/PUR only.
+      setTickets(d.filter((t) => t.kind !== "entry"));
       const map: Record<string, string> = {};
       for (const c of cats) {
         if (c.name && c.color) map[c.name.toLowerCase()] = c.color;
@@ -171,17 +170,15 @@ export default function TicketsPage() {
   }, [kind, category, search]);
 
   const reqCount = useMemo(() => tickets.filter((t) => t.kind === "request").length, [tickets]);
-  const entryCount = useMemo(() => tickets.filter((t) => t.kind === "entry").length, [tickets]);
   const purchaseCount = useMemo(() => tickets.filter((t) => t.kind === "purchase").length, [tickets]);
 
   const categoryStats = useMemo(() => {
-    const map = new Map<string, { total: number; req: number; inv: number; pur: number }>();
+    const map = new Map<string, { total: number; req: number; pur: number }>();
     for (const t of tickets) {
       const name = (t.category || "Uncategorized").trim() || "Uncategorized";
-      const cur = map.get(name) || { total: 0, req: 0, inv: 0, pur: 0 };
+      const cur = map.get(name) || { total: 0, req: 0, pur: 0 };
       cur.total += 1;
       if (t.kind === "request") cur.req += 1;
-      else if (t.kind === "entry") cur.inv += 1;
       else if (t.kind === "purchase") cur.pur += 1;
       map.set(name, cur);
     }
@@ -199,11 +196,10 @@ export default function TicketsPage() {
       name: "All",
       total: tickets.length,
       req: reqCount,
-      inv: entryCount,
       pur: purchaseCount,
       color: "#0b1b45",
     }),
-    [tickets.length, reqCount, entryCount, purchaseCount]
+    [tickets.length, reqCount, purchaseCount]
   );
 
   const filtered = useMemo(() => {
@@ -232,10 +228,15 @@ export default function TicketsPage() {
   return (
     <PageShell section="Overview" page="Tickets" maxWidth={1320}>
       <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", gap: 16, marginBottom: 18, flexWrap: "wrap" }}>
-        <PageIntro
-          title="Tickets"
-          description="All inventory tickets — entries (INV), stock issues (REQ), and purchases (PUR). Filter by category below."
-        />
+        <div>
+          <PageIntro
+            title="Tickets"
+            description="Stock issues (REQ) and purchases (PUR). Inventory entries and AI reference tags live on Item Master."
+          />
+          <Link href="/item-master" style={{ fontSize: 12.5, fontWeight: 600, color: "#1560f0", textDecoration: "none" }}>
+            Open Item Master →
+          </Link>
+        </div>
         <button
           type="button"
           onClick={() => {
@@ -259,7 +260,6 @@ export default function TicketsPage() {
 
       {loadError && <ErrorBanner message={loadError} />}
 
-      {/* By Category — same idea as telegram-maintenance dashboard capsules */}
       <div style={{ marginBottom: 22 }}>
         <div style={{ fontSize: 15, fontWeight: 700, color: "#0b1b45", marginBottom: 12 }}>By Category</div>
         <div
@@ -269,19 +269,13 @@ export default function TicketsPage() {
             gap: 12,
           }}
         >
-          <CategoryCapsule
-            {...allStats}
-            title="All"
-            active={!category}
-            onClick={() => selectCategory("All")}
-          />
+          <CategoryCapsule {...allStats} title="All" active={!category} onClick={() => selectCategory("All")} />
           {categoryStats.map((cat) => (
             <CategoryCapsule
               key={cat.name}
               title={cat.name}
               total={cat.total}
               req={cat.req}
-              inv={cat.inv}
               pur={cat.pur}
               color={cat.color}
               active={category.toLowerCase() === cat.name.toLowerCase()}
@@ -321,7 +315,6 @@ export default function TicketsPage() {
               [
                 ["all", "All", "#3a4a68"],
                 ["request", `REQ (${reqCount})`, "#1560f0"],
-                ["entry", `INV (${entryCount})`, "#6d5bd0"],
                 ["purchase", `PUR (${purchaseCount})`, "#0d9488"],
               ] as const
             ).map(([k, label, color]) => (
@@ -344,9 +337,7 @@ export default function TicketsPage() {
 
         <div style={{ padding: 16, background: "#f6f8fb", minHeight: 280 }}>
           {loading && tickets.length === 0 ? <EmptyState text="Loading tickets…" /> : null}
-          {!loading && filtered.length === 0 ? (
-            <EmptyState text="No tickets match these filters." />
-          ) : null}
+          {!loading && filtered.length === 0 ? <EmptyState text="No tickets match these filters." /> : null}
 
           <div style={{ display: "grid", gap: 12 }}>
             {visible.map((t) => (
