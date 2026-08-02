@@ -106,6 +106,21 @@ export type BotSession = {
   // above, so re-entering the step always starts from the full catalogue.
   productQuery?: string;
   productPage?: number;
+  // AI / fuzzy suggestions on item_capture. While set with awaiting=true the
+  // step shows pick buttons instead of advancing.
+  itemSuggest?: {
+    awaiting: boolean;
+    typed?: string;
+    labels: string[];
+    imageFileId?: string;
+    candidates: {
+      name: string;
+      productId?: string;
+      productNumber?: string;
+      score: number;
+      source: string;
+    }[];
+  };
   approval?: { stepInstanceId: string; awaitingRole: string; decidedBy?: string; decision?: "ok" | "no" };
   status: "active" | "awaiting_approval" | "completed" | "cancelled";
   lastMessageId?: number;
