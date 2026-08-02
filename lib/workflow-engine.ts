@@ -1,5 +1,5 @@
-import type { Db, Document, ObjectId } from "mongodb";
-import { aiConfigured, identifyItemFromImage, normalizeItemName } from "./ai";
+import { ObjectId, type Db, type Document } from "mongodb";
+import { aiConfigured, identifyItemFromImage, normalizeItemName, expandReferenceNames, localReferenceExpansions } from "./ai";
 import { logAudit } from "./audit";
 import { cached } from "./cache";
 import { defer } from "./defer";
@@ -10,8 +10,8 @@ import {
   locationPathById,
 } from "./locations";
 import { isDuplicateKeyError } from "./mongodb";
-import { upsertAliases } from "./product-aliases";
-import { productMatchesFuzzy, rankItemSuggestions, type MatchCandidate } from "./product-match";
+import { findAlias, upsertAliases } from "./product-aliases";
+import { aliasesByProductId, productMatchesFuzzy, rankItemSuggestions, type MatchCandidate } from "./product-match";
 import { activeProducts } from "./product-store";
 import { attributeValues, productLabel, type ProductAttribute } from "./products";
 import { receiptKey, recordMovement } from "./stock";
@@ -69,7 +69,9 @@ async function productOptions(db: Db, session: BotSession, step: StepInstance): 
   const category = step.config.filterByCategory ? answerValue(session, "category_select") : undefined;
   const scoped = category ? all.filter((p) => String(p.category ?? "") === String(category)) : all;
   const query = session.productQuery ?? "";
-  return query ? scoped.filter((p) => productMatchesFuzzy(p, query)) : scoped;
+  if (!query) return scoped;
+  const aliasMap = await aliasesByProductId(db);
+  return scoped.filter((p) => productMatchesFuzzy(p, query, aliasMap.get(p._id.toString()) || []));
 }
 
 function productAttributes(p: Document): ProductAttribute[] {
@@ -221,7 +223,7 @@ function renderItemSuggest(session: BotSession, step: StepInstance): RenderResul
   if (suggest.imageFileId) lines.push("📷 Photo received");
   if (top) lines.push(`Looks like: <b>${escHtml(top)}</b>`);
   if (suggest.labels.length > 1) {
-    lines.push(`Also: ${suggest.labels.slice(0, 4).map(escHtml).join(", ")}`);
+    lines.push(`Also: ${suggest.labels.slice(0, 6).map(escHtml).join(", ")}`);
   }
   if (suggest.typed) lines.push(`You typed: <i>${escHtml(suggest.typed)}</i>`);
   lines.push("", "Tap a recommendation:");
@@ -390,7 +392,9 @@ async function handleItemCaptureInput(
     try {
       const file = await downloadFileBytes(image);
       if (file) {
+        console.log(`[ai] vision start bytes=${file.bytes.length} mime=${file.mime}`);
         labels = await identifyItemFromImage(file.bytes, file.mime, name || undefined);
+        console.log(`[ai] vision labels=${JSON.stringify(labels)}`);
       } else if (/^(1|true|yes)$/i.test(process.env.AI_MOCK || "")) {
         labels = await identifyItemFromImage(Buffer.from([]), "image/jpeg", name || undefined);
       } else {
@@ -415,12 +419,12 @@ async function handleItemCaptureInput(
         display: "(image)",
         imageFileId: image,
       };
+      const hint = visionError
+        ? `\n<i>${escHtml(visionError.slice(0, 160))}</i>`
+        : "\n<i>Nemotron returned no product names — try a clearer photo or type the name.</i>";
       return {
         render: {
-          text:
-            `${step.label || "Item"}\n\n📷 Photo saved, but AI could not name it` +
-            (visionError ? ` (${escHtml(visionError.slice(0, 80))})` : "") +
-            `.\nType the item name.`,
+          text: `${step.label || "Item"}\n\n📷 Photo saved, but Nemotron could not name it.${hint}\n\nType the item name.`,
           keyboard: navRow(session),
         },
       };
@@ -455,10 +459,44 @@ async function commitItemName(
   if (!name) return { notice: "Pick or type an item name." };
 
   let productId = opts.productId;
+  let productName = name;
   if (!productId) {
     const products = await activeProducts(db);
     const hit = products.find((p) => String(p.name ?? "").toLowerCase() === name.toLowerCase());
-    if (hit) productId = hit._id.toString();
+    if (hit) {
+      productId = hit._id.toString();
+      productName = String(hit.name ?? name);
+    }
+  } else {
+    try {
+      const p = await db.collection("products").findOne({ _id: new ObjectId(productId) }, { projection: { name: 1 } });
+      if (p?.name) productName = String(p.name);
+    } catch {
+      /* keep name */
+    }
+  }
+
+  // If still no product row, link via an existing alias of this spelling.
+  if (!productId) {
+    const aliased = await findAlias(db, name);
+    if (aliased?.productId) {
+      productId = aliased.productId;
+      productName = aliased.productName || name;
+    }
+  }
+
+  // Fuzzy-link to Product Master so reference tags still land on a real item.
+  if (!productId) {
+    const ranked = await rankItemSuggestions(db, {
+      typed: name,
+      labels: opts.aliases,
+      limit: 1,
+    });
+    const top = ranked[0];
+    if (top?.productId && top.score >= 55) {
+      productId = top.productId;
+      productName = top.name;
+    }
   }
 
   session.answers[step.instanceId] = {
@@ -467,12 +505,18 @@ async function commitItemName(
     display: name,
     imageFileId: opts.imageFileId || session.itemSuggest?.imageFileId || session.answers[step.instanceId]?.imageFileId,
   };
+  const seedAliases = [...(opts.aliases ?? []), name, ...localReferenceExpansions(name), ...localReferenceExpansions(productName)];
   session.itemSuggest = undefined;
 
+  // Persist AI + alternate reference names on Product Master so Item Master /
+  // Telegram autocorrect keep learning (e.g. "c type cable" → USB-C cable).
   if (productId) {
-    const aliases = [...(opts.aliases ?? [])].map((a) => a.trim()).filter(Boolean);
+    const pid = productId;
+    const pname = productName;
     defer(async () => {
-      await upsertAliases(db, productId!, name, aliases, "ai");
+      const expanded = await expandReferenceNames(pname, seedAliases);
+      await upsertAliases(db, pid, pname, expanded, "ai");
+      console.log(`[ai] saved ${expanded.length} reference names for ${pname}`);
     });
   }
 

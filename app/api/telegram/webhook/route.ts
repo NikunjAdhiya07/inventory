@@ -25,11 +25,14 @@ const ok = () => NextResponse.json({ ok: true });
 
 function pickPhotoFileId(photos: { file_id: string; file_size?: number; width?: number }[] | undefined): string | undefined {
   if (!photos?.length) return undefined;
-  // Prefer a mid-size frame (~800–1280px). The largest Telegram size is often
-  // multi‑MB and makes vision slow or fail; the smallest is too blurry.
+  // Prefer ~640–900px: sharp enough for Nemotron, small enough that getFile +
+  // download finish before Telegram timeouts on slow links.
   const ranked = [...photos].sort((a, b) => (a.width ?? 0) - (b.width ?? 0));
   const mid =
-    ranked.find((p) => (p.width ?? 0) >= 800) ?? ranked[Math.max(0, ranked.length - 2)] ?? ranked[ranked.length - 1];
+    ranked.find((p) => (p.width ?? 0) >= 640 && (p.width ?? 0) <= 1000) ??
+    ranked.find((p) => (p.width ?? 0) >= 500) ??
+    ranked[Math.max(0, ranked.length - 2)] ??
+    ranked[ranked.length - 1];
   return mid.file_id;
 }
 

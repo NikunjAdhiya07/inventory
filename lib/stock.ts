@@ -3,7 +3,8 @@ import { cached, invalidate } from "./cache";
 import { locationPathFrom, locationsByIdForPaths } from "./locations";
 import { isDuplicateKeyError } from "./mongodb";
 import { activeProducts } from "./product-store";
-import { productMatches, type ProductAttribute } from "./products";
+import { aliasesByProductId, scoreProductQuery } from "./product-match";
+import { type ProductAttribute } from "./products";
 
 // The stock ledger.
 //
@@ -222,13 +223,17 @@ function productAttributes(p: Document): ProductAttribute[] {
 // Products in stock that match a free-text query, each with the locations
 // holding them.
 //
-// The match runs over the Product Master (name, number, category and every
-// attribute value — see `productMatches`), so "Type-C cable" and "C cable wire"
-// both find the same product. Only products with a positive balance somewhere
-// are returned: this search exists to answer "can I have one", and offering
-// something with nothing behind it just moves the disappointment later.
+// Match uses Product Master (name, number, attributes) PLUS AI/manual reference
+// names (SEO keywords in productAliases) — so "c type cable" finds "USB-C Cable"
+// when those tags were saved from the entry bot. Only products with a positive
+// balance somewhere are returned.
 export async function searchStock(db: Db, query: string, limit = 40): Promise<StockHit[]> {
-  const [products, all, byId] = await Promise.all([activeProducts(db), balances(db), locationsByIdForPaths(db)]);
+  const [products, all, byId, aliasMap] = await Promise.all([
+    activeProducts(db),
+    balances(db),
+    locationsByIdForPaths(db),
+    aliasesByProductId(db),
+  ]);
 
   // Group the balances by product once, so the per-product lookup below is a map
   // hit rather than a scan of every balance in the system.
@@ -239,12 +244,15 @@ export async function searchStock(db: Db, query: string, limit = 40): Promise<St
     else linesByProduct.set(b.productId, [b]);
   }
 
-  const hits: StockHit[] = [];
+  const scored: { hit: StockHit; score: number }[] = [];
   for (const p of products) {
     const productId = p._id.toString();
     const held = linesByProduct.get(productId);
     if (!held?.length) continue;
-    if (!productMatches(p, query)) continue;
+
+    const score = scoreProductQuery(p, query, aliasMap.get(productId) || []);
+    // 55 ≈ fuzzy / strong keyword hit; below that is noise for stock search.
+    if (score < 55) continue;
 
     const lines: StockLine[] = held
       .map((b) => ({
@@ -260,19 +268,23 @@ export async function searchStock(db: Db, query: string, limit = 40): Promise<St
       // be sent to, so it should not be the one below the fold.
       .sort((a, b) => b.qty - a.qty || a.locationPath.localeCompare(b.locationPath));
 
-    hits.push({
-      productId,
-      name: String(p.name ?? ""),
-      productNumber: String(p.productNumber ?? ""),
-      category: String(p.category ?? ""),
-      subcategory: String(p.subcategory ?? ""),
-      unit: String(p.unit ?? ""),
-      attributes: productAttributes(p),
-      lines,
-      total: lines.reduce((sum, l) => sum + l.qty, 0),
+    scored.push({
+      score,
+      hit: {
+        productId,
+        name: String(p.name ?? ""),
+        productNumber: String(p.productNumber ?? ""),
+        category: String(p.category ?? ""),
+        subcategory: String(p.subcategory ?? ""),
+        unit: String(p.unit ?? ""),
+        attributes: productAttributes(p),
+        lines,
+        total: lines.reduce((sum, l) => sum + l.qty, 0),
+      },
     });
-    if (hits.length >= limit) break;
   }
 
-  return hits;
+  // Best SEO / name match first, then most stock on hand.
+  scored.sort((a, b) => b.score - a.score || b.hit.total - a.hit.total || a.hit.name.localeCompare(b.hit.name));
+  return scored.slice(0, limit).map((s) => s.hit);
 }
