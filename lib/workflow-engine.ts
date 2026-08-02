@@ -216,14 +216,18 @@ function truncateLabel(s: string, n: number): string {
 
 function renderItemSuggest(session: BotSession, step: StepInstance): RenderResult {
   const suggest = session.itemSuggest!;
+  const top = suggest.candidates[0]?.name || suggest.labels[0] || "";
   const lines = [`<b>${escHtml(step.label || "Item")}</b>`, ""];
   if (suggest.imageFileId) lines.push("📷 Photo received");
+  if (top) lines.push(`Looks like: <b>${escHtml(top)}</b>`);
+  if (suggest.labels.length > 1) {
+    lines.push(`Also: ${suggest.labels.slice(0, 4).map(escHtml).join(", ")}`);
+  }
   if (suggest.typed) lines.push(`You typed: <i>${escHtml(suggest.typed)}</i>`);
-  if (suggest.labels.length) lines.push(`AI: ${suggest.labels.slice(0, 3).map(escHtml).join(", ")}`);
-  lines.push("", "Pick the item name:");
+  lines.push("", "Tap a recommendation:");
 
   const btns = suggest.candidates.map((c, i) => ({
-    text: truncateLabel(c.name, 28),
+    text: i === 0 ? `✔ ${truncateLabel(c.name, 26)}` : truncateLabel(c.name, 28),
     callback_data: `ai:pick:${i}`,
   }));
   const rows: InlineKeyboard = buttonRows(btns, 1);
@@ -240,7 +244,7 @@ async function presentItemSuggestions(
   db: Db,
   session: BotSession,
   step: StepInstance,
-  opts: { typed?: string; labels?: string[]; imageFileId?: string }
+  opts: { typed?: string; labels?: string[]; imageFileId?: string; forceSuggest?: boolean }
 ): Promise<EngineResult> {
   let candidates = await rankItemSuggestions(db, {
     typed: opts.typed,
@@ -248,8 +252,8 @@ async function presentItemSuggestions(
     limit: 5,
   });
 
-  // Optional AI text normalize when local ranking is weak.
-  if (opts.typed && candidates[0]?.score < 75 && aiConfigured()) {
+  // Optional AI text normalize when local ranking is weak (typed path only).
+  if (opts.typed && !opts.forceSuggest && candidates[0]?.score < 75 && aiConfigured()) {
     try {
       const products = await activeProducts(db);
       const guess = await normalizeItemName(
@@ -260,20 +264,22 @@ async function presentItemSuggestions(
         const extra = await rankItemSuggestions(db, { typed: guess, labels: [guess], limit: 5 });
         const merged = [...extra, ...candidates];
         const seen = new Set<string>();
-        candidates = merged.filter((c) => {
-          const k = (c.productId || c.name).toLowerCase();
-          if (seen.has(k)) return false;
-          seen.add(k);
-          return true;
-        }).slice(0, 5);
+        candidates = merged
+          .filter((c) => {
+            const k = (c.productId || c.name).toLowerCase();
+            if (seen.has(k)) return false;
+            seen.add(k);
+            return true;
+          })
+          .slice(0, 5);
       }
     } catch (err) {
       console.error("[ai] normalizeItemName failed:", err);
     }
   }
 
-  // Exact product name typed → skip the picker.
-  if (opts.typed && candidates[0]?.score >= 100 && candidates[0].source === "exact") {
+  // Exact product name typed → skip the picker (never for photo-driven flow).
+  if (!opts.forceSuggest && opts.typed && candidates[0]?.score >= 100 && candidates[0].source === "exact") {
     return commitItemName(db, session, step, {
       name: candidates[0].name,
       productId: candidates[0].productId,
@@ -282,16 +288,36 @@ async function presentItemSuggestions(
     });
   }
 
+  // Ensure AI labels always appear as tappable recommendations.
+  if (opts.labels?.length) {
+    for (const label of opts.labels) {
+      if (!candidates.some((c) => c.name.toLowerCase() === label.toLowerCase())) {
+        candidates.push({ name: label, score: 50, source: "ai" });
+      }
+    }
+    candidates = candidates.slice(0, 6);
+  }
+
   if (!candidates.length) {
     const fallbackName = opts.typed || opts.labels?.[0] || "";
     if (!fallbackName) {
-      return { notice: "Could not identify the item. Type a name." };
+      return {
+        render: {
+          text: `${step.label || "Item"}\n\n📷 Could not identify. Type the item name.`,
+          keyboard: navRow(session),
+        },
+      };
     }
-    return commitItemName(db, session, step, {
-      name: fallbackName,
-      imageFileId: opts.imageFileId || session.answers[step.instanceId]?.imageFileId,
-      aliases: opts.labels ?? [],
-    });
+    // Photo path always asks the user to confirm; typed-only may still commit.
+    if (opts.forceSuggest) {
+      candidates = [{ name: fallbackName, score: 40, source: "ai" }];
+    } else {
+      return commitItemName(db, session, step, {
+        name: fallbackName,
+        imageFileId: opts.imageFileId || session.answers[step.instanceId]?.imageFileId,
+        aliases: opts.labels ?? [],
+      });
+    }
   }
 
   session.itemSuggest = {
@@ -308,7 +334,6 @@ async function presentItemSuggestions(
     })),
   };
 
-  // Keep the photo on the answer even while waiting for a pick.
   if (opts.imageFileId) {
     const prev = session.answers[step.instanceId];
     session.answers[step.instanceId] = {
@@ -361,19 +386,27 @@ async function handleItemCaptureInput(
     }
 
     let labels: string[] = [];
+    let visionError = "";
     try {
       const file = await downloadFileBytes(image);
       if (file) {
         labels = await identifyItemFromImage(file.bytes, file.mime, name || undefined);
-      } else if (process.env.AI_MOCK) {
+      } else if (/^(1|true|yes)$/i.test(process.env.AI_MOCK || "")) {
         labels = await identifyItemFromImage(Buffer.from([]), "image/jpeg", name || undefined);
+      } else {
+        visionError = "could not download photo from Telegram";
       }
     } catch (err) {
+      visionError = err instanceof Error ? err.message : String(err);
       console.error("[ai] identifyItemFromImage failed:", err);
     }
 
     if (!labels.length && name) {
-      return presentItemSuggestions(db, session, step, { typed: name, imageFileId: image });
+      return presentItemSuggestions(db, session, step, {
+        typed: name,
+        imageFileId: image,
+        forceSuggest: true,
+      });
     }
     if (!labels.length) {
       session.answers[step.instanceId] = {
@@ -384,7 +417,10 @@ async function handleItemCaptureInput(
       };
       return {
         render: {
-          text: `${step.label || "Item"}\n\n📷 Photo saved. AI could not name it — type the item.`,
+          text:
+            `${step.label || "Item"}\n\n📷 Photo saved, but AI could not name it` +
+            (visionError ? ` (${escHtml(visionError.slice(0, 80))})` : "") +
+            `.\nType the item name.`,
           keyboard: navRow(session),
         },
       };
@@ -394,6 +430,7 @@ async function handleItemCaptureInput(
       typed: name || undefined,
       labels,
       imageFileId: image,
+      forceSuggest: true,
     });
   }
 

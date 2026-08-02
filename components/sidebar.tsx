@@ -27,6 +27,7 @@ const GROUPS: NavGroup[] = [
   {
     title: "Catalog",
     items: [
+      { key: "item-master", label: "Item Master", href: "/item-master", icon: "▣" },
       { key: "products", label: "Product Master", href: "/products", icon: "❐" },
       { key: "product-attributes", label: "Product Attributes", href: "/product-attributes", icon: "≡" },
       { key: "categories", label: "Categories", href: "/categories", icon: "▦" },

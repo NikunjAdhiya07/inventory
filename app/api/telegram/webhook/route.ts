@@ -23,6 +23,16 @@ export const dynamic = "force-dynamic";
 
 const ok = () => NextResponse.json({ ok: true });
 
+function pickPhotoFileId(photos: { file_id: string; file_size?: number; width?: number }[] | undefined): string | undefined {
+  if (!photos?.length) return undefined;
+  // Prefer a mid-size frame (~800–1280px). The largest Telegram size is often
+  // multi‑MB and makes vision slow or fail; the smallest is too blurry.
+  const ranked = [...photos].sort((a, b) => (a.width ?? 0) - (b.width ?? 0));
+  const mid =
+    ranked.find((p) => (p.width ?? 0) >= 800) ?? ranked[Math.max(0, ranked.length - 2)] ?? ranked[ranked.length - 1];
+  return mid.file_id;
+}
+
 // A role's permission set changes only when an admin edits the role, so reading
 // it per update was a round trip spent re-learning the same answer.
 async function rolePerms(db: Db, roleName: string): Promise<string[]> {
@@ -426,8 +436,8 @@ export async function POST(req: NextRequest) {
     (typeof message.text === "string" && message.text) ||
     (typeof message.caption === "string" && message.caption) ||
     undefined;
-  const photos = message.photo as { file_id: string }[] | undefined;
-  const imageFileId = photos?.length ? photos[photos.length - 1].file_id : undefined; // largest size
+  const photos = message.photo as { file_id: string; file_size?: number; width?: number }[] | undefined;
+  const imageFileId = pickPhotoFileId(photos);
 
   let session = sessionDoc as BotSession | null;
 
