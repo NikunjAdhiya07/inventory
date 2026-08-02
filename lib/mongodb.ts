@@ -62,6 +62,11 @@ const INDEX_SPECS: Record<string, { key: Document; unique?: boolean; partialFilt
     { key: { category: 1 } },
   ],
   productAttributes: [{ key: { order: 1 } }],
+  // Alternate spellings / AI labels for autocorrect on the entry bot.
+  productAliases: [
+    { key: { aliasKey: 1 }, unique: true },
+    { key: { productId: 1 } },
+  ],
   statuses: [{ key: { order: 1 } }],
   colors: [{ key: { group: 1 } }],
   users: [{ key: { tgId: 1 }, unique: true }],

@@ -61,6 +61,7 @@ const CACHED_COLLECTIONS = new Set([
   "locations",
   "products",
   "productAttributes",
+  "productAliases",
   "roles",
   "workflows",
   "workflowVersions",

@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import type { Db, Document, ObjectId } from "mongodb";
+import { aiConfigured } from "@/lib/ai";
 import { getDb, ensureIndexesOnce } from "@/lib/mongodb";
 import { cached } from "@/lib/cache";
 import { defer } from "@/lib/defer";
@@ -420,7 +421,11 @@ export async function POST(req: NextRequest) {
   }
 
   // ---------------- Messages ----------------
-  const text: string | undefined = message.text;
+  // Caption rides with photos; without this, "photo + name" loses the name.
+  const text: string | undefined =
+    (typeof message.text === "string" && message.text) ||
+    (typeof message.caption === "string" && message.caption) ||
+    undefined;
   const photos = message.photo as { file_id: string }[] | undefined;
   const imageFileId = photos?.length ? photos[photos.length - 1].file_id : undefined; // largest size
 
@@ -448,6 +453,11 @@ export async function POST(req: NextRequest) {
     const firstStep = session.steps[0];
     // A plain (non-command) opening message doubles as the item-capture input.
     if (!isCommand && firstStep?.type === "item_capture" && (text || imageFileId)) {
+      // Vision can take several seconds — show progress on the anchor first.
+      if (imageFileId && aiConfigured()) {
+        await render(session, "🔍 Identifying photo…", []);
+        await saveSession(db, session);
+      }
       const result = await applyMessage(db, session, { text, imageFileId });
       session.processedUpdateIds = [updateId];
       await deliverAndSave(db, session, result);
@@ -468,6 +478,11 @@ export async function POST(req: NextRequest) {
     session.processedUpdateIds = [...(session.processedUpdateIds ?? []), updateId].slice(-20);
     await deliverAndSave(db, session, { cancelled: true, render: { text: "Entry cancelled.", keyboard: [] } });
     return ok();
+  }
+
+  if (imageFileId && aiConfigured() && session.steps[session.stepIndex]?.type === "item_capture") {
+    await render(session, "🔍 Identifying photo…", []);
+    await saveSession(db, session);
   }
 
   const result = await applyMessage(db, session, { text, imageFileId });

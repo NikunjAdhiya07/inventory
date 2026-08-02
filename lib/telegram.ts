@@ -100,6 +100,36 @@ export async function getFile(fileId: string) {
   return call<{ file_path: string }>("getFile", { file_id: fileId });
 }
 
+// Download Telegram file bytes for vision / storage. Returns null when the bot
+// token is missing (dev stub) or Telegram refuses the file.
+export async function downloadFileBytes(
+  fileId: string
+): Promise<{ bytes: Buffer; mime: string; filePath: string } | null> {
+  if (!TOKEN) {
+    console.log("[telegram:stub] downloadFileBytes", fileId);
+    return null;
+  }
+  const meta = await getFile(fileId);
+  if (!meta?.file_path) return null;
+  try {
+    const res = await fetch(`https://api.telegram.org/file/bot${TOKEN}/${meta.file_path}`, {
+      signal: AbortSignal.timeout(TELEGRAM_TIMEOUT_MS * 3),
+    });
+    if (!res.ok) return null;
+    const buf = Buffer.from(await res.arrayBuffer());
+    const lower = meta.file_path.toLowerCase();
+    const mime = lower.endsWith(".png")
+      ? "image/png"
+      : lower.endsWith(".webp")
+        ? "image/webp"
+        : "image/jpeg";
+    return { bytes: buf, mime, filePath: meta.file_path };
+  } catch (err) {
+    console.error("[telegram] downloadFileBytes error:", err);
+    return null;
+  }
+}
+
 // Health probe: getChat succeeds only when the bot is a member of the chat and
 // the Telegram API is reachable, so a non-null result means the bot is live in
 // that group. In the dev stub (no token) this resolves truthy → "healthy".

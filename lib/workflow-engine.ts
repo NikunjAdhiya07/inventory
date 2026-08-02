@@ -1,4 +1,5 @@
 import type { Db, Document, ObjectId } from "mongodb";
+import { aiConfigured, identifyItemFromImage, normalizeItemName } from "./ai";
 import { logAudit } from "./audit";
 import { cached } from "./cache";
 import { defer } from "./defer";
@@ -9,10 +10,12 @@ import {
   locationPathById,
 } from "./locations";
 import { isDuplicateKeyError } from "./mongodb";
+import { upsertAliases } from "./product-aliases";
+import { productMatchesFuzzy, rankItemSuggestions, type MatchCandidate } from "./product-match";
 import { activeProducts } from "./product-store";
-import { attributeValues, productLabel, productMatches, type ProductAttribute } from "./products";
+import { attributeValues, productLabel, type ProductAttribute } from "./products";
 import { receiptKey, recordMovement } from "./stock";
-import { buttonRows, type InlineKeyboard } from "./telegram";
+import { buttonRows, downloadFileBytes, type InlineKeyboard } from "./telegram";
 import { nextTicketNumber } from "./ticket";
 import type { Answer, BotSession, ProductSnapshot, StepInstance } from "./workflow-types";
 
@@ -66,7 +69,7 @@ async function productOptions(db: Db, session: BotSession, step: StepInstance): 
   const category = step.config.filterByCategory ? answerValue(session, "category_select") : undefined;
   const scoped = category ? all.filter((p) => String(p.category ?? "") === String(category)) : all;
   const query = session.productQuery ?? "";
-  return query ? scoped.filter((p) => productMatches(p, query)) : scoped;
+  return query ? scoped.filter((p) => productMatchesFuzzy(p, query)) : scoped;
 }
 
 function productAttributes(p: Document): ProductAttribute[] {
@@ -203,6 +206,288 @@ function navRow(session: BotSession): InlineKeyboard {
   return [row];
 }
 
+function escHtml(s: unknown): string {
+  return String(s ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+function truncateLabel(s: string, n: number): string {
+  return s.length <= n ? s : `${s.slice(0, n - 1)}…`;
+}
+
+function renderItemSuggest(session: BotSession, step: StepInstance): RenderResult {
+  const suggest = session.itemSuggest!;
+  const lines = [`<b>${escHtml(step.label || "Item")}</b>`, ""];
+  if (suggest.imageFileId) lines.push("📷 Photo received");
+  if (suggest.typed) lines.push(`You typed: <i>${escHtml(suggest.typed)}</i>`);
+  if (suggest.labels.length) lines.push(`AI: ${suggest.labels.slice(0, 3).map(escHtml).join(", ")}`);
+  lines.push("", "Pick the item name:");
+
+  const btns = suggest.candidates.map((c, i) => ({
+    text: truncateLabel(c.name, 28),
+    callback_data: `ai:pick:${i}`,
+  }));
+  const rows: InlineKeyboard = buttonRows(btns, 1);
+  if (suggest.typed) {
+    rows.push([{ text: `Use “${truncateLabel(suggest.typed, 22)}” as typed`, callback_data: "ai:as:typed" }]);
+  }
+  if (suggest.labels[0] && !suggest.candidates.some((c) => c.name.toLowerCase() === suggest.labels[0].toLowerCase())) {
+    rows.push([{ text: `Use “${truncateLabel(suggest.labels[0], 22)}”`, callback_data: "ai:as:label" }]);
+  }
+  return { text: lines.join("\n"), keyboard: [...rows, ...navRow(session)] };
+}
+
+async function presentItemSuggestions(
+  db: Db,
+  session: BotSession,
+  step: StepInstance,
+  opts: { typed?: string; labels?: string[]; imageFileId?: string }
+): Promise<EngineResult> {
+  let candidates = await rankItemSuggestions(db, {
+    typed: opts.typed,
+    labels: opts.labels,
+    limit: 5,
+  });
+
+  // Optional AI text normalize when local ranking is weak.
+  if (opts.typed && candidates[0]?.score < 75 && aiConfigured()) {
+    try {
+      const products = await activeProducts(db);
+      const guess = await normalizeItemName(
+        opts.typed,
+        products.map((p) => String(p.name ?? "")).filter(Boolean)
+      );
+      if (guess) {
+        const extra = await rankItemSuggestions(db, { typed: guess, labels: [guess], limit: 5 });
+        const merged = [...extra, ...candidates];
+        const seen = new Set<string>();
+        candidates = merged.filter((c) => {
+          const k = (c.productId || c.name).toLowerCase();
+          if (seen.has(k)) return false;
+          seen.add(k);
+          return true;
+        }).slice(0, 5);
+      }
+    } catch (err) {
+      console.error("[ai] normalizeItemName failed:", err);
+    }
+  }
+
+  // Exact product name typed → skip the picker.
+  if (opts.typed && candidates[0]?.score >= 100 && candidates[0].source === "exact") {
+    return commitItemName(db, session, step, {
+      name: candidates[0].name,
+      productId: candidates[0].productId,
+      imageFileId: opts.imageFileId || session.answers[step.instanceId]?.imageFileId,
+      aliases: [...(opts.labels ?? []), opts.typed],
+    });
+  }
+
+  if (!candidates.length) {
+    const fallbackName = opts.typed || opts.labels?.[0] || "";
+    if (!fallbackName) {
+      return { notice: "Could not identify the item. Type a name." };
+    }
+    return commitItemName(db, session, step, {
+      name: fallbackName,
+      imageFileId: opts.imageFileId || session.answers[step.instanceId]?.imageFileId,
+      aliases: opts.labels ?? [],
+    });
+  }
+
+  session.itemSuggest = {
+    awaiting: true,
+    typed: opts.typed,
+    labels: opts.labels ?? [],
+    imageFileId: opts.imageFileId || session.answers[step.instanceId]?.imageFileId,
+    candidates: candidates.map((c: MatchCandidate) => ({
+      name: c.name,
+      productId: c.productId,
+      productNumber: c.productNumber,
+      score: c.score,
+      source: c.source,
+    })),
+  };
+
+  // Keep the photo on the answer even while waiting for a pick.
+  if (opts.imageFileId) {
+    const prev = session.answers[step.instanceId];
+    session.answers[step.instanceId] = {
+      type: "item_capture",
+      value: prev?.value ?? "",
+      display: String(prev?.display || "(image)"),
+      imageFileId: opts.imageFileId,
+    };
+  }
+
+  return { render: renderItemSuggest(session, step) };
+}
+
+async function handleItemCaptureInput(
+  db: Db,
+  session: BotSession,
+  step: StepInstance,
+  input: { text?: string; imageFileId?: string }
+): Promise<EngineResult> {
+  const name = (input.text ?? "").trim().slice(0, 80);
+  const image = input.imageFileId;
+  const priorImage = session.answers[step.instanceId]?.imageFileId;
+
+  if (step.config.requireImage && !image && !priorImage) {
+    return { notice: "Please send a photo of the item." };
+  }
+  if (!name && !image && !session.answers[step.instanceId] && !session.itemSuggest?.awaiting) {
+    return { notice: "Send a photo or type the item name." };
+  }
+
+  // Photo path: download + vision, then suggest.
+  if (image) {
+    if (!aiConfigured()) {
+      // No AI key — keep photo and wait for a typed name, or use caption if any.
+      session.answers[step.instanceId] = {
+        type: "item_capture",
+        value: name || session.answers[step.instanceId]?.value || "",
+        display: name || String(session.answers[step.instanceId]?.value || "(image)"),
+        imageFileId: image,
+      };
+      if (name) {
+        return presentItemSuggestions(db, session, step, { typed: name, imageFileId: image });
+      }
+      return {
+        render: {
+          text: `${step.label || "Item"}\n\n📷 Photo saved. Type the item name.`,
+          keyboard: navRow(session),
+        },
+      };
+    }
+
+    let labels: string[] = [];
+    try {
+      const file = await downloadFileBytes(image);
+      if (file) {
+        labels = await identifyItemFromImage(file.bytes, file.mime, name || undefined);
+      } else if (process.env.AI_MOCK) {
+        labels = await identifyItemFromImage(Buffer.from([]), "image/jpeg", name || undefined);
+      }
+    } catch (err) {
+      console.error("[ai] identifyItemFromImage failed:", err);
+    }
+
+    if (!labels.length && name) {
+      return presentItemSuggestions(db, session, step, { typed: name, imageFileId: image });
+    }
+    if (!labels.length) {
+      session.answers[step.instanceId] = {
+        type: "item_capture",
+        value: "",
+        display: "(image)",
+        imageFileId: image,
+      };
+      return {
+        render: {
+          text: `${step.label || "Item"}\n\n📷 Photo saved. AI could not name it — type the item.`,
+          keyboard: navRow(session),
+        },
+      };
+    }
+
+    return presentItemSuggestions(db, session, step, {
+      typed: name || undefined,
+      labels,
+      imageFileId: image,
+    });
+  }
+
+  // Text-only: fuzzy / alias suggestions.
+  if (name) {
+    return presentItemSuggestions(db, session, step, {
+      typed: name,
+      imageFileId: priorImage,
+    });
+  }
+
+  return { render: await renderCurrentStep(db, session) };
+}
+
+async function commitItemName(
+  db: Db,
+  session: BotSession,
+  step: StepInstance,
+  opts: { name: string; productId?: string; imageFileId?: string; aliases?: string[] }
+): Promise<EngineResult> {
+  const name = opts.name.trim().slice(0, 80);
+  if (!name) return { notice: "Pick or type an item name." };
+
+  let productId = opts.productId;
+  if (!productId) {
+    const products = await activeProducts(db);
+    const hit = products.find((p) => String(p.name ?? "").toLowerCase() === name.toLowerCase());
+    if (hit) productId = hit._id.toString();
+  }
+
+  session.answers[step.instanceId] = {
+    type: "item_capture",
+    value: name,
+    display: name,
+    imageFileId: opts.imageFileId || session.itemSuggest?.imageFileId || session.answers[step.instanceId]?.imageFileId,
+  };
+  session.itemSuggest = undefined;
+
+  if (productId) {
+    const aliases = [...(opts.aliases ?? [])].map((a) => a.trim()).filter(Boolean);
+    defer(async () => {
+      await upsertAliases(db, productId!, name, aliases, "ai");
+    });
+  }
+
+  return advance(db, session);
+}
+
+async function commitItemSuggestion(
+  db: Db,
+  session: BotSession,
+  step: StepInstance,
+  data: string
+): Promise<EngineResult> {
+  const suggest = session.itemSuggest;
+  if (!suggest?.awaiting) return { notice: "Send a photo or type a name first." };
+
+  if (data === "ai:as:typed") {
+    const typed = suggest.typed?.trim();
+    if (!typed) return { notice: "Nothing typed to use." };
+    return commitItemName(db, session, step, {
+      name: typed,
+      imageFileId: suggest.imageFileId,
+      aliases: suggest.labels,
+    });
+  }
+
+  if (data === "ai:as:label") {
+    const label = suggest.labels[0]?.trim();
+    if (!label) return { notice: "No AI label to use." };
+    const hit = suggest.candidates.find((c) => c.name.toLowerCase() === label.toLowerCase());
+    return commitItemName(db, session, step, {
+      name: label,
+      productId: hit?.productId,
+      imageFileId: suggest.imageFileId,
+      aliases: [...suggest.labels, suggest.typed ?? ""],
+    });
+  }
+
+  if (data.startsWith("ai:pick:")) {
+    const idx = Number(data.slice("ai:pick:".length));
+    const chosen = suggest.candidates[idx];
+    if (!chosen) return { notice: "That suggestion expired. Send again." };
+    return commitItemName(db, session, step, {
+      name: chosen.name,
+      productId: chosen.productId,
+      imageFileId: suggest.imageFileId,
+      aliases: [...suggest.labels, suggest.typed ?? "", ...suggest.candidates.map((c) => c.name)],
+    });
+  }
+
+  return { notice: "Use the buttons above." };
+}
+
 // ---------------------------------------------------------------------------
 // Rendering
 // ---------------------------------------------------------------------------
@@ -212,8 +497,16 @@ export async function renderCurrentStep(db: Db, session: BotSession): Promise<Re
   const label = step.label || step.type;
 
   switch (step.type) {
-    case "item_capture":
-      return { text: label, keyboard: navRow(session) };
+    case "item_capture": {
+      const suggest = session.itemSuggest;
+      if (suggest?.awaiting && suggest.candidates.length) {
+        return renderItemSuggest(session, step);
+      }
+      return {
+        text: `${label}\n\nSend a <b>photo</b> or type the item name.`,
+        keyboard: navRow(session),
+      };
+    }
 
     case "product_select": {
       const options = await productOptions(db, session, step);
@@ -324,21 +617,7 @@ export async function applyMessage(
 
   switch (step.type) {
     case "item_capture": {
-      const name = (input.text ?? "").trim();
-      const image = input.imageFileId;
-      if (step.config.requireImage && !image && !session.answers[step.instanceId]?.imageFileId) {
-        return { notice: "Please send a photo of the item." };
-      }
-      if (!name && !image && !session.answers[step.instanceId]) {
-        return { notice: "Send the item name and/or a photo." };
-      }
-      session.answers[step.instanceId] = {
-        type: "item_capture",
-        value: name || session.answers[step.instanceId]?.value || "",
-        display: name || String(session.answers[step.instanceId]?.value || "(image)"),
-        imageFileId: image || session.answers[step.instanceId]?.imageFileId,
-      };
-      return advance(db, session);
+      return handleItemCaptureInput(db, session, step, input);
     }
 
     case "custom_text": {
@@ -392,7 +671,14 @@ export async function applyCallback(db: Db, session: BotSession, data: string): 
     // Belt and braces for a stale keyboard from before the rule above existed.
     if (UNSKIPPABLE.has(step.type)) return { notice: "This step can't be skipped." };
     session.answers[step.instanceId] = { type: step.type, value: "", display: "(skipped)" };
+    session.itemSuggest = undefined;
     return advance(db, session);
+  }
+
+  // AI / fuzzy item name suggestions (item_capture).
+  if (data.startsWith("ai:")) {
+    if (step.type !== "item_capture") return { notice: "That button is for the item step." };
+    return commitItemSuggestion(db, session, step, data);
   }
 
   switch (step.type) {
@@ -555,6 +841,7 @@ export async function primeStep(db: Db, session: BotSession) {
   // most of the catalogue with no visible reason.
   session.productQuery = "";
   session.productPage = 0;
+  session.itemSuggest = undefined;
   const step = currentStep(session);
   if (!step) return;
 

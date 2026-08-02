@@ -28,6 +28,10 @@ const INDEX_SPECS = {
     { key: { category: 1 } },
   ],
   productAttributes: [{ key: { order: 1 } }],
+  productAliases: [
+    { key: { aliasKey: 1 }, unique: true },
+    { key: { productId: 1 } },
+  ],
   statuses: [{ key: { order: 1 } }],
   colors: [{ key: { group: 1 } }],
   users: [{ key: { tgId: 1 }, unique: true }],
