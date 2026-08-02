@@ -39,14 +39,18 @@ const seeds = {
   ],
   roles: [
     { name: "Admin", desc: "Full control over all master data", color: "#1560f0", users: 2, status: "Active", perms: ["Add Inventory", "Manage Masters", "Manage Workflows", "Approve Entries", "View Reports"] },
-    { name: "Inventory Manager", desc: "Runs day-to-day stock operations", color: "#0d9488", users: 5, status: "Active", perms: ["Add Inventory", "Approve Entries", "View Reports"] },
+    { name: "Inventory Manager", desc: "Runs day-to-day stock operations", color: "#0d9488", users: 5, status: "Active", perms: ["Add Inventory", "Approve Entries", "View Reports", "Request Items", "Issue Inventory"] },
+    // Decides on purchase tickets raised when nothing in stock matches. Holds no
+    // inventory permissions: approving a spend and moving stock are different
+    // jobs, and one person doing both is how a request approves itself.
+    { name: "Purchase Officer", desc: "Approves purchase requests for items not held in stock", color: "#db2777", users: 0, status: "Active", perms: ["Approve Purchase", "View Reports", "Request Items"] },
     { name: "Workflow Designer", desc: "Builds and edits custom workflows", color: "#8b5cf6", users: 3, status: "Active", perms: ["Manage Workflows", "View Reports"] },
     { name: "Viewer", desc: "Read-only access to reports", color: "#f59e0b", users: 11, status: "Active", perms: ["View Reports"] },
     // Given to anyone who joins a connected Telegram group (see lib/enrollment.ts).
     // Least privilege on purpose: enough to log an entry, nothing else. The bot
     // creates this role itself if it is missing, so editing the permissions here
     // — or in the console — is the one place that decides what a member can do.
-    { name: "Group Member", desc: "Anyone who joins a connected Telegram group. Can add inventory, nothing else.", color: "#0ea5e9", users: 0, status: "Active", perms: ["Add Inventory"] },
+    { name: "Group Member", desc: "Anyone who joins a connected Telegram group. Can add inventory and raise requests, nothing else.", color: "#0ea5e9", users: 0, status: "Active", perms: ["Add Inventory", "Request Items"] },
   ],
   users: [
     { username: "Asha Sharma", handle: "@asha", tgId: "584920113", role: "Admin", status: "Active" },

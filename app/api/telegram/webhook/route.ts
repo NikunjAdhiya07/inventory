@@ -6,7 +6,9 @@ import { defer } from "@/lib/defer";
 import { resolveWorkflow } from "@/lib/workflow-resolver";
 import { renderCurrentStep, applyMessage, applyCallback, primeStep, type EngineResult } from "@/lib/workflow-engine";
 import { sendMessage, editMessageText, answerCallbackQuery, type InlineKeyboard } from "@/lib/telegram";
-import { isGroupAllowed, noteBlockedGroup, recordGroupActivity, registerGroup } from "@/lib/telegram-health";
+import { groupConfig, noteBlockedGroup, recordGroupActivity, registerGroup } from "@/lib/telegram-health";
+import { handleRequestUpdate } from "@/lib/request-webhook";
+import { PERM_APPROVE_PURCHASE, PERM_ISSUE, PERM_REQUEST } from "@/lib/request-types";
 import {
   AUTO_ENROLL_ENABLED,
   displayName,
@@ -252,7 +254,8 @@ export async function POST(req: NextRequest) {
   //     and anyone can create a chat and add it. An unapproved chat enrols
   //     nobody, starts no entry and resolves no workflow — it only registers
   //     itself as pending so an admin has something to approve.
-  if (isGroupChat(chat.type) && !(await isGroupAllowed(db, chatId))) {
+  const group = isGroupChat(chat.type) ? await groupConfig(db, chatId) : { allowed: true, mode: "entry" as const };
+  if (isGroupChat(chat.type) && !group.allowed) {
     const announce = await noteBlockedGroup(db, chatId, chat.title);
     const reason = "⛔ This group isn't approved for the inventory bot yet. An admin has to enable it in the console.";
     if (callback) await answerCallbackQuery(callback.id, reason.replace("⛔ ", ""));
@@ -298,12 +301,16 @@ export async function POST(req: NextRequest) {
 
   // Started speculatively for plain messages: the result is cached, so when this
   // update turns out to begin a new entry the three-round-trip resolution has
-  // already happened alongside the lookups above instead of after them.
-  const workflowPromise = callback ? null : resolveWorkflow(db, chatId).catch(() => null);
+  // already happened alongside the lookups above instead of after them. A
+  // request group runs no workflow at all, so it resolves none.
+  const isRequestGroup = group.mode === "request";
+  const workflowPromise = callback || isRequestGroup ? null : resolveWorkflow(db, chatId).catch(() => null);
 
   const [auth, sessionDoc] = await Promise.all([
     authorize(db, userId, from, chatId, chat.type),
-    db.collection("botSessions").findOne(sessionQuery),
+    // Entry sessions do not exist in a request group; looking for one would be a
+    // round trip spent proving it every single update.
+    isRequestGroup ? Promise.resolve(null) : db.collection("botSessions").findOne(sessionQuery),
   ]);
 
   // Reaching here without an account now means one of two deliberate things:
@@ -317,8 +324,17 @@ export async function POST(req: NextRequest) {
     else await sendMessage(chatId, reason);
     return ok();
   }
-  if (!auth.perms.includes("Add Inventory") && !isApprovalCallback) {
-    const reason = `⛔ The ${auth.user.role} role can't add inventory. Ask an admin to grant it the "Add Inventory" permission.`;
+  // Which permission opens the door depends on what this group is for. An entry
+  // group needs "Add Inventory"; a request group needs any one of the three
+  // request permissions, because the same chat is where requesters, Inventory
+  // Managers and Purchase Officers all act. Which of the three a given button
+  // actually requires is checked again next to that button's handler.
+  const REQUEST_PERMS = [PERM_REQUEST, PERM_ISSUE, PERM_APPROVE_PURCHASE];
+  const needed = isRequestGroup ? REQUEST_PERMS : ["Add Inventory"];
+  if (!needed.some((p) => auth.perms.includes(p)) && !isApprovalCallback) {
+    const reason = isRequestGroup
+      ? `⛔ The ${auth.user.role} role can't use the request bot. Ask an admin to grant it the "${PERM_REQUEST}" permission.`
+      : `⛔ The ${auth.user.role} role can't add inventory. Ask an admin to grant it the "Add Inventory" permission.`;
     if (callback) await answerCallbackQuery(callback.id, reason.replace("⛔ ", ""));
     else await sendMessage(chatId, reason);
     return ok();
@@ -337,6 +353,27 @@ export async function POST(req: NextRequest) {
     })
   );
   defer(() => ensureIndexesOnce(db));
+
+  // ---------------- Request groups ----------------
+  // Everything below this point is the inventory-entry flow. A request group
+  // never reaches it: no session is opened, no workflow is resolved, and a typed
+  // message is a product search rather than the start of an entry.
+  if (isRequestGroup) {
+    await handleRequestUpdate(db, {
+      chatId,
+      updateId,
+      userId,
+      name,
+      handle: String(auth.user.handle || (from.username ? `@${from.username}` : "")),
+      dbUserId: auth.user._id.toString(),
+      perms: auth.perms,
+      ...(message ? { message: { text: message.text as string | undefined } } : {}),
+      ...(callback
+        ? { callback: { id: callback.id, data: callbackData, messageId: tappedMessageId } }
+        : {}),
+    });
+    return ok();
+  }
 
   // ---------------- Callback queries ----------------
   if (callback) {

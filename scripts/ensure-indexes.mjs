@@ -47,6 +47,19 @@ const INDEX_SPECS = {
     { key: { ticketNumber: 1 }, unique: true, partialFilterExpression: { ticketNumber: { $type: "string" } } },
     { key: { sessionId: 1 }, unique: true, partialFilterExpression: { sessionId: { $type: "string" } } },
   ],
+  stockMovements: [
+    { key: { productId: 1, locationId: 1 } },
+    { key: { movementKey: 1 }, unique: true, partialFilterExpression: { movementKey: { $type: "string" } } },
+    { key: { requestId: 1 } },
+    { key: { createdAt: -1 } },
+  ],
+  requests: [
+    { key: { chatId: 1, requesterUserId: 1, status: 1 } },
+    { key: { ticketNumber: 1 }, unique: true, partialFilterExpression: { ticketNumber: { $type: "string" } } },
+    { key: { anchorMessageId: 1 } },
+    { key: { status: 1, createdAt: -1 } },
+    { key: { createdAt: -1 } },
+  ],
 };
 
 const uri = process.env.MONGODB_URI;

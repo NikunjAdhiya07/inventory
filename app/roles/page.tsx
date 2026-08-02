@@ -6,7 +6,20 @@ import { api } from "@/lib/api-client";
 import { PageIntro, Modal, ModalHeader, ModalFooter, thStyle, tdStyle, labelStyle, inputStyle, secondaryBtnStyle, primaryBtnStyle, addBtnStyle, chipStyle, EmptyState, SortTh, toggleStyle, toggleKnobStyle } from "@/components/dc-ui";
 import { useSort } from "@/lib/use-sort";
 
-const PERMS = ["Add Inventory", "Manage Masters", "Manage Workflows", "Approve Entries", "View Reports"];
+const PERMS = [
+  "Add Inventory",
+  "Manage Masters",
+  "Manage Workflows",
+  "Approve Entries",
+  "View Reports",
+  // The request bot (a `request`-mode Telegram group). Kept separate from
+  // "Add Inventory" on purpose: someone who may ask for a cable is not
+  // thereby someone who may write to the inventory, and the person who
+  // hands it over is a third role again.
+  "Request Items",
+  "Issue Inventory",
+  "Approve Purchase",
+];
 
 // The permission the Telegram webhook actually gates messaging on
 // (`app/api/telegram/webhook/route.ts`). A person can only talk to the bot when

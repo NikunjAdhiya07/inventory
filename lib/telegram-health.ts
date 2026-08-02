@@ -11,6 +11,19 @@ export type BotHealth = "healthy" | "unhealthy" | "unknown";
 export type LogType = "health" | "command" | "update" | "error";
 export type LogLevel = "info" | "error";
 
+// What the bot does in a given group. One bot token can only ever have one
+// webhook, so both flows arrive at the same endpoint and the group decides which
+// one it is: `entry` runs the inventory-capture workflow, `request` runs the
+// search-and-request flow.
+//
+// Defaulting to `entry` is what keeps every group that existed before this
+// field behaving exactly as it did.
+export type GroupMode = "entry" | "request";
+
+export function groupMode(g: { mode?: string }): GroupMode {
+  return g.mode === "request" ? "request" : "entry";
+}
+
 // The status the console displays. Approval and a manual override both win over
 // health so an admin can hold a group offline even when the bot is perfectly
 // reachable; otherwise the last health-check result decides, falling back to any
@@ -43,6 +56,7 @@ export function deriveGroup<T extends Document & { id: string }>(g: T) {
     ...g,
     approved: isApproved(g as { approved?: boolean }),
     manualInactive: Boolean(g.manualInactive),
+    mode: groupMode(g as { mode?: string }),
     botHealth: (g.botHealth as BotHealth) ?? "unknown",
     lastSeenAt: (g.lastSeenAt as string | null) ?? null,
     lastCheckedAt: (g.lastCheckedAt as string | null) ?? null,
@@ -61,28 +75,39 @@ function discoveredGroupDefaults(chatId: string, title: string | undefined, now:
     status: "Active",
     manualInactive: false,
     approved: false,
+    // A discovered group captures inventory until an admin says otherwise. It is
+    // the older and more destructive of the two flows, so making it the default
+    // is a deliberate choice to fail towards the behaviour an admin already
+    // knows rather than towards a silent new one.
+    mode: "entry" as GroupMode,
     source: "telegram",
     createdAt: now,
   };
 }
 
-// May this chat drive the bot? Checked before anything else the webhook does for
-// a group, so an unapproved chat never enrols anyone or opens an entry.
+// May this chat drive the bot, and which flow does it run? Checked before
+// anything else the webhook does for a group, so an unapproved chat never enrols
+// anyone, opens an entry or raises a request.
+//
+// Both answers come from one document, so they are read together — the mode
+// costs nothing on top of the gate that was already here.
 //
 // Cached like the other read-mostly admin data: it is read on every single
-// update and only changes when someone approves, force-inactivates or deletes a
-// group — all of which run through the console's write path and invalidate it.
-export async function isGroupAllowed(db: Db, chatId: string): Promise<boolean> {
-  return cached(`telegramGroups:allowed:${chatId}`, async () => {
+// update and only changes when someone approves, force-inactivates, re-modes or
+// deletes a group — all of which run through the console's write path and
+// invalidate it.
+export async function groupConfig(db: Db, chatId: string): Promise<{ allowed: boolean; mode: GroupMode }> {
+  return cached(`telegramGroups:config:${chatId}`, async () => {
     const g = await db
       .collection("telegramGroups")
-      .findOne({ chatId }, { projection: { approved: 1, manualInactive: 1, status: 1 } });
+      .findOne({ chatId }, { projection: { approved: 1, manualInactive: 1, status: 1, mode: 1 } });
     // Never seen before: not approved, by definition.
-    if (!g) return false;
+    if (!g) return { allowed: false, mode: "entry" as GroupMode };
     // Health is deliberately not consulted here. An update arriving IS the bot
     // being reachable, so a stale "unhealthy" probe must not lock a live group
     // out of its own entries.
-    return isApproved(g as { approved?: boolean }) && !g.manualInactive && g.status !== "Inactive";
+    const allowed = isApproved(g as { approved?: boolean }) && !g.manualInactive && g.status !== "Inactive";
+    return { allowed, mode: groupMode(g as { mode?: string }) };
   });
 }
 

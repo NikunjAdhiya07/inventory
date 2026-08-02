@@ -2,9 +2,16 @@ import type { Db, Document, ObjectId } from "mongodb";
 import { logAudit } from "./audit";
 import { cached } from "./cache";
 import { defer } from "./defer";
+import {
+  activeLocations,
+  locationChildren,
+  locationParentIds,
+  locationPathById,
+} from "./locations";
 import { isDuplicateKeyError } from "./mongodb";
 import { activeProducts } from "./product-store";
 import { attributeValues, productLabel, productMatches, type ProductAttribute } from "./products";
+import { receiptKey, recordMovement } from "./stock";
 import { buttonRows, type InlineKeyboard } from "./telegram";
 import { nextTicketNumber } from "./ticket";
 import type { Answer, BotSession, ProductSnapshot, StepInstance } from "./workflow-types";
@@ -92,35 +99,6 @@ function productButtonText(p: Document): string {
   return text.length > 42 ? `${text.slice(0, 41)}…` : text;
 }
 
-// The whole active location tree in one query. It backs both child listings and
-// id lookups, so walking a path costs no round trips at all — it used to cost one
-// per level.
-async function activeLocations(db: Db) {
-  return cached("locations:active", () =>
-    db.collection("locations").find({ status: "Active" }).sort({ name: 1 }).toArray()
-  );
-}
-
-async function locationChildren(db: Db, parent: string | null) {
-  const all = await activeLocations(db);
-  // Mongo's `{ parent: null }` matches a missing field too, so normalise here.
-  return all.filter((l) => (l.parent ?? null) === parent);
-}
-
-async function locationsById(db: Db) {
-  const all = await activeLocations(db);
-  return new Map(all.map((l) => [l._id.toString(), l]));
-}
-
-// Ids that have at least one active child. Drives both the button icon and the
-// decision to select-on-tap, without a query per option.
-async function locationParentIds(db: Db): Promise<Set<string>> {
-  const all = await activeLocations(db);
-  const ids = new Set<string>();
-  for (const l of all) if (l.parent) ids.add(String(l.parent));
-  return ids;
-}
-
 // The node a location step opens inside, from `config.defaultLocation` (a name).
 async function defaultLocationNode(db: Db, step: StepInstance) {
   const name = step.config.defaultLocation;
@@ -146,20 +124,6 @@ async function locationOptions(db: Db, session: BotSession, step: StepInstance) 
 
   const roots = await locationChildren(db, null);
   return [...children, ...roots.filter((r) => r._id.toString() !== currentParent)];
-}
-
-// Full path of a node, walked up through its parents. Independent of how the
-// cursor arrived there, so it stays correct after a jump between branches.
-async function locationPathById(db: Db, id: string): Promise<string> {
-  const byId = await locationsById(db);
-  const names: string[] = [];
-  let node = byId.get(id);
-  // Guard against a cycle in the stored parent pointers.
-  for (let hops = 0; node && hops < 20; hops++) {
-    names.unshift(String(node.name));
-    node = node.parent ? byId.get(String(node.parent)) : undefined;
-  }
-  return names.join(" › ");
 }
 
 // ---------------------------------------------------------------------------
@@ -833,6 +797,36 @@ async function finalize(db: Db, session: BotSession): Promise<EngineResult> {
     throw err;
   }
   session.status = "completed";
+
+  // A completed entry is stock arriving, so it posts to the ledger the request
+  // bot reads. The movement key is derived from the ticket number, so a retry
+  // that got this far a second time writes the same row and the index keeps one.
+  //
+  // Awaited so a frozen instance cannot drop it, but a failure is logged rather
+  // than thrown: the entry row is already durable and the user is watching for
+  // their ticket, so the recoverable outcome is a missing balance that
+  // `scripts/backfill-stock.mjs` can replay — not a confirmation that never came.
+  //
+  // A workflow with no product step, no location or no quantity cannot post —
+  // there is nothing to add, nowhere to add it, or no amount to add. Those
+  // entries stay a record of what happened without pretending to be a balance.
+  if (product && entry.fields.locationId && quantity !== null && quantity > 0) {
+    await recordMovement(db, {
+      movementKey: receiptKey(ticketNumber),
+      productId: product.id,
+      productName: product.name,
+      productNumber: product.productNumber,
+      locationId: entry.fields.locationId,
+      locationPath: entry.fields.locationPath,
+      qty: quantity,
+      unit: unit || product.unit || "",
+      reason: "receipt",
+      refType: "inventoryEntry",
+      refId: ticketNumber,
+      by: session.submittedByName,
+      createdAt: now.toISOString(),
+    }).catch((err) => console.error("[engine] stock receipt failed:", err));
+  }
 
   const productLine: [string, string][] = product
     ? [["Product", `${product.name} (${product.productNumber})`]]

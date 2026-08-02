@@ -51,9 +51,16 @@ async function ensureMemberRole(db: Db) {
     {
       $setOnInsert: {
         name: MEMBER_ROLE,
-        desc: "Anyone who joins a connected Telegram group. Can add inventory, nothing else.",
+        desc: "Anyone who joins a connected Telegram group. Can add inventory and raise requests, nothing else.",
         color: "#0ea5e9",
-        perms: ["Add Inventory"],
+        // Being in a connected group is the credential for both flows: an entry
+        // group member logs stock, a request group member asks for it. Neither
+        // grants the right to approve or issue anything.
+        //
+        // `$setOnInsert` means an installation that already created this role
+        // keeps its current permissions — "Request Items" has to be ticked once
+        // in the console there.
+        perms: ["Add Inventory", "Request Items"],
         status: "Active",
       },
     },

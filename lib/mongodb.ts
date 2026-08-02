@@ -89,6 +89,29 @@ const INDEX_SPECS: Record<string, { key: Document; unique?: boolean; partialFilt
     { key: { ticketNumber: 1 }, unique: true, partialFilterExpression: { ticketNumber: { $type: "string" } } },
     { key: { sessionId: 1 }, unique: true, partialFilterExpression: { sessionId: { $type: "string" } } },
   ],
+  // The stock ledger. On-hand is never stored — it is summed from these rows per
+  // product per location, so a movement can be added or corrected without any
+  // running total drifting out of agreement with its own history.
+  //
+  // `movementKey` is what makes a movement idempotent: the receipt for an entry
+  // and the issue for a request line each derive one deterministic key, so a
+  // retried webhook update writes the same row twice and the index keeps one.
+  stockMovements: [
+    { key: { productId: 1, locationId: 1 } },
+    { key: { movementKey: 1 }, unique: true, partialFilterExpression: { movementKey: { $type: "string" } } },
+    { key: { requestId: 1 } },
+    { key: { createdAt: -1 } },
+  ],
+  // Item requests and purchase requests. A draft IS the requester's live cart —
+  // there is no separate session collection — so the chat lookup that finds it
+  // runs on every update in a request group and gets its own compound index.
+  requests: [
+    { key: { chatId: 1, requesterUserId: 1, status: 1 } },
+    { key: { ticketNumber: 1 }, unique: true, partialFilterExpression: { ticketNumber: { $type: "string" } } },
+    { key: { anchorMessageId: 1 } },
+    { key: { status: 1, createdAt: -1 } },
+    { key: { createdAt: -1 } },
+  ],
 };
 
 export async function ensureIndexes(db?: Db): Promise<void> {
