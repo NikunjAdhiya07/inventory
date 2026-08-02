@@ -1,9 +1,20 @@
-import type { Db } from "mongodb";
+import type { Db, Document, ObjectId } from "mongodb";
 import { logAudit } from "./audit";
 import { cached } from "./cache";
 import { defer } from "./defer";
+import {
+  activeLocations,
+  locationChildren,
+  locationParentIds,
+  locationPathById,
+} from "./locations";
+import { isDuplicateKeyError } from "./mongodb";
+import { activeProducts } from "./product-store";
+import { attributeValues, productLabel, productMatches, type ProductAttribute } from "./products";
+import { receiptKey, recordMovement } from "./stock";
 import { buttonRows, type InlineKeyboard } from "./telegram";
-import type { BotSession, StepInstance } from "./workflow-types";
+import { nextTicketNumber } from "./ticket";
+import type { Answer, BotSession, ProductSnapshot, StepInstance } from "./workflow-types";
 
 export type RenderResult = { text: string; keyboard: InlineKeyboard };
 export type EngineResult = {
@@ -40,33 +51,52 @@ async function activeUnits(db: Db) {
   );
 }
 
-// The whole active location tree in one query. It backs both child listings and
-// id lookups, so walking a path costs no round trips at all — it used to cost one
-// per level.
-async function activeLocations(db: Db) {
-  return cached("locations:active", () =>
-    db.collection("locations").find({ status: "Active" }).sort({ name: 1 }).toArray()
-  );
+// ---------------------------------------------------------------------------
+// Product Master
+//
+// A catalogue is the one master that can outgrow a single inline keyboard, so
+// the step pages through it and accepts a typed search. Both the rendered page
+// and the tap that comes back resolve through `productOptions`, so the callback
+// index can never mean a different product than the button the user saw.
+// ---------------------------------------------------------------------------
+const PRODUCT_PAGE_SIZE = 8;
+
+async function productOptions(db: Db, session: BotSession, step: StepInstance): Promise<Document[]> {
+  const all = await activeProducts(db);
+  const category = step.config.filterByCategory ? answerValue(session, "category_select") : undefined;
+  const scoped = category ? all.filter((p) => String(p.category ?? "") === String(category)) : all;
+  const query = session.productQuery ?? "";
+  return query ? scoped.filter((p) => productMatches(p, query)) : scoped;
 }
 
-async function locationChildren(db: Db, parent: string | null) {
-  const all = await activeLocations(db);
-  // Mongo's `{ parent: null }` matches a missing field too, so normalise here.
-  return all.filter((l) => (l.parent ?? null) === parent);
+function productAttributes(p: Document): ProductAttribute[] {
+  if (!Array.isArray(p.attributes)) return [];
+  return p.attributes
+    .filter((a): a is Record<string, unknown> => Boolean(a) && typeof a === "object")
+    .map((a) => ({ name: String(a.name ?? ""), value: String(a.value ?? "") }))
+    .filter((a) => a.name && a.value);
 }
 
-async function locationsById(db: Db) {
-  const all = await activeLocations(db);
-  return new Map(all.map((l) => [l._id.toString(), l]));
+// Copied onto the answer so the entry keeps what was true when it was raised.
+function productSnapshot(p: Document): ProductSnapshot {
+  return {
+    id: p._id.toString(),
+    name: String(p.name ?? ""),
+    productNumber: String(p.productNumber ?? ""),
+    category: String(p.category ?? ""),
+    subcategory: String(p.subcategory ?? ""),
+    unit: String(p.unit ?? ""),
+    attributes: productAttributes(p),
+  };
 }
 
-// Ids that have at least one active child. Drives both the button icon and the
-// decision to select-on-tap, without a query per option.
-async function locationParentIds(db: Db): Promise<Set<string>> {
-  const all = await activeLocations(db);
-  const ids = new Set<string>();
-  for (const l of all) if (l.parent) ids.add(String(l.parent));
-  return ids;
+// Products differ from each other in their attributes as often as in their
+// names ("MS Round Pipe" twice, 50 mm and 80 mm), so the distinguishing values
+// go on the button. Telegram truncates long labels mid-word, so we do it first.
+function productButtonText(p: Document): string {
+  const values = attributeValues(productAttributes(p), 2);
+  const text = values ? `${p.name} · ${values}` : String(p.name ?? "");
+  return text.length > 42 ? `${text.slice(0, 41)}…` : text;
 }
 
 // The node a location step opens inside, from `config.defaultLocation` (a name).
@@ -94,20 +124,6 @@ async function locationOptions(db: Db, session: BotSession, step: StepInstance) 
 
   const roots = await locationChildren(db, null);
   return [...children, ...roots.filter((r) => r._id.toString() !== currentParent)];
-}
-
-// Full path of a node, walked up through its parents. Independent of how the
-// cursor arrived there, so it stays correct after a jump between branches.
-async function locationPathById(db: Db, id: string): Promise<string> {
-  const byId = await locationsById(db);
-  const names: string[] = [];
-  let node = byId.get(id);
-  // Guard against a cycle in the stored parent pointers.
-  for (let hops = 0; node && hops < 20; hops++) {
-    names.unshift(String(node.name));
-    node = node.parent ? byId.get(String(node.parent)) : undefined;
-  }
-  return names.join(" › ");
 }
 
 // ---------------------------------------------------------------------------
@@ -173,11 +189,16 @@ async function commitNumber(db: Db, session: BotSession, step: StepInstance, raw
 }
 
 // Standard footer: [Back?] [Skip?] [Cancel]
+// Steps that a Skip button must never appear on, however they were configured.
+// An approval marked optional in the builder would otherwise let the submitter
+// skip their own approval; a review step has its own Confirm.
+const UNSKIPPABLE: ReadonlySet<string> = new Set(["approval", "review_confirm"]);
+
 function navRow(session: BotSession): InlineKeyboard {
   const step = currentStep(session);
   const row = [];
   if (canGoBack(session)) row.push({ text: "⬅ Back", callback_data: "cb:back" });
-  if (step && !step.required && step.type !== "review_confirm") row.push({ text: "Skip ⤼", callback_data: "cb:skip" });
+  if (step && !step.required && !UNSKIPPABLE.has(step.type)) row.push({ text: "Skip ⤼", callback_data: "cb:skip" });
   row.push({ text: "✖ Cancel", callback_data: "cb:cancel" });
   return [row];
 }
@@ -193,6 +214,38 @@ export async function renderCurrentStep(db: Db, session: BotSession): Promise<Re
   switch (step.type) {
     case "item_capture":
       return { text: label, keyboard: navRow(session) };
+
+    case "product_select": {
+      const options = await productOptions(db, session, step);
+      const query = session.productQuery ?? "";
+      const pageCount = Math.max(1, Math.ceil(options.length / PRODUCT_PAGE_SIZE));
+      // Clamp rather than trust: a search that shortened the list can leave the
+      // cursor past the end, and an out-of-range page would render nothing.
+      const page = Math.min(Math.max(session.productPage ?? 0, 0), pageCount - 1);
+      session.productPage = page;
+      const start = page * PRODUCT_PAGE_SIZE;
+      const slice = options.slice(start, start + PRODUCT_PAGE_SIZE);
+
+      // The callback carries the index into the FULL filtered list, not into the
+      // page, so paging can never shift what a button means.
+      const btns = slice.map((p, i) => ({ text: productButtonText(p), callback_data: `prod:${start + i}` }));
+      const rows: InlineKeyboard = buttonRows(btns, 2);
+      const pager = [];
+      if (page > 0) pager.push({ text: "◀ Prev", callback_data: "prodpg:prev" });
+      if (page < pageCount - 1) pager.push({ text: "Next ▶", callback_data: "prodpg:next" });
+      if (query) pager.push({ text: "✖ Clear search", callback_data: "prodclr" });
+      if (pager.length) rows.push(pager);
+
+      const lines = [label];
+      if (query) lines.push(`<i>Search: “${query}” — ${options.length} match${options.length === 1 ? "" : "es"}</i>`);
+      else if (options.length > PRODUCT_PAGE_SIZE) lines.push("<i>Type a name, number or attribute to search.</i>");
+      if (!options.length) {
+        lines.push(query ? "<i>Nothing matches. Clear the search or type something else.</i>" : "<i>No products available yet.</i>");
+      } else if (pageCount > 1) {
+        lines.push(`<i>Showing ${start + 1}–${start + slice.length} of ${options.length}</i>`);
+      }
+      return { text: lines.join("\n"), keyboard: [...rows, ...navRow(session)] };
+    }
 
     case "category_select": {
       const cats = await activeCategories(db);
@@ -295,6 +348,24 @@ export async function applyMessage(
       return advance(db, session);
     }
 
+    case "product_select": {
+      // A typed message on a product step is a search, not an answer — the
+      // catalogue is too long to be a keyboard on its own.
+      const q = (input.text ?? "").trim().slice(0, 60);
+      if (!q) return { render: await renderCurrentStep(db, session) };
+      const previous = session.productQuery;
+      session.productQuery = q;
+      session.productPage = 0;
+      const matches = await productOptions(db, session, step);
+      if (!matches.length) {
+        // Keep the list the user could still act on rather than replacing it
+        // with an empty one.
+        session.productQuery = previous;
+        return { notice: `No product matches “${q}”.` };
+      }
+      return { render: await renderCurrentStep(db, session) };
+    }
+
     default:
       // Button-only step — number steps included, now that they are keypad-driven.
       // A typed message can't answer it, so re-render the step rather than emit a
@@ -318,6 +389,8 @@ export async function applyCallback(db: Db, session: BotSession, data: string): 
   if (data === "cb:back") return goBack(db, session);
   if (data === "cb:skip") {
     if (step.required) return { notice: "This step is required." };
+    // Belt and braces for a stale keyboard from before the rule above existed.
+    if (UNSKIPPABLE.has(step.type)) return { notice: "This step can't be skipped." };
     session.answers[step.instanceId] = { type: step.type, value: "", display: "(skipped)" };
     return advance(db, session);
   }
@@ -346,6 +419,31 @@ export async function applyCallback(db: Db, session: BotSession, data: string): 
 
       session.numberDraft = draft;
       return { render: await renderCurrentStep(db, session) };
+    }
+
+    case "product_select": {
+      if (data === "prodclr") {
+        session.productQuery = "";
+        session.productPage = 0;
+        return { render: await renderCurrentStep(db, session) };
+      }
+      if (data.startsWith("prodpg:")) {
+        session.productPage = Math.max(0, (session.productPage ?? 0) + (data === "prodpg:next" ? 1 : -1));
+        return { render: await renderCurrentStep(db, session) };
+      }
+      if (!data.startsWith("prod:")) return { notice: "Pick a product from the list." };
+
+      const options = await productOptions(db, session, step);
+      const chosen = options[indexOf(data, "prod:")];
+      if (!chosen) return { notice: "That product is no longer available." };
+      session.answers[step.instanceId] = {
+        type: "product_select",
+        // The id is the durable reference; the snapshot is what the ticket keeps.
+        value: chosen._id.toString(),
+        display: productLabel(chosen),
+        product: productSnapshot(chosen),
+      };
+      return advance(db, session);
     }
 
     case "category_select": {
@@ -452,6 +550,11 @@ async function selectLocation(db: Db, session: BotSession, step: StepInstance, i
 // engine's own entry points (advance/goBack) cover every later step.
 export async function primeStep(db: Db, session: BotSession) {
   session.locationCursor = { parentStack: [], currentParent: null };
+  // A product step always opens on the unfiltered first page, including when
+  // Back returns to it — a stale search from earlier in the entry would hide
+  // most of the catalogue with no visible reason.
+  session.productQuery = "";
+  session.productPage = 0;
   const step = currentStep(session);
   if (!step) return;
 
@@ -507,81 +610,273 @@ async function goBack(db: Db, session: BotSession): Promise<EngineResult> {
   return { render: await renderCurrentStep(db, session) };
 }
 
+// ---------------------------------------------------------------------------
+// Finalizing an entry — i.e. generating the ticket
+//
+// This runs once per entry and must keep running once per entry no matter how
+// the update that triggered it arrives. Three things can trigger it more than
+// once for the same entry:
+//
+//   1. an impatient double tap on Confirm — two updates, two distinct update
+//      ids, so the webhook's replay guard does not catch them;
+//   2. Telegram redelivering an update we were too slow to acknowledge;
+//   3. two instances handling those two updates concurrently.
+//
+// So the session is *claimed* with a conditional update before anything is
+// written, and the entry itself carries the session id under a unique index.
+// The claim serialises the common case; the index is the backstop for the case
+// where both updates got past it. A losing caller re-reads the entry that won
+// and shows the user that ticket, so a double tap looks like one confirmation
+// rather than two tickets or an error.
+// ---------------------------------------------------------------------------
+
+// The key that ties one entry to one session. Sessions normally have an _id by
+// the time an entry completes; a workflow short enough to finish on its very
+// first update may not, and there the chat + originating update id is just as
+// stable a key — and just as unique.
+function entryKey(session: BotSession): string {
+  if (session._id) return String(session._id);
+  return `start:${session.chatId}:${session.startUpdateId ?? "0"}`;
+}
+
+// Claim the right to write this session's entry. Returns false when another
+// update already finalized it.
+async function claimSession(db: Db, session: BotSession): Promise<boolean> {
+  if (!session._id) return true; // nothing persisted to race against yet
+  const claimed = await db.collection("botSessions").findOneAndUpdate(
+    { _id: session._id as ObjectId, status: { $ne: "completed" } },
+    { $set: { status: "completed", updatedAt: new Date().toISOString() } }
+  );
+  return Boolean(claimed);
+}
+
+// Undo a claim whose entry never got written. Best effort: if this write fails
+// too the session is simply left completed, which is the safe direction — an
+// entry that can't be retried beats a duplicate one.
+async function releaseClaim(db: Db, session: BotSession) {
+  if (!session._id) return;
+  session.status = "active";
+  // The engine had already stepped past the last step to get here. Park the
+  // cursor back on it so the user's next input re-runs the final step and can
+  // complete the entry, instead of landing on a step that no longer exists.
+  session.stepIndex = Math.min(session.stepIndex, Math.max(session.steps.length - 1, 0));
+  // Written explicitly rather than left to the caller: the throw that follows
+  // skips the webhook's own save.
+  await db
+    .collection("botSessions")
+    .updateOne({ _id: session._id as ObjectId }, { $set: { status: "active", stepIndex: session.stepIndex } })
+    .catch((err) => console.error("[engine] could not release the entry claim:", err));
+}
+
+async function alreadyTicketed(db: Db, session: BotSession): Promise<EngineResult> {
+  session.status = "completed";
+  const existing = await db
+    .collection("inventoryEntries")
+    .findOne({ sessionId: entryKey(session) }, { projection: { ticketNumber: 1 } });
+  // The winner is still mid-insert (two instances, same instant). Acknowledge
+  // without redrawing: its confirmation is the one that will land, and inventing
+  // a second one here would either duplicate it or show a ticketless success.
+  if (!existing?.ticketNumber) return { finished: true, notice: "This entry has already been submitted." };
+  return {
+    finished: true,
+    render: { text: confirmationText(session, String(existing.ticketNumber)), keyboard: [] },
+  };
+}
+
+function confirmationText(session: BotSession, ticketNumber: string): string {
+  const header = ticketNumber
+    ? `✅ <b>Inventory Successfully Added</b>\n🎫 Ticket: <code>${ticketNumber}</code>`
+    : "✅ <b>Inventory Successfully Added</b>";
+  return `${header}\n\n${summaryText(session)}`;
+}
+
+// Custom step labels are free text, and two steps in one workflow can carry the
+// same one. Keying the map by label alone silently dropped the earlier answer;
+// disambiguating keeps both, which is what the person filling the form expects.
+function uniqueKey(existing: Record<string, string>, label: string): string {
+  if (!(label in existing)) return label;
+  for (let n = 2; ; n++) {
+    const candidate = `${label} (${n})`;
+    if (!(candidate in existing)) return candidate;
+  }
+}
+
 async function finalize(db: Db, session: BotSession): Promise<EngineResult> {
+  // Cheap in-memory guard for a re-entry inside one invocation; the claim below
+  // is what covers separate requests and separate instances.
+  if (session.status === "completed") return alreadyTicketed(db, session);
+  if (!(await claimSession(db, session))) return alreadyTicketed(db, session);
+
   const custom: Record<string, string> = {};
   for (const s of session.steps) {
     const a = session.answers[s.instanceId];
-    if (!a) continue;
-    if (s.type === "custom_text" || s.type === "custom_number") custom[s.label] = String(a.display);
+    if (!a || a.display === "(skipped)") continue;
+    if (s.type === "custom_text" || s.type === "custom_number") {
+      custom[uniqueKey(custom, s.label || s.type)] = String(a.display);
+    }
   }
 
-  const itemStep = session.steps.find((s) => s.type === "item_capture");
-  const itemAnswer = itemStep ? session.answers[itemStep.instanceId] : undefined;
+  const itemAnswer = answerFor(session, "item_capture");
+  const product = answerFor(session, "product_select")?.product;
+
+  // A product step supplies facts the entry would otherwise have to ask for
+  // twice. An explicit answer always wins; the product only fills what the
+  // workflow never asked, so a captured entry is complete either way.
+  const itemName = String(itemAnswer?.value || product?.name || "");
+  const category = String(answerValue(session, "category_select") ?? product?.category ?? "");
+  const subcategory = String(answerValue(session, "subcategory_select") ?? product?.subcategory ?? "");
+  const unit = String(answerValue(session, "unit_select") ?? product?.unit ?? "");
+  // One shape for a quantity: a number, or null when the workflow never asked.
+  // It used to land as "" on a workflow without a quantity step and as a number
+  // otherwise, so anything reading entries had to handle both.
+  const rawQuantity = answerValue(session, "quantity");
+  const parsedQuantity = rawQuantity === undefined || rawQuantity === "" ? NaN : Number(rawQuantity);
+  const quantity = Number.isFinite(parsedQuantity) ? parsedQuantity : null;
+
+  const now = new Date();
+  const ticketNumber = await nextTicketNumber(db, now);
 
   const entry = {
+    ticketNumber,
+    // Unique-indexed: one session can only ever produce one ticket.
+    sessionId: entryKey(session),
     workflowId: session.workflowId,
     version: session.version,
     chatId: session.chatId,
     submittedByUserId: session.userId,
     submittedByName: session.submittedByName,
     fields: {
-      itemName: itemAnswer ? String(itemAnswer.value) : "",
-      imageFileId: itemAnswer?.imageFileId,
-      category: answerValue(session, "category_select") ?? "",
-      subcategory: answerValue(session, "subcategory_select") ?? "",
-      locationId: answerValue(session, "location_tree") ?? "",
+      itemName,
+      // Only set when there is one — an explicit `undefined` is stored as null
+      // by the driver, which reads as "this entry had no image" versus "this
+      // workflow never asked for one".
+      ...(itemAnswer?.imageFileId ? { imageFileId: itemAnswer.imageFileId } : {}),
+      ...(product
+        ? {
+            productId: product.id,
+            productName: product.name,
+            productNumber: product.productNumber,
+            // Snapshotted at the moment of choice: a later edit to the Product
+            // Master must not change what this ticket says was received.
+            attributes: product.attributes,
+          }
+        : {}),
+      category,
+      subcategory,
+      locationId: String(answerValue(session, "location_tree") ?? ""),
       locationPath: answerDisplay(session, "location_tree") ?? "",
-      quantity: answerValue(session, "quantity") ?? "",
-      unit: answerValue(session, "unit_select") ?? "",
+      quantity,
+      unit,
       custom,
     },
-    approval: session.approval?.decision ? { status: session.approval.decision === "ok" ? "approved" : "rejected", by: session.approval.decidedBy } : undefined,
+    ...(session.approval?.decision
+      ? {
+          approval: {
+            status: session.approval.decision === "ok" ? "approved" : "rejected",
+            by: session.approval.decidedBy ?? "",
+          },
+        }
+      : {}),
     status: "Completed" as const,
-    createdAt: new Date().toISOString(),
+    createdAt: now.toISOString(),
   };
 
   // The entry write stays awaited — "Inventory Successfully Added" must not be
   // sent before the row is durable. The audit row is bookkeeping, so it moves
   // behind the response instead of adding a second round trip to the wait.
-  await db.collection("inventoryEntries").insertOne(entry);
+  try {
+    await db.collection("inventoryEntries").insertOne(entry);
+  } catch (err) {
+    // Both updates got past the claim (concurrent instances). The index held,
+    // so exactly one entry exists — show its ticket instead of an error.
+    if (isDuplicateKeyError(err)) return alreadyTicketed(db, session);
+    // Anything else and the entry was NOT written. Hand the claim back, or the
+    // session stays marked completed with no ticket behind it and the user can
+    // neither retry nor recover what they typed.
+    await releaseClaim(db, session);
+    throw err;
+  }
   session.status = "completed";
+
+  // A completed entry is stock arriving, so it posts to the ledger the request
+  // bot reads. The movement key is derived from the ticket number, so a retry
+  // that got this far a second time writes the same row and the index keeps one.
+  //
+  // Awaited so a frozen instance cannot drop it, but a failure is logged rather
+  // than thrown: the entry row is already durable and the user is watching for
+  // their ticket, so the recoverable outcome is a missing balance that
+  // `scripts/backfill-stock.mjs` can replay — not a confirmation that never came.
+  //
+  // A workflow with no product step, no location or no quantity cannot post —
+  // there is nothing to add, nowhere to add it, or no amount to add. Those
+  // entries stay a record of what happened without pretending to be a balance.
+  if (product && entry.fields.locationId && quantity !== null && quantity > 0) {
+    await recordMovement(db, {
+      movementKey: receiptKey(ticketNumber),
+      productId: product.id,
+      productName: product.name,
+      productNumber: product.productNumber,
+      locationId: entry.fields.locationId,
+      locationPath: entry.fields.locationPath,
+      qty: quantity,
+      unit: unit || product.unit || "",
+      reason: "receipt",
+      refType: "inventoryEntry",
+      refId: ticketNumber,
+      by: session.submittedByName,
+      createdAt: now.toISOString(),
+    }).catch((err) => console.error("[engine] stock receipt failed:", err));
+  }
+
+  const productLine: [string, string][] = product
+    ? [["Product", `${product.name} (${product.productNumber})`]]
+    : [];
   defer(() =>
     logAudit(
       {
         action: "Created",
         dataType: "Inventory Entry",
-        entity: entry.fields.itemName || "(unnamed item)",
+        entity: ticketNumber,
         field: "New entry",
         before: "—",
-        after: entry.fields.itemName || "(unnamed item)",
+        after: itemName || "(unnamed item)",
         beforeFields: [["Item", "—"]],
         afterFields: [
-          ["Item", entry.fields.itemName || "—"],
-          ["Category", String(entry.fields.category)],
-          ["Location", String(entry.fields.locationPath)],
-          ["Quantity", `${entry.fields.quantity} ${entry.fields.unit}`],
+          ["Ticket", ticketNumber],
+          ["Item", itemName || "—"],
+          ...productLine,
+          ["Category", category || "—"],
+          ["Location", entry.fields.locationPath || "—"],
+          ["Quantity", quantity === null ? "—" : `${quantity} ${unit}`.trim()],
         ],
       },
       session.submittedByName
     )
   );
 
-  return {
-    finished: true,
-    render: { text: `✅ <b>Inventory Successfully Added</b>\n\n${summaryText(session)}`, keyboard: [] },
-  };
+  return { finished: true, render: { text: confirmationText(session, ticketNumber), keyboard: [] } };
 }
 
 // ---------------------------------------------------------------------------
 // Answer helpers
 // ---------------------------------------------------------------------------
+// The first step of a type that was actually ANSWERED. Matching on the step
+// alone meant a workflow with two steps of one type (or a skipped optional one)
+// reported the empty first answer and dropped the real one.
+function answerFor(session: BotSession, type: string): Answer | undefined {
+  for (const s of session.steps) {
+    if (s.type !== type) continue;
+    const a = session.answers[s.instanceId];
+    if (a && a.display !== "(skipped)" && a.value !== "") return a;
+  }
+  return undefined;
+}
+
 function answerValue(session: BotSession, type: string): string | number | undefined {
-  const step = session.steps.find((s) => s.type === type);
-  return step ? session.answers[step.instanceId]?.value : undefined;
+  return answerFor(session, type)?.value;
 }
 function answerDisplay(session: BotSession, type: string): string | undefined {
-  const step = session.steps.find((s) => s.type === type);
-  return step ? session.answers[step.instanceId]?.display : undefined;
+  return answerFor(session, type)?.display;
 }
 
 function summaryText(session: BotSession): string {
@@ -592,6 +887,12 @@ function summaryText(session: BotSession): string {
     if (s.type === "review_confirm" || s.type === "approval") continue;
     const label = s.label.replace(/[:：]\s*$/, "");
     lines.push(`• <b>${shortLabel(label, s.type)}:</b> ${a.display}`);
+    // A product's attributes ARE the product for a user checking their entry —
+    // 50 mm vs 80 mm is the whole difference — so they are spelled out under it
+    // rather than left inside the stored snapshot.
+    for (const attr of a.product?.attributes ?? []) {
+      lines.push(`   ↳ ${attr.name}: ${attr.value}`);
+    }
   }
   return lines.join("\n") || "<i>No data captured.</i>";
 }
@@ -600,6 +901,7 @@ function summaryText(session: BotSession): string {
 function shortLabel(label: string, type: string): string {
   const defaults: Record<string, string> = {
     item_capture: "Item",
+    product_select: "Product",
     category_select: "Category",
     subcategory_select: "Subcategory",
     location_tree: "Location",

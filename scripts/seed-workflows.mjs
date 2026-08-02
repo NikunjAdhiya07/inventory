@@ -31,13 +31,26 @@ const stepLibrary = [
     status: "Active",
   },
   {
+    type: "product_select",
+    name: "Product Select",
+    desc: "Pick a product from the Product Master; its attributes are captured with the entry.",
+    icon: "❐",
+    category: "select",
+    configSchema: [
+      { key: "dataSource", label: "Product source", type: "dataSource", default: "products", appliesToDataSource: "products" },
+      { key: "filterByCategory", label: "Filter by chosen category", type: "toggle", default: false },
+    ],
+    order: 2,
+    status: "Active",
+  },
+  {
     type: "category_select",
     name: "Category Select",
     desc: "Pick a top-level category from an inline keyboard.",
     icon: "▦",
     category: "select",
     configSchema: [{ key: "dataSource", label: "Category source", type: "dataSource", default: "categories", appliesToDataSource: "categories" }],
-    order: 2,
+    order: 3,
     status: "Active",
   },
   {
@@ -47,7 +60,7 @@ const stepLibrary = [
     icon: "▩",
     category: "select",
     configSchema: [{ key: "filterByCategory", label: "Filter by chosen category", type: "toggle", default: true }],
-    order: 3,
+    order: 4,
     status: "Active",
   },
   {
@@ -57,7 +70,7 @@ const stepLibrary = [
     icon: "▧",
     category: "select",
     configSchema: [{ key: "dataSource", label: "Location source", type: "dataSource", default: "locations", appliesToDataSource: "locations" }],
-    order: 4,
+    order: 5,
     status: "Active",
   },
   {
@@ -70,7 +83,7 @@ const stepLibrary = [
       { key: "numberMin", label: "Minimum", type: "number", default: 1 },
       { key: "numberMax", label: "Maximum (0 = no limit)", type: "number", default: 0 },
     ],
-    order: 5,
+    order: 6,
     status: "Active",
   },
   {
@@ -80,7 +93,7 @@ const stepLibrary = [
     icon: "⚖",
     category: "select",
     configSchema: [{ key: "dataSource", label: "Unit source", type: "dataSource", default: "units", appliesToDataSource: "units" }],
-    order: 6,
+    order: 7,
     status: "Active",
   },
   {
@@ -90,7 +103,7 @@ const stepLibrary = [
     icon: "✎",
     category: "custom",
     configSchema: [{ key: "placeholder", label: "Placeholder / hint", type: "text", default: "" }],
-    order: 7,
+    order: 8,
     status: "Active",
   },
   {
@@ -103,7 +116,7 @@ const stepLibrary = [
       { key: "numberMin", label: "Minimum", type: "number", default: 0 },
       { key: "numberMax", label: "Maximum (0 = no limit)", type: "number", default: 0 },
     ],
-    order: 8,
+    order: 9,
     status: "Active",
   },
   {
@@ -116,7 +129,7 @@ const stepLibrary = [
       { key: "approvalMode", label: "Approval mode", type: "select", options: ["single", "multi"], default: "single" },
       { key: "approverRole", label: "Approver role", type: "select", default: "Admin", appliesToDataSource: "roles" },
     ],
-    order: 9,
+    order: 10,
     status: "Active",
   },
   {
@@ -126,7 +139,7 @@ const stepLibrary = [
     icon: "☑",
     category: "control",
     configSchema: [],
-    order: 10,
+    order: 11,
     status: "Active",
   },
 ];
@@ -149,9 +162,10 @@ function defaultSteps() {
   ];
 }
 
+// Seeded by an admin, so approved — the bot refuses any group without it.
 const telegramGroups = [
-  { chatId: "-1001111111111", title: "Main Inventory Group", status: "Active" },
-  { chatId: "-1002222222222", title: "High-Value Items Group", status: "Active" },
+  { chatId: "-1001111111111", title: "Main Inventory Group", status: "Active", approved: true },
+  { chatId: "-1002222222222", title: "High-Value Items Group", status: "Active", approved: true },
 ];
 
 async function seedEmpty(db, collection, docs) {
@@ -165,12 +179,25 @@ async function seedEmpty(db, collection, docs) {
   return true;
 }
 
+// The step library is the palette the builder renders, and it is owned by this
+// seed rather than by any console screen — so it is synced by `type` instead of
+// only being written into an empty collection. Without this, an install that was
+// seeded before a step type existed would never see the new one.
+async function syncStepLibrary(db) {
+  let added = 0;
+  for (const entry of stepLibrary) {
+    const res = await db.collection("stepLibrary").updateOne({ type: entry.type }, { $set: entry }, { upsert: true });
+    if (res.upsertedCount) added++;
+  }
+  console.log(`stepLibrary: ${stepLibrary.length} step types synced (${added} new)`);
+}
+
 async function main() {
   const client = new MongoClient(uri);
   await client.connect();
   const db = client.db(dbName);
 
-  await seedEmpty(db, "stepLibrary", stepLibrary);
+  await syncStepLibrary(db);
   await seedEmpty(db, "telegramGroups", telegramGroups);
 
   // Workflow + its version snapshot + a group assignment, seeded together so the

@@ -2,6 +2,7 @@
 
 import { useEffect, useState } from "react";
 import PageShell from "@/components/page-shell";
+import RequestWorkflowPreview, { REQUEST_WORKFLOW_STEPS } from "@/components/request-workflow-preview";
 import { api } from "@/lib/api-client";
 import {
   ErrorBanner,
@@ -42,6 +43,7 @@ export default function WorkflowsPage() {
   const [units, setUnits] = useState<Named[]>([]);
   const [locations, setLocations] = useState<Named[]>([]);
   const [roles, setRoles] = useState<Named[]>([]);
+  const [products, setProducts] = useState<Named[]>([]);
   const [groups, setGroups] = useState<Group[]>([]);
 
   const [createOpen, setCreateOpen] = useState(false);
@@ -61,6 +63,7 @@ export default function WorkflowsPage() {
   const [versions, setVersions] = useState<Version[]>([]);
   const [delId, setDelId] = useState<string | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
+  const [requestViewOpen, setRequestViewOpen] = useState(false);
 
   useEffect(() => {
     let cancelled = false;
@@ -80,6 +83,7 @@ export default function WorkflowsPage() {
     api.get<Named[]>("/api/units").then((d) => !cancelled && setUnits(d), onError);
     api.get<Named[]>("/api/locations").then((d) => !cancelled && setLocations(d), onError);
     api.get<Named[]>("/api/roles").then((d) => !cancelled && setRoles(d), onError);
+    api.get<Named[]>("/api/products").then((d) => !cancelled && setProducts(d), onError);
     api.get<Group[]>("/api/telegram-groups").then((d) => !cancelled && setGroups(d), onError);
     return () => {
       cancelled = true;
@@ -91,6 +95,7 @@ export default function WorkflowsPage() {
     if (source === "units") return units;
     if (source === "locations") return locations;
     if (source === "roles") return roles;
+    if (source === "products") return products;
     return [];
   }
 
@@ -204,18 +209,21 @@ export default function WorkflowsPage() {
   return (
     <PageShell section="Automation" page="Workflows" maxWidth={1320}>
       <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", gap: 20, marginBottom: 22 }}>
-        <PageIntro title="Workflows" description="Design the bot's inventory-entry conversation: pick steps, order them, set rules, and assign each workflow to a group or category." />
+        <PageIntro
+          title="Workflows"
+          description="Two bots, two workflow kinds: Search / Request (2nd bot, fixed) for Requests-mode groups, and builder workflows below for Entries-mode groups."
+        />
         <button onClick={() => setCreateOpen(true)} style={addBtnStyle}>
-          ＋ New Workflow
+          ＋ New Entry Workflow
         </button>
       </div>
 
       {loadError && <ErrorBanner message={loadError} />}
 
       <div style={{ display: "grid", gridTemplateColumns: "repeat(3,1fr)", gap: 16, marginBottom: 22 }}>
-        <Stat label="Total Workflows" value={workflows.length} />
-        <Stat label="Active" value={activeCount} color="#0f9d63" />
-        <Stat label="Step Types Available" value={lib.length} />
+        <Stat label="Workflows" value={workflows.length + 1} />
+        <Stat label="Active" value={activeCount + 1} color="#0f9d63" />
+        <Stat label="Entry step types" value={lib.length} />
       </div>
 
       <section style={{ background: "#fff", border: "1px solid #e9edf3", borderRadius: 14, overflow: "hidden", boxShadow: "0 1px 2px rgba(16,30,54,.04)" }}>
@@ -231,11 +239,36 @@ export default function WorkflowsPage() {
             </tr>
           </thead>
           <tbody>
+            <tr style={{ background: "#f8faff" }}>
+              <td style={tdStyle("16px")}>
+                <div style={{ display: "flex", alignItems: "center", gap: 9, flexWrap: "wrap" }}>
+                  <div style={{ fontWeight: 600, color: "#1a2b4a" }}>Search / Request</div>
+                  <span style={{ fontSize: 10.5, fontWeight: 700, background: "#eef3fe", color: "#1560f0", borderRadius: 20, padding: "1px 8px" }}>2ND BOT</span>
+                  <span style={{ fontSize: 10.5, fontWeight: 700, background: "#eafaf1", color: "#0f9d63", borderRadius: 20, padding: "1px 8px" }}>FIXED</span>
+                </div>
+                <div style={{ fontSize: 11.5, color: "#98a4bd", marginTop: 2, maxWidth: 520 }}>
+                  Requests-mode Telegram groups — search stock, submit, manager Accept issues and closes. Not built from the entry Step Library.
+                </div>
+              </td>
+              <td style={{ ...tdStyle(), textAlign: "center", color: "#4a5878" }}>{REQUEST_WORKFLOW_STEPS.length}</td>
+              <td style={{ ...tdStyle(), textAlign: "center", color: "#8a97b0", fontFamily: "var(--font-mono)" }}>—</td>
+              <td style={tdStyle()}>
+                <span style={chipStyle(true)}>Active</span>
+              </td>
+              <td style={{ ...tdStyle(), padding: "12px 16px 12px 14px" }}>
+                <div style={{ display: "flex", gap: 6, justifyContent: "flex-end", flexWrap: "wrap" }}>
+                  <button onClick={() => setRequestViewOpen(true)} style={actionBtnStyle("#1560f0", "#cfe0ff")}>
+                    View
+                  </button>
+                </div>
+              </td>
+            </tr>
             {workflows.map((w) => (
               <tr key={w.id}>
                 <td style={tdStyle("16px")}>
                   <div style={{ display: "flex", alignItems: "center", gap: 9 }}>
                     <div style={{ fontWeight: 600, color: "#1a2b4a" }}>{w.name}</div>
+                    <span style={{ fontSize: 10.5, fontWeight: 700, background: "#f2effc", color: "#6d5bd0", borderRadius: 20, padding: "1px 8px" }}>ENTRY</span>
                     {w.isDefault ? <span style={{ fontSize: 10.5, fontWeight: 700, background: "#eaf2ff", color: "#1560f0", borderRadius: 20, padding: "1px 8px" }}>DEFAULT</span> : null}
                   </div>
                   {w.desc ? <div style={{ fontSize: 11.5, color: "#98a4bd", marginTop: 2, maxWidth: 460, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{w.desc}</div> : null}
@@ -265,14 +298,31 @@ export default function WorkflowsPage() {
             ))}
           </tbody>
         </table>
-        {!loading && workflows.length === 0 ? <EmptyState text="No workflows yet. Create one to design your first bot flow." /> : null}
+        {!loading && workflows.length === 0 ? <EmptyState text="No entry workflows yet. Create one for inventory-capture groups — Search / Request above already covers the 2nd bot." /> : null}
         {loading ? <EmptyState text="Loading…" /> : null}
       </section>
+
+      {/* Search / Request viewer (2nd bot) */}
+      {requestViewOpen ? (
+        <Modal onClose={() => setRequestViewOpen(false)} maxWidth={1100}>
+          <ModalHeader
+            title="View — Search / Request"
+            subtitle="2nd bot fixed workflow for Requests-mode groups. Steps are not added from the entry library — set a Telegram group to Requests mode to use this."
+            onClose={() => setRequestViewOpen(false)}
+          />
+          <RequestWorkflowPreview variant="modal" />
+          <ModalFooter>
+            <button onClick={() => setRequestViewOpen(false)} style={secondaryBtnStyle}>
+              Close
+            </button>
+          </ModalFooter>
+        </Modal>
+      ) : null}
 
       {/* Create */}
       {createOpen ? (
         <Modal onClose={() => setCreateOpen(false)} maxWidth={460}>
-          <ModalHeader title="New Workflow" subtitle="Give it a name — you'll add steps next." onClose={() => setCreateOpen(false)} />
+          <ModalHeader title="New Entry Workflow" subtitle="For Entries-mode groups only. The Search / Request (2nd bot) flow is fixed and already listed above." onClose={() => setCreateOpen(false)} />
           <div style={{ padding: "22px 24px" }}>
             <label style={labelStyle}>
               Workflow Name <span style={{ color: "#e0524f" }}>*</span>
@@ -293,11 +343,15 @@ export default function WorkflowsPage() {
       {/* Builder */}
       {builder ? (
         <Modal onClose={() => setBuilder(null)} maxWidth={960}>
-          <ModalHeader title={`Build — ${builder.name}`} subtitle="Add steps from the library, drag to reorder, set rules, then activate." onClose={() => setBuilder(null)} />
+          <ModalHeader
+            title={`Build — ${builder.name}`}
+            subtitle="Entry bot only. Add steps from the library for inventory capture. For the 2nd bot (search / request), close this and open View on Search / Request."
+            onClose={() => setBuilder(null)}
+          />
           <div style={{ display: "grid", gridTemplateColumns: "260px 1fr", gap: 0, minHeight: 420 }}>
             {/* Palette */}
             <div style={{ borderRight: "1px solid #f1f4f8", padding: "16px 14px", background: "#fafbfd", maxHeight: 560, overflowY: "auto" }}>
-              <div style={{ fontSize: 11, fontWeight: 700, textTransform: "uppercase", letterSpacing: ".5px", color: "#aab4c8", marginBottom: 10 }}>Step Library</div>
+              <div style={{ fontSize: 11, fontWeight: 700, textTransform: "uppercase", letterSpacing: ".5px", color: "#aab4c8", marginBottom: 10 }}>Entry Step Library</div>
               {lib.map((entry) => (
                 <button
                   key={entry.id}
@@ -310,6 +364,9 @@ export default function WorkflowsPage() {
                   <span style={{ marginLeft: "auto", color: "#1560f0", fontWeight: 800 }}>＋</span>
                 </button>
               ))}
+              <div style={{ marginTop: 12, padding: "10px 10px", borderRadius: 9, background: "#eef3fe", border: "1px solid #cdd9f7", fontSize: 11.5, color: "#3a4a68", lineHeight: 1.45 }}>
+                Looking for search / issue stock? That is the <b>Search / Request</b> workflow — use <b>View</b> on the list, not this library.
+              </div>
             </div>
 
             {/* Steps */}
@@ -501,6 +558,7 @@ export default function WorkflowsPage() {
 function defaultLabel(entry: StepLibEntry): string {
   const map: Record<string, string> = {
     item_capture: "Send the item name and/or a photo of the product.",
+    product_select: "Select the product:",
     category_select: "Select a category:",
     subcategory_select: "Select a subcategory:",
     location_tree: "Choose the storage location:",

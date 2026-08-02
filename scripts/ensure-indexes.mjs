@@ -22,6 +22,12 @@ const INDEX_SPECS = {
   categories: [{ key: { order: 1 } }],
   subcategories: [{ key: { parent: 1 } }],
   locations: [{ key: { parent: 1 } }],
+  products: [
+    { key: { productNumberKey: 1 }, unique: true },
+    { key: { status: 1, name: 1 } },
+    { key: { category: 1 } },
+  ],
+  productAttributes: [{ key: { order: 1 } }],
   statuses: [{ key: { order: 1 } }],
   colors: [{ key: { group: 1 } }],
   users: [{ key: { tgId: 1 }, unique: true }],
@@ -36,7 +42,24 @@ const INDEX_SPECS = {
   telegramLogs: [{ key: { ts: -1 } }, { key: { chatId: 1, ts: -1 } }],
   workflowAssignments: [{ key: { chatId: 1 } }, { key: { category: 1 } }],
   botSessions: [{ key: { chatId: 1, userId: 1, status: 1 } }, { key: { status: 1 } }],
-  inventoryEntries: [{ key: { createdAt: -1 } }],
+  inventoryEntries: [
+    { key: { createdAt: -1 } },
+    { key: { ticketNumber: 1 }, unique: true, partialFilterExpression: { ticketNumber: { $type: "string" } } },
+    { key: { sessionId: 1 }, unique: true, partialFilterExpression: { sessionId: { $type: "string" } } },
+  ],
+  stockMovements: [
+    { key: { productId: 1, locationId: 1 } },
+    { key: { movementKey: 1 }, unique: true, partialFilterExpression: { movementKey: { $type: "string" } } },
+    { key: { requestId: 1 } },
+    { key: { createdAt: -1 } },
+  ],
+  requests: [
+    { key: { chatId: 1, requesterUserId: 1, status: 1 } },
+    { key: { ticketNumber: 1 }, unique: true, partialFilterExpression: { ticketNumber: { $type: "string" } } },
+    { key: { anchorMessageId: 1 } },
+    { key: { status: 1, createdAt: -1 } },
+    { key: { createdAt: -1 } },
+  ],
 };
 
 const uri = process.env.MONGODB_URI;
