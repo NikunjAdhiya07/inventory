@@ -44,13 +44,22 @@ type ItemRow = {
 };
 
 function sourceChip(source: string): CSSProperties {
+  const base: CSSProperties = {
+    display: "inline-flex",
+    alignItems: "center",
+    padding: "4px 11px",
+    borderRadius: 20,
+    fontSize: 12,
+    fontWeight: 600,
+    border: "1px solid",
+  };
   if (source === "ai") {
-    return { ...chipStyle, background: "#eef2ff", color: "#3730a3", border: "1px solid #c7d2fe" };
+    return { ...base, background: "#eef2ff", color: "#3730a3", borderColor: "#c7d2fe" };
   }
   if (source === "user") {
-    return { ...chipStyle, background: "#ecfdf5", color: "#065f46", border: "1px solid #a7f3d0" };
+    return { ...base, background: "#ecfdf5", color: "#065f46", borderColor: "#a7f3d0" };
   }
-  return { ...chipStyle, background: "#f1f5f9", color: "#475569", border: "1px solid #e2e8f0" };
+  return { ...base, background: "#f1f5f9", color: "#475569", borderColor: "#e2e8f0" };
 }
 
 export default function ItemMasterPage() {
@@ -107,7 +116,7 @@ export default function ItemMasterPage() {
     return hay.includes(q);
   });
 
-  const { sorted, sortKey, dir, toggleSort } = useSort(filtered, "name");
+  const { sorted, sortKey, dir, toggleSort } = useSort<ItemRow, keyof ItemRow>(filtered, "name");
   const viewing = items.find((i) => i.id === viewId) || null;
   const tagging = items.find((i) => i.id === tagId) || null;
 
@@ -186,42 +195,49 @@ export default function ItemMasterPage() {
           <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13 }}>
             <thead>
               <tr style={{ background: "#f8fafc" }}>
-                <SortTh k="name" sortKey={sortKey} dir={dir} onToggle={toggleSort}>
-                  Item
-                </SortTh>
-                <SortTh k="productNumber" sortKey={sortKey} dir={dir} onToggle={toggleSort}>
-                  SKU
-                </SortTh>
-                <SortTh k="category" sortKey={sortKey} dir={dir} onToggle={toggleSort}>
-                  Category
-                </SortTh>
-                <th style={thStyle}>Reference names</th>
-                <SortTh k="entryCount" sortKey={sortKey} dir={dir} onToggle={toggleSort}>
-                  Entries
-                </SortTh>
-                <th style={thStyle}>Last entry</th>
-                <th style={thStyle} />
+                <SortTh label="Item" active={sortKey === "name"} dir={dir} onClick={() => toggleSort("name")} />
+                <SortTh
+                  label="SKU"
+                  active={sortKey === "productNumber"}
+                  dir={dir}
+                  onClick={() => toggleSort("productNumber")}
+                />
+                <SortTh
+                  label="Category"
+                  active={sortKey === "category"}
+                  dir={dir}
+                  onClick={() => toggleSort("category")}
+                />
+                <th style={thStyle()}>Reference names</th>
+                <SortTh
+                  label="Entries"
+                  active={sortKey === "entryCount"}
+                  dir={dir}
+                  onClick={() => toggleSort("entryCount")}
+                />
+                <th style={thStyle()}>Last entry</th>
+                <th style={thStyle()} />
               </tr>
             </thead>
             <tbody>
               {sorted.map((item) => (
                 <tr key={item.id} style={{ borderTop: "1px solid #f1f5f9" }}>
-                  <td style={tdStyle}>
+                  <td style={tdStyle()}>
                     <div style={{ fontWeight: 600, color: "#0f172a" }}>{item.name}</div>
                     {item.unit ? (
                       <div style={{ fontSize: 11, color: "#94a3b8", marginTop: 2 }}>{item.unit}</div>
                     ) : null}
                   </td>
-                  <td style={{ ...tdStyle, fontFamily: "ui-monospace, monospace", fontSize: 12 }}>
+                  <td style={{ ...tdStyle(), fontFamily: "ui-monospace, monospace", fontSize: 12 }}>
                     {item.productNumber || "—"}
                   </td>
-                  <td style={tdStyle}>
+                  <td style={tdStyle()}>
                     <div>{item.category || "—"}</div>
                     {item.subcategory ? (
                       <div style={{ fontSize: 11, color: "#94a3b8" }}>{item.subcategory}</div>
                     ) : null}
                   </td>
-                  <td style={tdStyle}>
+                  <td style={tdStyle()}>
                     {item.referenceNames.length === 0 ? (
                       <span style={{ color: "#94a3b8", fontSize: 12 }}>No tags yet</span>
                     ) : (
@@ -232,15 +248,15 @@ export default function ItemMasterPage() {
                           </span>
                         ))}
                         {item.referenceNames.length > 6 ? (
-                          <span style={{ ...chipStyle, background: "#f8fafc", color: "#64748b" }}>
+                          <span style={{ ...chipStyle(false), cursor: "default" }}>
                             +{item.referenceNames.length - 6}
                           </span>
                         ) : null}
                       </div>
                     )}
                   </td>
-                  <td style={{ ...tdStyle, fontVariantNumeric: "tabular-nums" }}>{item.entryCount}</td>
-                  <td style={tdStyle}>
+                  <td style={{ ...tdStyle(), fontVariantNumeric: "tabular-nums" }}>{item.entryCount}</td>
+                  <td style={tdStyle()}>
                     {item.lastEntryTicket ? (
                       <div>
                         <div style={{ fontFamily: "ui-monospace, monospace", fontSize: 12 }}>{item.lastEntryTicket}</div>
@@ -252,13 +268,13 @@ export default function ItemMasterPage() {
                       <span style={{ color: "#94a3b8" }}>—</span>
                     )}
                   </td>
-                  <td style={{ ...tdStyle, whiteSpace: "nowrap" }}>
-                    <button type="button" style={actionBtnStyle} onClick={() => setViewId(item.id)}>
+                  <td style={{ ...tdStyle(), whiteSpace: "nowrap" }}>
+                    <button type="button" style={actionBtnStyle("#3a4a68", "#dfe5ee")} onClick={() => setViewId(item.id)}>
                       View
                     </button>{" "}
                     <button
                       type="button"
-                      style={actionBtnStyle}
+                      style={actionBtnStyle("#3a4a68", "#dfe5ee")}
                       onClick={() => {
                         setTagId(item.id);
                         setNewAlias("");
@@ -276,7 +292,7 @@ export default function ItemMasterPage() {
       )}
 
       {viewing && (
-        <Modal onClose={() => setViewId(null)} width={560}>
+        <Modal onClose={() => setViewId(null)} maxWidth={560}>
           <ModalHeader title={viewing.name} onClose={() => setViewId(null)} />
           <div style={{ padding: "16px 20px", display: "grid", gap: 12, fontSize: 13 }}>
             <Row label="SKU" value={viewing.productNumber || "—"} mono />
@@ -289,7 +305,7 @@ export default function ItemMasterPage() {
                 <div style={{ ...labelStyle, marginBottom: 6 }}>Attributes</div>
                 <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
                   {viewing.attributes!.map((a) => (
-                    <span key={a.name} style={chipStyle}>
+                    <span key={a.name} style={{ ...chipStyle(false), cursor: "default" }}>
                       {a.name}: {a.value}
                     </span>
                   ))}
@@ -353,7 +369,7 @@ export default function ItemMasterPage() {
       )}
 
       {tagging && (
-        <Modal onClose={() => setTagId(null)} width={480}>
+        <Modal onClose={() => setTagId(null)} maxWidth={480}>
           <ModalHeader title={`Tags · ${tagging.name}`} onClose={() => setTagId(null)} />
           <div style={{ padding: "16px 20px", display: "grid", gap: 14 }}>
             <p style={{ margin: 0, fontSize: 13, color: "#64748b", lineHeight: 1.45 }}>
