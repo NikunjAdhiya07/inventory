@@ -92,7 +92,7 @@ async function renderResults(db: Db, request: ItemRequest): Promise<RenderResult
 
   if (!hits.length) {
     return {
-      text: `No stock for “${esc(ui.query)}”. Try another name.`,
+      text: `No stock for “${esc(ui.query)}”. Try another name or a reference tag (e.g. “c type cable”).`,
       keyboard: [
         ...(request.lines.length ? [[{ text: `Cart (${request.lines.length})`, callback_data: "rq:cart" }]] : []),
         [{ text: "✖ Cancel", callback_data: "rq:cancel" }],

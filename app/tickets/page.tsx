@@ -7,7 +7,7 @@ import TicketCard, { type TicketCardModel } from "@/components/ticket-card";
 import { api } from "@/lib/api-client";
 import { ErrorBanner, PageIntro, SearchInput, EmptyState } from "@/components/dc-ui";
 
-type KindFilter = "all" | "request" | "purchase";
+type KindFilter = "all" | "request" | "purchase" | "issue" | "return";
 
 const CATEGORY_COLORS = ["#1560f0", "#0d9488", "#6d5bd0", "#d97706", "#e11d48", "#0891b2", "#4f46e5", "#059669"];
 
@@ -171,6 +171,8 @@ export default function TicketsPage() {
 
   const reqCount = useMemo(() => tickets.filter((t) => t.kind === "request").length, [tickets]);
   const purchaseCount = useMemo(() => tickets.filter((t) => t.kind === "purchase").length, [tickets]);
+  const issueCount = useMemo(() => tickets.filter((t) => t.kind === "issue").length, [tickets]);
+  const returnCount = useMemo(() => tickets.filter((t) => t.kind === "return").length, [tickets]);
 
   const categoryStats = useMemo(() => {
     const map = new Map<string, { total: number; req: number; pur: number }>();
@@ -231,7 +233,7 @@ export default function TicketsPage() {
         <div>
           <PageIntro
             title="Tickets"
-            description="Stock issues (REQ) and purchases (PUR). Inventory entries and AI reference tags live on Item Master."
+            description="Stock requests (REQ), purchases (PUR), material issues (ISS) and returns (RET). Inventory entries and AI reference tags live on Item Master."
           />
           <Link href="/item-master" style={{ fontSize: 12.5, fontWeight: 600, color: "#1560f0", textDecoration: "none" }}>
             Open Item Master →
@@ -316,6 +318,8 @@ export default function TicketsPage() {
                 ["all", "All", "#3a4a68"],
                 ["request", `REQ (${reqCount})`, "#1560f0"],
                 ["purchase", `PUR (${purchaseCount})`, "#0d9488"],
+                ["issue", `ISS (${issueCount})`, "#b06a00"],
+                ["return", `RET (${returnCount})`, "#6d5bd0"],
               ] as const
             ).map(([k, label, color]) => (
               <button key={k} type="button" onClick={() => setKind(k)} style={chip(kind === k, color)}>

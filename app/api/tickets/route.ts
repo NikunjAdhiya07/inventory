@@ -2,11 +2,12 @@ import { NextRequest, NextResponse } from "next/server";
 import { getDb } from "@/lib/mongodb";
 import { toClient } from "@/lib/serialize";
 
-// Unified ticket feed for the console dashboard: inventory entries (INV-…) and
-// item requests / issues (REQ-…, PUR-…). Shaped like the maintenance TicketCard
-// so the UI can render one card component for every series.
+// Unified ticket feed for the console dashboard: inventory entries (INV-…),
+// item requests / purchases (REQ-…, PUR-…) and material issues / returns
+// (ISS-…, RET-…). Shaped like the maintenance TicketCard so the UI can render
+// one card component for every series.
 
-export type TicketKind = "entry" | "request" | "purchase";
+export type TicketKind = "entry" | "request" | "purchase" | "issue" | "return";
 
 function openStatus(status: string): boolean {
   return ["draft", "pending_manager", "pending_approval", "procuring", "awaiting_collection"].includes(status);
@@ -17,6 +18,18 @@ function boardStatus(status: string): "PENDING" | "COMPLETED" | "REJECTED" | "CA
   if (status === "rejected") return "REJECTED";
   if (status === "cancelled") return "CANCELLED";
   return "PENDING";
+}
+
+// The issue/return lifecycle has its own vocabulary, so it maps onto the board's
+// four columns explicitly rather than by accident. An issue that is out with
+// someone is PENDING right up until a return settles it — that is the whole
+// point of the flow, and treating "acknowledged" as done would hide exactly the
+// tickets a store head needs to chase.
+function materialBoardStatus(kind: "issue" | "return", status: string): "PENDING" | "COMPLETED" | "REJECTED" | "CANCELLED" {
+  if (status === "cancelled") return "CANCELLED";
+  if (status === "rejected") return "REJECTED";
+  if (kind === "issue") return status === "settled" ? "COMPLETED" : "PENDING";
+  return status === "accepted" ? "COMPLETED" : "PENDING";
 }
 
 export async function GET(req: NextRequest) {
@@ -128,6 +141,85 @@ export async function GET(req: NextRequest) {
         purchase: purchase || null,
         history: Array.isArray(c.history) ? c.history : [],
         decisions,
+        source: "telegram",
+      });
+    }
+  }
+
+  if (!kind || kind === "issue" || kind === "return") {
+    const filter: Record<string, unknown> = {
+      ticketNumber: { $exists: true, $ne: "" },
+      status: { $ne: "draft" },
+    };
+    if (kind === "issue" || kind === "return") filter.kind = kind;
+
+    const materials = await db.collection("issueTickets").find(filter).sort({ updatedAt: -1 }).limit(limit).toArray();
+
+    for (const m of materials) {
+      const c = toClient(m);
+      const mKind = c.kind === "return" ? "return" : "issue";
+      const lines = Array.isArray(c.lines) ? (c.lines as Record<string, unknown>[]) : [];
+      const recipient = c.recipient as { name?: string } | undefined;
+      const status = String(c.status);
+
+      // A return's lines carry the quantity coming BACK, so a line the recipient
+      // left at zero would otherwise render as "Wire × 0" — the one number on the
+      // card that is not what a reader wants. Show what was taken and let the
+      // per-line detail carry the split.
+      const desc =
+        lines
+          .map((l) => {
+            const qty = mKind === "return" ? l.issuedQty ?? l.qty : l.qty;
+            return `${l.productName} × ${qty} ${l.unit || ""}`.trim();
+          })
+          .join(", ") || (mKind === "return" ? "Material return" : "Material issue");
+
+      const locations = [...new Set(lines.map((l) => String(l.locationPath || "")).filter(Boolean))];
+      const categories = [...new Set(lines.map((l) => String(l.category || "")).filter(Boolean))];
+
+      tickets.push({
+        id: c.id,
+        ticketId: c.ticketNumber,
+        kind: mKind as TicketKind,
+        series: mKind === "return" ? "RET" : "ISS",
+        status,
+        boardStatus: materialBoardStatus(mKind, status),
+        open: !["settled", "accepted", "rejected", "cancelled"].includes(status),
+        description: desc,
+        category: categories[0] || (mKind === "return" ? "Return" : "Issue"),
+        subCategory: String(lines[0]?.subcategory || ""),
+        location: locations.join(" · ") || "—",
+        quantity: lines.reduce(
+          (s, l) => s + Number((mKind === "return" ? l.issuedQty ?? l.qty : l.qty) || 0),
+          0
+        ),
+        unit: String(lines[0]?.unit || ""),
+        productNumber: String(lines[0]?.productNumber || ""),
+        createdBy: String(c.createdByName || "—"),
+        // Who the materials are with. It is the single most useful thing on an
+        // open issue card — "who do I chase" — so it takes the slot the other
+        // series use for whoever closed the ticket.
+        completedBy: String(recipient?.name || ""),
+        createdAt: c.createdAt || c.submittedAt,
+        completedAt: c.closedAt || null,
+        closedAt: c.closedAt || null,
+        submittedAt: c.submittedAt || null,
+        issueTicketNumber: c.issueTicketNumber || null,
+        lines: lines.map((l) => ({
+          productName: l.productName,
+          productNumber: l.productNumber,
+          locationPath: l.locationPath,
+          qty: mKind === "return" ? l.issuedQty ?? l.qty : l.qty,
+          unit: l.unit,
+          // The settlement split, which is the reason this flow exists. On an
+          // issue it is filled in when a return closes it; on a return it is
+          // what the recipient declared.
+          returnedQty: mKind === "return" ? l.qty : l.returnedQty ?? null,
+          consumedQty:
+            mKind === "return" ? Number(l.issuedQty ?? 0) - Number(l.qty ?? 0) : l.consumedQty ?? null,
+          outcome: l.outcome,
+        })),
+        history: Array.isArray(c.history) ? c.history : [],
         source: "telegram",
       });
     }

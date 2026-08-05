@@ -7,7 +7,10 @@
 
 const TOKEN = process.env.TELEGRAM_BOT_TOKEN || "";
 const API = `https://api.telegram.org/bot${TOKEN}`;
-const TELEGRAM_TIMEOUT_MS = Number(process.env.TELEGRAM_TIMEOUT_MS) || 6000;
+// UI calls (send/edit) stay snappy so stalled Telegram doesn't hang the webhook.
+const TELEGRAM_TIMEOUT_MS = Number(process.env.TELEGRAM_TIMEOUT_MS) || 8000;
+// File metadata + binary download need more headroom (slow links, cold CDN).
+const TELEGRAM_FILE_TIMEOUT_MS = Number(process.env.TELEGRAM_FILE_TIMEOUT_MS) || 45_000;
 
 export type InlineButton = { text: string; callback_data: string };
 export type InlineKeyboard = InlineButton[][];
@@ -16,7 +19,11 @@ let stubMessageId = 1000;
 
 type CallResult<T> = { ok: true; result: T } | { ok: false; description: string };
 
-async function callRaw<T = unknown>(method: string, payload: Record<string, unknown>): Promise<CallResult<T>> {
+async function callRaw<T = unknown>(
+  method: string,
+  payload: Record<string, unknown>,
+  timeoutMs = TELEGRAM_TIMEOUT_MS
+): Promise<CallResult<T>> {
   if (!TOKEN) {
     console.log(`[telegram:stub] ${method}`, JSON.stringify(payload));
     return { ok: true, result: { message_id: ++stubMessageId } as unknown as T };
@@ -27,9 +34,8 @@ async function callRaw<T = unknown>(method: string, payload: Record<string, unkn
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
       // Without a timeout a stalled Telegram connection holds the whole function
-      // until the platform kills it, and the user sees nothing at all. Failing at
-      // 6s lets `render` fall back to a fresh send instead.
-      signal: AbortSignal.timeout(TELEGRAM_TIMEOUT_MS),
+      // until the platform kills it, and the user sees nothing at all.
+      signal: AbortSignal.timeout(timeoutMs),
     });
     const data = await res.json();
     if (!data.ok) {
@@ -51,8 +57,12 @@ async function callRaw<T = unknown>(method: string, payload: Record<string, unkn
   }
 }
 
-async function call<T = unknown>(method: string, payload: Record<string, unknown>): Promise<T | null> {
-  const res = await callRaw<T>(method, payload);
+async function call<T = unknown>(
+  method: string,
+  payload: Record<string, unknown>,
+  timeoutMs = TELEGRAM_TIMEOUT_MS
+): Promise<T | null> {
+  const res = await callRaw<T>(method, payload, timeoutMs);
   return res.ok ? res.result : null;
 }
 
@@ -97,7 +107,12 @@ export async function answerCallbackQuery(callbackQueryId: string, text?: string
 }
 
 export async function getFile(fileId: string) {
-  return call<{ file_path: string }>("getFile", { file_id: fileId });
+  return call<{ file_path: string }>("getFile", { file_id: fileId }, TELEGRAM_FILE_TIMEOUT_MS);
+}
+
+function isTimeoutError(err: unknown): boolean {
+  const msg = String(err);
+  return /timeout|aborted|TimeoutError/i.test(msg);
 }
 
 // Download Telegram file bytes for vision / storage. Returns null when the bot
@@ -109,25 +124,50 @@ export async function downloadFileBytes(
     console.log("[telegram:stub] downloadFileBytes", fileId);
     return null;
   }
-  const meta = await getFile(fileId);
-  if (!meta?.file_path) return null;
-  try {
-    const res = await fetch(`https://api.telegram.org/file/bot${TOKEN}/${meta.file_path}`, {
-      signal: AbortSignal.timeout(TELEGRAM_TIMEOUT_MS * 3),
-    });
-    if (!res.ok) return null;
-    const buf = Buffer.from(await res.arrayBuffer());
-    const lower = meta.file_path.toLowerCase();
-    const mime = lower.endsWith(".png")
-      ? "image/png"
-      : lower.endsWith(".webp")
-        ? "image/webp"
-        : "image/jpeg";
-    return { bytes: buf, mime, filePath: meta.file_path };
-  } catch (err) {
-    console.error("[telegram] downloadFileBytes error:", err);
-    return null;
+
+  const attempts = 3;
+  let lastErr: unknown = null;
+
+  for (let i = 1; i <= attempts; i++) {
+    try {
+      const meta = await getFile(fileId);
+      if (!meta?.file_path) {
+        lastErr = "getFile returned no file_path";
+        // Transient timeouts already logged in callRaw; short backoff then retry.
+        if (i < attempts) await new Promise((r) => setTimeout(r, 400 * i));
+        continue;
+      }
+
+      const res = await fetch(`https://api.telegram.org/file/bot${TOKEN}/${meta.file_path}`, {
+        signal: AbortSignal.timeout(TELEGRAM_FILE_TIMEOUT_MS),
+      });
+      if (!res.ok) {
+        lastErr = `file download HTTP ${res.status}`;
+        if (i < attempts) await new Promise((r) => setTimeout(r, 400 * i));
+        continue;
+      }
+
+      const buf = Buffer.from(await res.arrayBuffer());
+      const lower = meta.file_path.toLowerCase();
+      const mime = lower.endsWith(".png")
+        ? "image/png"
+        : lower.endsWith(".webp")
+          ? "image/webp"
+          : "image/jpeg";
+      return { bytes: buf, mime, filePath: meta.file_path };
+    } catch (err) {
+      lastErr = err;
+      console.error(`[telegram] downloadFileBytes attempt ${i}/${attempts}:`, err);
+      if (i < attempts && isTimeoutError(err)) {
+        await new Promise((r) => setTimeout(r, 500 * i));
+        continue;
+      }
+      break;
+    }
   }
+
+  console.error("[telegram] downloadFileBytes failed:", lastErr);
+  return null;
 }
 
 // Health probe: getChat succeeds only when the bot is a member of the chat and

@@ -1,33 +1,37 @@
-// Vision + text helpers for the Telegram entry bot.
+// NVIDIA NIM / Nemotron vision + text for the Telegram entry bot.
+// Ollama is intentionally not used — only NVIDIA_API_KEY credentials.
 //
-// Primary: NVIDIA NIM (OpenAI-compatible) with thinking disabled for speed.
-// Fallback: local Ollama vision (OLLAMA_BASE_URL + OLLAMA_VISION_MODEL) when set.
-// Dev: AI_MOCK=true returns stub labels without a network call.
+// Env:
+//   NVIDIA_API_KEY (required unless AI_MOCK=true)
+//   NVIDIA_BASE_URL (default https://integrate.api.nvidia.com/v1)
+//   NVIDIA_VISION_MODEL (default nvidia/nemotron-3-nano-omni-30b-a3b-reasoning)
+//   NVIDIA_TEXT_MODEL (default nvidia/nemotron-3-nano-30b-a3b)
+//   AI_MOCK=true — stub labels without a network call
+//   AI_TIMEOUT_MS, AI_MAX_IMAGE_BYTES, AI_VISION_MAX_TOKENS
 
 const BASE_URL = (process.env.NVIDIA_BASE_URL || process.env.AI_BASE_URL || "https://integrate.api.nvidia.com/v1").replace(
   /\/$/,
   ""
 );
-const API_KEY = process.env.NVIDIA_API_KEY || process.env.AI_API_KEY || "";
+const API_KEY = (process.env.NVIDIA_API_KEY || process.env.AI_API_KEY || "").trim();
 const VISION_MODEL =
   process.env.NVIDIA_VISION_MODEL || process.env.AI_VISION_MODEL || "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning";
 const TEXT_MODEL = process.env.NVIDIA_TEXT_MODEL || process.env.AI_TEXT_MODEL || "nvidia/nemotron-3-nano-30b-a3b";
-const OLLAMA_BASE = (process.env.OLLAMA_BASE_URL || "").replace(/\/$/, "");
-const OLLAMA_VISION = process.env.OLLAMA_VISION_MODEL || "qwen2.5vl:7b";
 const MOCK = /^(1|true|yes)$/i.test(process.env.AI_MOCK || "");
-const TIMEOUT_MS = Number(process.env.AI_TIMEOUT_MS) || 45000;
-// Keep payloads small — Telegram "largest" photos can be several MB as base64.
+const TIMEOUT_MS = Number(process.env.AI_TIMEOUT_MS) || 90_000;
+// Reasoning VLMs burn tokens on thinking; leave room for the JSON answer.
+const VISION_MAX_TOKENS = Number(process.env.AI_VISION_MAX_TOKENS) || 1024;
+const TEXT_MAX_TOKENS = Number(process.env.AI_TEXT_MAX_TOKENS) || 256;
 const MAX_IMAGE_BYTES = Number(process.env.AI_MAX_IMAGE_BYTES) || 1_200_000;
 
 export function aiConfigured(): boolean {
-  return MOCK || Boolean(API_KEY) || Boolean(OLLAMA_BASE);
+  return MOCK || Boolean(API_KEY);
 }
 
 type ChatContent = string | { type: "text"; text: string } | { type: "image_url"; image_url: { url: string } };
 
 function parseLabelJson(raw: string): string[] {
   const cleaned = raw
-    // Strip common thinking / reasoning wrappers if the model ignored our flag.
     .replace(/<think>[\s\S]*?<\/think>/gi, "")
     .replace(/```(?:json)?\s*([\s\S]*?)```/gi, "$1")
     .trim();
@@ -43,26 +47,53 @@ function parseLabelJson(raw: string): string[] {
             return "";
           })
           .filter(Boolean)
-          .slice(0, 8);
+          .slice(0, 12);
       }
     } catch {
       /* fall through */
     }
   }
-  // Prose fallback: split on commas / newlines / "or"
   const line = cleaned
     .split(/\n/)
     .map((l) => l.replace(/^[-*\d.)]+\s*/, "").trim())
-    .find((l) => l && !/^none$/i.test(l));
+    .find((l) => l && !/^none$/i.test(l) && !/^thinking/i.test(l));
   if (!line) return [];
   return line
     .split(/,|\/|\bor\b/i)
     .map((s) => s.replace(/^["']|["']$/g, "").trim())
     .filter((s) => s.length > 1 && s.length < 60)
-    .slice(0, 5);
+    .slice(0, 10);
 }
 
-async function nvidiaChat(model: string, messages: { role: string; content: ChatContent | ChatContent[] }[]): Promise<string> {
+function extractMessageText(message: {
+  content?: unknown;
+  reasoning_content?: unknown;
+  reasoning?: unknown;
+}): string {
+  const parts: string[] = [];
+  const push = (v: unknown) => {
+    if (typeof v === "string" && v.trim()) parts.push(v.trim());
+    else if (Array.isArray(v)) {
+      for (const p of v) {
+        if (typeof p === "string") parts.push(p);
+        else if (p && typeof p === "object" && "text" in p) parts.push(String((p as { text: unknown }).text));
+      }
+    }
+  };
+  // Prefer final answer content; fall back to reasoning if that is all we got.
+  push(message.content);
+  if (!parts.length) {
+    push(message.reasoning_content);
+    push(message.reasoning);
+  }
+  return parts.join("\n").trim();
+}
+
+async function nvidiaChat(
+  model: string,
+  messages: { role: string; content: ChatContent | ChatContent[] }[],
+  maxTokens: number
+): Promise<string> {
   if (!API_KEY) throw new Error("NVIDIA_API_KEY is not set");
 
   const res = await fetch(`${BASE_URL}/chat/completions`, {
@@ -75,9 +106,10 @@ async function nvidiaChat(model: string, messages: { role: string; content: Chat
     body: JSON.stringify({
       model,
       messages,
-      temperature: 0.1,
-      max_tokens: 256,
-      // Omni models think by default — that burns tokens/time before any labels.
+      temperature: 0.2,
+      top_p: 0.9,
+      max_tokens: maxTokens,
+      // Nemotron Omni thinks by default — disable so labels fit in the budget.
       chat_template_kwargs: { enable_thinking: false },
     }),
     signal: AbortSignal.timeout(TIMEOUT_MS),
@@ -89,58 +121,33 @@ async function nvidiaChat(model: string, messages: { role: string; content: Chat
   }
 
   const data = (await res.json()) as {
-    choices?: { message?: { content?: string } }[];
+    choices?: { message?: { content?: unknown; reasoning_content?: unknown; reasoning?: unknown }; finish_reason?: string }[];
   };
-  return String(data.choices?.[0]?.message?.content ?? "").trim();
-}
-
-async function ollamaVision(bytes: Buffer, hint?: string): Promise<string[]> {
-  if (!OLLAMA_BASE) throw new Error("OLLAMA_BASE_URL is not set");
-  const prompt =
-    `Identify the inventory / office / warehouse item in this photo.\n` +
-    `Reply with ONLY a JSON array of 1-5 short product names, most likely first.\n` +
-    `Example: ["Mouse","Computer mouse","USB mouse"]` +
-    (hint ? `\nUser caption: ${hint.slice(0, 80)}` : "");
-
-  const res = await fetch(`${OLLAMA_BASE}/api/chat`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      model: OLLAMA_VISION,
-      stream: false,
-      messages: [
-        {
-          role: "user",
-          content: prompt,
-          images: [bytes.toString("base64")],
-        },
-      ],
-      options: { temperature: 0.1 },
-    }),
-    signal: AbortSignal.timeout(TIMEOUT_MS),
-  });
-  if (!res.ok) {
-    const body = await res.text().catch(() => "");
-    throw new Error(`Ollama ${res.status}: ${body.slice(0, 200)}`);
+  const choice = data.choices?.[0];
+  const text = extractMessageText(choice?.message || {});
+  if (!text) {
+    throw new Error(`NVIDIA empty content (finish=${choice?.finish_reason || "?"})`);
   }
-  const data = (await res.json()) as { message?: { content?: string } };
-  return parseLabelJson(String(data.message?.content ?? ""));
+  return text;
 }
 
 function maybeShrink(bytes: Buffer): Buffer {
   if (bytes.length <= MAX_IMAGE_BYTES) return bytes;
-  // Without an image codec we can't resize — refuse oversized payloads so the
-  // caller can fall back to a smaller Telegram size instead of timing out.
-  throw new Error(`image too large (${bytes.length} bytes)`);
+  throw new Error(`image too large (${bytes.length} bytes; max ${MAX_IMAGE_BYTES})`);
 }
 
 const VISION_PROMPT =
-  `You identify warehouse / office inventory items in photos for a stock system.\n` +
-  `Return ONLY a JSON array of 1–5 short product name strings, most likely first.\n` +
-  `Use common English product names (e.g. "Mouse", "USB-C cable", "Keyboard").\n` +
-  `No sentences. No markdown. JSON array only.`;
+  `Look at this photo and name the physical object(s) shown for a warehouse inventory system.\n` +
+  `Reply with ONLY a JSON array of 4–8 short English names / reference spellings, most likely first.\n` +
+  `Include the common product name PLUS alternate names people might type (slang, typos, short forms).\n` +
+  `Example for a USB-C cable: ["USB-C cable","USB C cable","C type cable","C-type wire","Type C cable","USBC cable"]\n` +
+  `Example for a mouse: ["Mouse","Computer mouse","Wireless mouse","USB mouse"]\n` +
+  `Always guess — never return an empty array. No sentences. No markdown. JSON array only.`;
 
-// Identify inventory item names from a photo (JPEG/PNG bytes).
+const VISION_PROMPT_RETRY =
+  `What object is in this image? Reply ONLY a JSON array of 4–8 short names and common alternate spellings (e.g. ["USB-C cable","C type cable"]). Always include at least one guess.`;
+
+/** Identify inventory item names + alternate reference spellings from a photo. */
 export async function identifyItemFromImage(
   bytes: Buffer,
   mime = "image/jpeg",
@@ -148,47 +155,140 @@ export async function identifyItemFromImage(
 ): Promise<string[]> {
   if (MOCK) {
     const fromHint = (hint || "").trim();
-    return fromHint ? [fromHint, `${fromHint} item`] : ["Mouse", "Computer mouse", "USB mouse"];
+    if (fromHint) return [fromHint, `${fromHint} item`, `usb ${fromHint}`, `c type ${fromHint}`].slice(0, 6);
+    return ["Mouse", "Computer mouse", "USB mouse", "Wireless mouse"];
   }
 
-  const errors: string[] = [];
-  const prompt = VISION_PROMPT + (hint ? `\nCaption hint: "${hint.slice(0, 80)}"` : "");
+  if (!API_KEY) {
+    console.error("[ai] NVIDIA_API_KEY missing — cannot identify image");
+    return [];
+  }
 
-  if (API_KEY) {
+  const payload = maybeShrink(bytes);
+  const dataUrl = `data:${mime};base64,${payload.toString("base64")}`;
+  const hintLine = hint ? `\nCaption hint: "${hint.slice(0, 80)}"` : "";
+  const prompts = [VISION_PROMPT + hintLine, VISION_PROMPT_RETRY + hintLine];
+
+  let lastRaw = "";
+  let lastErr: unknown = null;
+
+  for (const prompt of prompts) {
     try {
-      const payload = maybeShrink(bytes);
-      const dataUrl = `data:${mime};base64,${payload.toString("base64")}`;
-      const raw = await nvidiaChat(VISION_MODEL, [
-        {
-          role: "user",
-          content: [
-            { type: "text", text: prompt },
-            { type: "image_url", image_url: { url: dataUrl } },
-          ],
-        },
-      ]);
+      const raw = await nvidiaChat(
+        VISION_MODEL,
+        [
+          {
+            role: "user",
+            content: [
+              { type: "image_url", image_url: { url: dataUrl } },
+              { type: "text", text: prompt },
+            ],
+          },
+        ],
+        VISION_MAX_TOKENS
+      );
+      lastRaw = raw;
       const labels = parseLabelJson(raw);
       if (labels.length) return labels;
-      errors.push(`NVIDIA returned no labels: ${raw.slice(0, 120)}`);
+      console.warn("[ai] Nemotron empty/unparseable labels, retrying…", raw.slice(0, 200));
     } catch (err) {
-      errors.push(String(err));
-      console.error("[ai] NVIDIA vision failed:", err);
+      lastErr = err;
+      console.error("[ai] Nemotron vision attempt failed:", err);
     }
   }
 
-  if (OLLAMA_BASE) {
-    try {
-      const labels = await ollamaVision(maybeShrink(bytes), hint);
-      if (labels.length) return labels;
-      errors.push("Ollama returned no labels");
-    } catch (err) {
-      errors.push(String(err));
-      console.error("[ai] Ollama vision failed:", err);
-    }
-  }
-
-  if (errors.length) console.error("[ai] identifyItemFromImage exhausted:", errors.join(" | "));
+  if (lastErr) throw lastErr instanceof Error ? lastErr : new Error(String(lastErr));
+  console.error("[ai] Nemotron returned no parseable labels:", lastRaw.slice(0, 400));
   return [];
+}
+
+/** Extra reference spellings for a confirmed product name (typos, slang, short forms). */
+export async function expandReferenceNames(canonical: string, seed: string[] = []): Promise<string[]> {
+  const base = [canonical, ...seed].map((s) => s.trim()).filter(Boolean);
+  const local = localReferenceExpansions(canonical);
+  const merged = uniqueNames([...base, ...local]);
+
+  if (MOCK || !API_KEY) return merged.slice(0, 12);
+
+  try {
+    const raw = await nvidiaChat(
+      TEXT_MODEL,
+      [
+        {
+          role: "user",
+          content:
+            `Product name: "${canonical}"\n` +
+            `Known labels: ${merged.slice(0, 8).join(", ") || "(none)"}\n` +
+            `List alternate reference names warehouse staff might type (slang, short forms, common misspellings).\n` +
+            `Example if product is USB-C cable: ["C type cable","C-type wire","usb c cable","type c cable","usbc wire"]\n` +
+            `Reply ONLY a JSON array of 4–10 short strings. No sentences.`,
+        },
+      ],
+      400
+    );
+    return uniqueNames([...merged, ...parseLabelJson(raw)]).slice(0, 16);
+  } catch (err) {
+    console.error("[ai] expandReferenceNames failed:", err);
+    return merged.slice(0, 12);
+  }
+}
+
+/** Cheap deterministic variants so we still tag items when the text model is slow. */
+export function localReferenceExpansions(name: string): string[] {
+  const n = name.trim();
+  if (!n) return [];
+  const out: string[] = [];
+  const lower = n.toLowerCase();
+
+  const push = (s: string) => {
+    const t = s.trim().replace(/\s+/g, " ");
+    if (t && t.toLowerCase() !== lower) out.push(t);
+  };
+
+  push(n.replace(/-/g, " "));
+  push(n.replace(/\s+/g, "-"));
+  push(n.replace(/-/g, ""));
+
+  // USB-C / Type-C style cables & wires
+  if (/\busb[-\s]?c\b/i.test(n) || /\bc[-\s]?type\b/i.test(n) || /\btype[-\s]?c\b/i.test(n)) {
+    push("C type cable");
+    push("C-type cable");
+    push("C type wire");
+    push("C-type wire");
+    push("USB C cable");
+    push("USB-C cable");
+    push("USBC cable");
+    push("Type C cable");
+    push("Type-C cable");
+    push("usb c type cable");
+  }
+  if (/\bhdmi\b/i.test(n)) {
+    push("HDMI cable");
+    push("hdmi wire");
+  }
+  if (/\bmouse\b/i.test(n)) {
+    push("Computer mouse");
+    push("USB mouse");
+  }
+  if (/\bkeyboard\b/i.test(n)) {
+    push("Computer keyboard");
+    push("USB keyboard");
+  }
+
+  return out;
+}
+
+function uniqueNames(names: string[]): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const raw of names) {
+    const t = raw.trim().replace(/\s+/g, " ").slice(0, 80);
+    const key = t.toLowerCase();
+    if (!t || seen.has(key)) continue;
+    seen.add(key);
+    out.push(t);
+  }
+  return out;
 }
 
 export async function normalizeItemName(typed: string, knownNames: string[]): Promise<string | null> {
@@ -197,15 +297,19 @@ export async function normalizeItemName(typed: string, knownNames: string[]): Pr
 
   const sample = knownNames.slice(0, 40).join(", ");
   try {
-    const raw = await nvidiaChat(TEXT_MODEL, [
-      {
-        role: "user",
-        content:
-          `The warehouse worker typed "${q}" (likely misspelled).\n` +
-          `Known products (sample): ${sample || "(none)"}.\n` +
-          `Reply with ONLY the corrected short product name, or ONLY the word NONE if unsure.`,
-      },
-    ]);
+    const raw = await nvidiaChat(
+      TEXT_MODEL,
+      [
+        {
+          role: "user",
+          content:
+            `The warehouse worker typed "${q}" (likely misspelled).\n` +
+            `Known products (sample): ${sample || "(none)"}.\n` +
+            `Reply with ONLY the corrected short product name, or ONLY the word NONE if unsure.`,
+        },
+      ],
+      TEXT_MAX_TOKENS
+    );
     const cleaned = raw.replace(/<think>[\s\S]*?<\/think>/gi, "").replace(/^["']|["']$/g, "").trim();
     if (!cleaned || /^none$/i.test(cleaned)) return null;
     return cleaned.slice(0, 80);

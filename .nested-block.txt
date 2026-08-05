@@ -1,0 +1,308 @@
+function emptyNestedCursor(): NestedCursor {
+  return { treeId: "", treeName: "", picked: false, level: 0, parentNodeId: null, path: [] };
+}
+
+function nestedCursorOf(session: BotSession): NestedCursor {
+  return (session.nestedCursor ??= emptyNestedCursor());
+}
+
+// What the tree is matched against: whatever the entry has already established
+// the item to be. The item step is the usual source; a product step names the
+// item just as well when the workflow starts from the catalogue instead.
+function itemNameForTree(session: BotSession): string {
+  const item = answerFor(session, "item_capture");
+  if (item && item.value) return String(item.value);
+  const product = answerFor(session, "product_select");
+  return String(product?.product?.name ?? product?.display ?? "");
+}
+
+// Which tree this step would walk, from its config and the entry's answers
+// alone. Deliberately blind to the cursor: it is also the probe for "does this
+// step have anything to ask", which has to be answerable while the cursor still
+// belongs to the step being left.
+async function lookupNestedTree(db: Db, session: BotSession, step: StepInstance): Promise<Document | null> {
+  const trees = await activeOptionTrees(db);
+  const configured = String(step.config.tree ?? "").trim();
+  if (configured) return findTreeByName(trees, configured);
+  if (step.config.matchItem === false) return null;
+  return matchOptionTree(trees, itemNameForTree(session));
+}
+
+// The tree this step is walking, binding it to the cursor the first time it is
+// worked out. Precedence: one already chosen for this session, then the lookup.
+async function resolveNestedTree(db: Db, session: BotSession, step: StepInstance): Promise<Document | null> {
+  const cursor = nestedCursorOf(session);
+
+  if (cursor.treeId) {
+    const trees = await activeOptionTrees(db);
+    const bound = trees.find((t) => t._id.toString() === cursor.treeId);
+    // A tree deactivated mid-entry drops the cursor back to unresolved rather
+    // than leaving the step walking a forest that is no longer offered.
+    if (bound) return bound;
+    session.nestedCursor = emptyNestedCursor();
+    return null;
+  }
+
+  const found = await lookupNestedTree(db, session, step);
+  if (found) bindTree(session, found);
+  return found;
+}
+
+// Whether a fresh walk of this tree would ask anything at all. A tree whose
+// first real level reads from the forest but has no root nodes yet has nothing
+// to say, and a step that would show an empty keyboard is worse than one that
+// quietly steps aside.
+async function treeAsksAnything(db: Db, tree: Document): Promise<boolean> {
+  for (const level of treeLevels(tree)) {
+    if (level.input === "nodes") {
+      const roots = await optionNodeChildren(db, tree._id.toString(), null);
+      return roots.length > 0 || Boolean(level.allowOther);
+    }
+    if (level.input === "list" && !(level.options ?? []).length && !level.allowOther) continue;
+    return true;
+  }
+  return false;
+}
+
+// A nested step with nothing to ask for THIS entry: no tree matches the item and
+// the author chose to step aside, or the tree that matched is empty. Such a step
+// is walked past in both directions, so Back never parks the user on it.
+async function nestedNothingToAsk(db: Db, session: BotSession, step: StepInstance | undefined): Promise<boolean> {
+  if (step?.type !== "nested_select") return false;
+  const tree = await lookupNestedTree(db, session, step);
+  if (tree) return !(await treeAsksAnything(db, tree));
+  return String(step.config.whenUnmatched ?? "skip") !== "ask";
+}
+
+// Entering a nested step: walk to the first level that has a question, which may
+// be none at all when the branch bottoms out immediately.
+async function enterNested(db: Db, session: BotSession, step: StepInstance): Promise<EngineResult> {
+  const tree = await resolveNestedTree(db, session, step);
+  // No tree and the author asked for a picker — render it.
+  if (!tree) return { render: await renderCurrentStep(db, session) };
+  return nestedForward(db, session, step, tree);
+}
+
+function bindTree(session: BotSession, tree: Document, picked = false) {
+  const cursor = nestedCursorOf(session);
+  cursor.treeId = tree._id.toString();
+  cursor.treeName = String(tree.name ?? "");
+  cursor.picked = picked;
+}
+
+// The buttons a level offers — the single source of truth for both rendering it
+// and resolving the tap that comes back, so an index can never mean a different
+// option than the button the user saw.
+async function nestedLevelOptions(db: Db, cursor: NestedCursor, level: OptionLevel): Promise<string[]> {
+  if (level.input === "list") return level.options ?? [];
+  if (level.input !== "nodes") return [];
+  const children = await optionNodeChildren(db, cursor.treeId, cursor.parentNodeId);
+  return children.map((n) => String(n.name));
+}
+
+function nestedTrail(cursor: NestedCursor): string {
+  return cursor.path.map((p) => p.value).join(" › ");
+}
+
+// Record one level's answer and move the cursor on. A node answer is the only
+// kind that moves the position in the forest.
+function pushNestedValue(cursor: NestedCursor, level: OptionLevel, value: string, nodeId?: string) {
+  cursor.path.push({ level: cursor.level, label: level.label, value, ...(nodeId ? { nodeId } : {}) });
+  if (nodeId) cursor.parentNodeId = nodeId;
+  cursor.level += 1;
+}
+
+// Walk forward to the next level that actually has something to ask, and finish
+// the step when there is nothing left.
+//
+// A branch is allowed to end above the configured depth: if the tree has no
+// children under the node the user picked, there is no honest question to ask,
+// so the step commits what it has instead of showing an empty keyboard. That is
+// what lets one tree carry "Copper → Flexible → 2.5 sq mm" beside a fibre
+// branch that stops at the core count.
+async function nestedForward(db: Db, session: BotSession, step: StepInstance, tree: Document): Promise<EngineResult> {
+  const cursor = nestedCursorOf(session);
+  const levels = treeLevels(tree);
+
+  while (cursor.level < levels.length) {
+    const level = levels[cursor.level];
+    if (level.input === "nodes") {
+      const options = await nestedLevelOptions(db, cursor, level);
+      if (options.length || level.allowOther) break;
+      cursor.level = levels.length; // nothing below this branch — the walk is done
+      break;
+    }
+    // A list level authored with no options and no typed fallback can never be
+    // answered; skipping it beats dead-ending the entry on a config mistake.
+    if (level.input === "list" && !(level.options ?? []).length && !level.allowOther) {
+      cursor.level += 1;
+      continue;
+    }
+    break;
+  }
+
+  if (cursor.level >= levels.length) return commitNested(db, session, step);
+  session.numberDraft = "";
+  return { render: await renderCurrentStep(db, session) };
+}
+
+async function commitNested(db: Db, session: BotSession, step: StepInstance): Promise<EngineResult> {
+  const cursor = nestedCursorOf(session);
+  if (!cursor.path.length) {
+    // Nothing was asked after all (an empty tree, or a first level with no
+    // options). Treat it as a step that had nothing to contribute.
+    session.answers[step.instanceId] = { type: "nested_select", value: "", display: "(skipped)" };
+    return advance(db, session);
+  }
+  const last = cursor.path[cursor.path.length - 1];
+  session.answers[step.instanceId] = {
+    type: "nested_select",
+    // The deepest node is the durable reference when the walk ended on one; the
+    // joined path is what a text-ended walk has to identify it.
+    value: last.nodeId ?? nestedTrail(cursor),
+    display: nestedTrail(cursor),
+    tree: cursor.treeName,
+    path: cursor.path.map((p) => ({ label: p.label, value: p.value })),
+  };
+  return advance(db, session);
+}
+
+async function renderNested(db: Db, session: BotSession, step: StepInstance): Promise<RenderResult> {
+  const cursor = nestedCursorOf(session);
+  const label = step.label || "Tell me more about this item:";
+  const tree = await resolveNestedTree(db, session, step);
+
+  // No tree yet — ask which one applies. Reached when nothing matched the item
+  // and the step is configured to ask rather than step aside.
+  if (!tree) {
+    const trees = await activeOptionTrees(db);
+    if (!trees.length) {
+      return { text: `${escHtml(label)}\n<i>No nested categories are configured yet.</i>`, keyboard: navRow(session) };
+    }
+    const btns = trees.map((t, i) => ({ text: truncateLabel(String(t.name), 28), callback_data: `nest:tree:${i}` }));
+    return {
+      text: `${escHtml(label)}\n<i>Which of these is it?</i>`,
+      keyboard: [...buttonRows(btns, 2), ...navRow(session)],
+    };
+  }
+
+  const levels = treeLevels(tree);
+  const level = levels[cursor.level];
+  if (!level) {
+    // Only reachable if the tree was edited mid-entry down to fewer levels.
+    return { text: `${escHtml(label)}\n<i>Nothing left to ask here.</i>`, keyboard: navRow(session) };
+  }
+
+  const trail = nestedTrail(cursor);
+  const heading = [
+    `<b>${escHtml(level.label)}</b>`,
+    `<i>${escHtml(cursor.treeName)}${trail ? `: ${escHtml(trail)}` : ""}</i>`,
+  ];
+
+  if (level.input === "number") {
+    return {
+      text: `${heading.join("\n")}\n\n${keypadValue(session.numberDraft ?? "", level.min, level.max)}`,
+      keyboard: numberPad(session),
+    };
+  }
+
+  if (level.input === "text") {
+    if (level.placeholder) heading.push(`<i>${escHtml(level.placeholder)}</i>`);
+    heading.push("", "Type your answer.");
+    return { text: heading.join("\n"), keyboard: navRow(session) };
+  }
+
+  const options = await nestedLevelOptions(db, cursor, level);
+  const prefix = level.input === "list" ? "nest:opt:" : "nest:";
+  const btns = options.map((name, i) => ({ text: truncateLabel(name, 28), callback_data: `${prefix}${i}` }));
+  if (level.allowOther) {
+    heading.push("", options.length ? "Tap an option, or type your own." : "Type your answer.");
+  } else if (!options.length) {
+    heading.push("", "<i>No options are configured here yet.</i>");
+  }
+  return { text: heading.join("\n"), keyboard: [...buttonRows(btns, 2), ...navRow(session)] };
+}
+
+// A typed answer to the level on screen. Levels that only take taps say so.
+async function applyNestedText(db: Db, session: BotSession, step: StepInstance, raw: string): Promise<EngineResult> {
+  const cursor = nestedCursorOf(session);
+  const tree = await resolveNestedTree(db, session, step);
+  if (!tree) return { render: await renderCurrentStep(db, session) };
+  const level = treeLevels(tree)[cursor.level];
+  if (!level) return { render: await renderCurrentStep(db, session) };
+
+  const text = raw.trim().slice(0, 60);
+  if (!text) return { render: await renderCurrentStep(db, session) };
+
+  if (level.input === "number") {
+    const check = checkNumber(text, level.min, level.max);
+    if (check.notice) return { notice: check.notice };
+    pushNestedValue(cursor, level, String(check.value));
+    return nestedForward(db, session, step, tree);
+  }
+
+  if (level.input === "text" || level.allowOther) {
+    // A typed value that names one of this level's own options is that option —
+    // typing "Copper" must not fork away from the branch it belongs to.
+    if (level.input === "nodes") {
+      const children = await optionNodeChildren(db, cursor.treeId, cursor.parentNodeId);
+      const hit = children.find((n) => String(n.name).toLowerCase() === text.toLowerCase());
+      if (hit) {
+        pushNestedValue(cursor, level, String(hit.name), hit._id.toString());
+        return nestedForward(db, session, step, tree);
+      }
+    }
+    pushNestedValue(cursor, level, text);
+    return nestedForward(db, session, step, tree);
+  }
+
+  return { notice: "Pick one of the options above." };
+}
+
+async function applyNestedCallback(db: Db, session: BotSession, step: StepInstance, data: string): Promise<EngineResult> {
+  const cursor = nestedCursorOf(session);
+
+  if (data.startsWith("nest:tree:")) {
+    const trees = await activeOptionTrees(db);
+    const chosen = trees[indexOf(data, "nest:tree:")];
+    if (!chosen) return { notice: "That option is no longer available." };
+    session.nestedCursor = emptyNestedCursor();
+    bindTree(session, chosen, true);
+    return nestedForward(db, session, step, chosen);
+  }
+
+  const tree = await resolveNestedTree(db, session, step);
+  if (!tree) return { render: await renderCurrentStep(db, session) };
+  const level = treeLevels(tree)[cursor.level];
+  if (!level) return { render: await renderCurrentStep(db, session) };
+
+  if (level.input === "number") {
+    if (!data.startsWith("num:")) return { notice: "Use the keypad above." };
+    const pressed = data.slice(4);
+    if (pressed === "ok") {
+      const check = checkNumber(session.numberDraft ?? "", level.min, level.max);
+      if (check.notice) return { notice: check.notice };
+      pushNestedValue(cursor, level, String(check.value));
+      return nestedForward(db, session, step, tree);
+    }
+    const draft = pressKeypad(session.numberDraft ?? "", pressed);
+    if (draft.notice) return { notice: draft.notice };
+    session.numberDraft = draft.value;
+    return { render: await renderCurrentStep(db, session) };
+  }
+
+  if (level.input === "list") {
+    const chosen = (level.options ?? [])[indexOf(data, "nest:opt:")];
+    if (!data.startsWith("nest:opt:") || chosen === undefined) return { notice: "Pick one of the options above." };
+    pushNestedValue(cursor, level, chosen);
+    return nestedForward(db, session, step, tree);
+  }
+
+  if (!data.startsWith("nest:")) return { notice: "Pick one of the options above." };
+  const children = await optionNodeChildren(db, cursor.treeId, cursor.parentNodeId);
+  const chosen = children[indexOf(data, "nest:")];
+  if (!chosen) return { notice: "That option is no longer available." };
+  pushNestedValue(cursor, level, String(chosen.name), chosen._id.toString());
+  return nestedForward(db, session, step, tree);
+}
+

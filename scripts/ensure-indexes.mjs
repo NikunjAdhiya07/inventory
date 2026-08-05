@@ -22,6 +22,8 @@ const INDEX_SPECS = {
   categories: [{ key: { order: 1 } }],
   subcategories: [{ key: { parent: 1 } }],
   locations: [{ key: { parent: 1 } }],
+  optionTrees: [{ key: { name: 1 }, unique: true }],
+  optionNodes: [{ key: { treeId: 1, parent: 1 } }, { key: { parent: 1 } }],
   products: [
     { key: { productNumberKey: 1 }, unique: true },
     { key: { status: 1, name: 1 } },
@@ -51,11 +53,15 @@ const INDEX_SPECS = {
     { key: { ticketNumber: 1 }, unique: true, partialFilterExpression: { ticketNumber: { $type: "string" } } },
     { key: { sessionId: 1 }, unique: true, partialFilterExpression: { sessionId: { $type: "string" } } },
   ],
+  movementTypes: [{ key: { code: 1 }, unique: true }, { key: { order: 1 } }],
   stockMovements: [
     { key: { productId: 1, locationId: 1 } },
     { key: { movementKey: 1 }, unique: true, partialFilterExpression: { movementKey: { $type: "string" } } },
     { key: { requestId: 1 } },
     { key: { createdAt: -1 } },
+    // The transaction history is read by type and by item, newest first.
+    { key: { reason: 1, createdAt: -1 } },
+    { key: { productId: 1, createdAt: -1 } },
   ],
   requests: [
     { key: { chatId: 1, requesterUserId: 1, status: 1 } },

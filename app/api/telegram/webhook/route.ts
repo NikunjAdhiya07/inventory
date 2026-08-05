@@ -9,6 +9,7 @@ import { renderCurrentStep, applyMessage, applyCallback, primeStep, type EngineR
 import { sendMessage, editMessageText, answerCallbackQuery, type InlineKeyboard } from "@/lib/telegram";
 import { groupConfig, noteBlockedGroup, recordGroupActivity, registerGroup } from "@/lib/telegram-health";
 import { handleRequestUpdate } from "@/lib/request-webhook";
+import { claimUpdate, handleIssueUpdate } from "@/lib/issue-webhook";
 import { PERM_APPROVE_PURCHASE, PERM_ISSUE, PERM_REQUEST } from "@/lib/request-types";
 import {
   AUTO_ENROLL_ENABLED,
@@ -25,11 +26,14 @@ const ok = () => NextResponse.json({ ok: true });
 
 function pickPhotoFileId(photos: { file_id: string; file_size?: number; width?: number }[] | undefined): string | undefined {
   if (!photos?.length) return undefined;
-  // Prefer a mid-size frame (~800–1280px). The largest Telegram size is often
-  // multi‑MB and makes vision slow or fail; the smallest is too blurry.
+  // Prefer ~640–900px: sharp enough for Nemotron, small enough that getFile +
+  // download finish before Telegram timeouts on slow links.
   const ranked = [...photos].sort((a, b) => (a.width ?? 0) - (b.width ?? 0));
   const mid =
-    ranked.find((p) => (p.width ?? 0) >= 800) ?? ranked[Math.max(0, ranked.length - 2)] ?? ranked[ranked.length - 1];
+    ranked.find((p) => (p.width ?? 0) >= 640 && (p.width ?? 0) <= 1000) ??
+    ranked.find((p) => (p.width ?? 0) >= 500) ??
+    ranked[Math.max(0, ranked.length - 2)] ??
+    ranked[ranked.length - 1];
   return mid.file_id;
 }
 
@@ -112,7 +116,9 @@ async function handleNewMembers(db: Db, members: TelegramUser[], chat: { id: num
   if (botAdded) {
     await sendMessage(
       chatId,
-      "✅ <b>Inventory bot connected.</b>\nEveryone in this group can add inventory — send an item name or a photo to start an entry."
+      "✅ <b>Inventory bot connected.</b>\n" +
+        "Send an item name or a photo to start an entry.\n" +
+        "Send <b>/issue</b> to hand materials to someone and track what comes back."
     );
     return;
   }
@@ -315,13 +321,25 @@ export async function POST(req: NextRequest) {
   // already happened alongside the lookups above instead of after them. A
   // request group runs no workflow at all, so it resolves none.
   const isRequestGroup = group.mode === "request";
+  const isEntryGroup = !isRequestGroup;
   const workflowPromise = callback || isRequestGroup ? null : resolveWorkflow(db, chatId).catch(() => null);
 
-  const [auth, sessionDoc] = await Promise.all([
+  const [auth, sessionDoc, issueClaim] = await Promise.all([
     authorize(db, userId, from, chatId, chat.type),
     // Entry sessions do not exist in a request group; looking for one would be a
     // round trip spent proving it every single update.
-    isRequestGroup ? Promise.resolve(null) : db.collection("botSessions").findOne(sessionQuery),
+    isEntryGroup ? db.collection("botSessions").findOne(sessionQuery) : Promise.resolve(null),
+    // Does the material issue/return overlay own this update? Asked in EVERY
+    // group, whatever its mode, so one chat can run the entry workflow and the
+    // handover lifecycle side by side. It answers from the callback prefix or
+    // the command text without touching Mongo; only a plain message costs a
+    // lookup, and that one is an indexed hit on an open draft.
+    claimUpdate(db, {
+      chatId,
+      userId,
+      ...(callback ? { callbackData } : {}),
+      ...(message ? { text: (message.text ?? message.caption) as string | undefined } : {}),
+    }).catch(() => null),
   ]);
 
   // Reaching here without an account now means one of two deliberate things:
@@ -340,9 +358,17 @@ export async function POST(req: NextRequest) {
   // request permissions, because the same chat is where requesters, Inventory
   // Managers and Purchase Officers all act. Which of the three a given button
   // actually requires is checked again next to that button's handler.
+  //
+  // An issue/return update skips this gate entirely. Half of that flow is a
+  // maintenance worker acknowledging materials handed to them and declaring what
+  // came back — being named on the ticket is the credential for that, and it is
+  // the one thing nobody else may do on their behalf. Holding it to the gate
+  // that guards adding stock would lock out exactly the people its tickets are
+  // addressed to. The store-side actions each check "Issue Inventory" next to
+  // their own handler instead.
   const REQUEST_PERMS = [PERM_REQUEST, PERM_ISSUE, PERM_APPROVE_PURCHASE];
   const needed = isRequestGroup ? REQUEST_PERMS : ["Add Inventory"];
-  if (!needed.some((p) => auth.perms.includes(p)) && !isApprovalCallback) {
+  if (!issueClaim && !needed.some((p) => auth.perms.includes(p)) && !isApprovalCallback) {
     const reason = isRequestGroup
       ? `⛔ The ${auth.user.role} role can't use the request bot. Ask an admin to grant it the "${PERM_REQUEST}" permission.`
       : `⛔ The ${auth.user.role} role can't add inventory. Ask an admin to grant it the "Add Inventory" permission.`;
@@ -365,24 +391,36 @@ export async function POST(req: NextRequest) {
   );
   defer(() => ensureIndexesOnce(db));
 
+  const flowCtx = {
+    chatId,
+    updateId,
+    userId,
+    name,
+    handle: String(auth.user.handle || (from.username ? `@${from.username}` : "")),
+    dbUserId: auth.user._id.toString(),
+    perms: auth.perms,
+    ...(message ? { message: { text: message.text as string | undefined } } : {}),
+    ...(callback ? { callback: { id: callback.id, data: callbackData, messageId: tappedMessageId } } : {}),
+  };
+
+  // ---------------- Material issue / return ----------------
+  // Checked first and in every group, because it is an overlay rather than a
+  // mode: this is what lets one chat run the original entry workflow and the
+  // handover lifecycle together. It only ever claims its own buttons, an
+  // explicit `/issue`, or a message from someone with a draft they opened
+  // themselves — so a plain message meant for the group's own flow never lands
+  // here. See `claimUpdate`.
+  if (issueClaim) {
+    await handleIssueUpdate(db, { ...flowCtx, draft: issueClaim.draft });
+    return ok();
+  }
+
   // ---------------- Request groups ----------------
   // Everything below this point is the inventory-entry flow. A request group
   // never reaches it: no session is opened, no workflow is resolved, and a typed
   // message is a product search rather than the start of an entry.
   if (isRequestGroup) {
-    await handleRequestUpdate(db, {
-      chatId,
-      updateId,
-      userId,
-      name,
-      handle: String(auth.user.handle || (from.username ? `@${from.username}` : "")),
-      dbUserId: auth.user._id.toString(),
-      perms: auth.perms,
-      ...(message ? { message: { text: message.text as string | undefined } } : {}),
-      ...(callback
-        ? { callback: { id: callback.id, data: callbackData, messageId: tappedMessageId } }
-        : {}),
-    });
+    await handleRequestUpdate(db, flowCtx);
     return ok();
   }
 

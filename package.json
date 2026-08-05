@@ -11,6 +11,8 @@
     "seed:real": "node scripts/seed-real-data.mjs",
     "seed:workflows": "node scripts/seed-workflows.mjs",
     "seed:products": "node scripts/seed-products.mjs",
+    "seed:option-trees": "node scripts/seed-option-trees.mjs",
+    "seed:movement-types": "node scripts/seed-movement-types.mjs",
     "ensure-indexes": "node scripts/ensure-indexes.mjs",
     "backfill:stock": "node scripts/backfill-stock.mjs",
     "migrate:request-roles": "node scripts/migrate-request-roles.mjs",

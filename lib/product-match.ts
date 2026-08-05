@@ -152,17 +152,64 @@ export async function rankItemSuggestions(
 }
 
 // Soft filter for product_select / stock search: widen substring match with fuzzy.
-export function productMatchesFuzzy(p: Document, query: string, aliases?: Map<string, ProductAlias>): boolean {
-  if (productMatches(p, query)) return true;
-  const q = query.trim().toLowerCase();
-  if (!q) return true;
+export function productMatchesFuzzy(
+  p: Document,
+  query: string,
+  aliases?: Map<string, ProductAlias> | ProductAlias[]
+): boolean {
+  return scoreProductQuery(p, query, aliases) >= 55;
+}
+
+/**
+ * Score how well a product matches a search query (0–100), using name /
+ * attributes plus SEO-style reference names (productAliases).
+ * Used by entry suggestions and the search/request group stock finder.
+ */
+export function scoreProductQuery(
+  p: Document,
+  query: string,
+  aliases?: Map<string, ProductAlias> | ProductAlias[]
+): number {
+  const q = query.trim().toLowerCase().replace(/\s+/g, " ");
+  if (!q) return 100;
+
+  let best = 0;
   const name = String(p.name ?? "");
-  if (similarity(q, name) >= 72) return true;
-  if (aliases) {
-    const id = p._id?.toString?.() ?? "";
-    for (const a of aliases.values()) {
-      if (a.productId === id && (a.aliasKey.includes(q) || similarity(q, a.aliasKey) >= 78)) return true;
+  const id = p._id?.toString?.() ?? String((p as { id?: string }).id ?? "");
+
+  if (name.toLowerCase() === q) best = Math.max(best, 100);
+  if (productMatches(p, query)) best = Math.max(best, 90);
+  best = Math.max(best, similarity(q, name));
+
+  const list: ProductAlias[] = Array.isArray(aliases)
+    ? aliases
+    : aliases
+      ? [...aliases.values()].filter((a) => a.productId === id)
+      : [];
+
+  for (const a of list) {
+    const key = a.aliasKey || a.alias.toLowerCase();
+    if (!key) continue;
+    if (key === q) best = Math.max(best, 98);
+    else if (key.includes(q) || q.includes(key)) {
+      const ratio = Math.min(q.length, key.length) / Math.max(q.length, key.length);
+      best = Math.max(best, Math.round(82 + ratio * 14));
+    } else {
+      best = Math.max(best, similarity(q, key));
     }
   }
-  return false;
+
+  return best;
+}
+
+/** Load aliases grouped by productId for stock / SEO search. */
+export async function aliasesByProductId(db: Db): Promise<Map<string, ProductAlias[]>> {
+  const map = new Map<string, ProductAlias[]>();
+  const all = await allAliasKeys(db);
+  for (const a of all.values()) {
+    const list = map.get(a.productId) || [];
+    list.push(a);
+    map.set(a.productId, list);
+  }
+  return map;
 }

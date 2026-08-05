@@ -19,13 +19,19 @@ import type { Db } from "mongodb";
 
 const PREFIX = process.env.TICKET_PREFIX || "INV";
 
-// The series an entry/request/purchase numbers itself from. `INVENTORY` stays
-// configurable because deployments already set TICKET_PREFIX; the other two are
-// fixed so a ticket number always says which flow raised it.
+// The series a ticket numbers itself from. `INVENTORY` stays configurable
+// because deployments already set TICKET_PREFIX; the rest are fixed so a ticket
+// number always says which flow raised it.
+//
+// ISS and RET are a pair: an issue records materials leaving with a named
+// person, and a return settles it. They are numbered separately because they are
+// raised days apart by different people, and each is quoted on its own.
 export const TicketSeries = {
   INVENTORY: PREFIX,
   REQUEST: "REQ",
   PURCHASE: "PUR",
+  ISSUE: "ISS",
+  RETURN: "RET",
 } as const;
 
 export type TicketSeriesName = (typeof TicketSeries)[keyof typeof TicketSeries];

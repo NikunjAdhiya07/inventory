@@ -5,7 +5,7 @@ import { useState, type CSSProperties, type ReactNode } from "react";
 export type TicketCardModel = {
   id: string;
   ticketId: string;
-  kind: "entry" | "request" | "purchase";
+  kind: "entry" | "request" | "purchase" | "issue" | "return";
   series: string;
   status: string;
   boardStatus: "PENDING" | "COMPLETED" | "REJECTED" | "CANCELLED";
@@ -62,14 +62,24 @@ function kindColor(kind: TicketCardModel["kind"]): string {
   return "#6d5bd0";
 }
 
-function agoLabel(iso?: string | null, endIso?: string | null): string {
+function durationLabel(ms: number): string {
+  const totalMinutes = Math.max(0, Math.round(ms / 60_000));
+  const days = Math.floor(totalMinutes / 1440);
+  const hours = Math.floor((totalMinutes % 1440) / 60);
+  const minutes = totalMinutes % 60;
+  if (days > 0) return hours > 0 ? `${days}d ${hours}h` : `${days}d`;
+  if (hours > 0) return minutes > 0 ? `${hours}h ${minutes}m` : `${hours}h`;
+  return `${minutes}m`;
+}
+
+function elapsedLabel(iso?: string | null, endIso?: string | null): string {
   if (!iso) return "—";
   const start = new Date(iso).getTime();
-  const end = endIso ? new Date(endIso).getTime() : Date.now();
   if (!Number.isFinite(start)) return "—";
-  const hours = Math.max(0, Math.floor((end - start) / 3_600_000));
-  if (hours >= 24) return `${(hours / 24).toFixed(1)}d (${hours}h)`;
-  return `${hours}h ago`;
+  const end = endIso ? new Date(endIso).getTime() : Date.now();
+  if (!Number.isFinite(end)) return "—";
+  // Closed tickets show turnaround (created → actioned); open ones show time since creation.
+  return endIso ? durationLabel(end - start) : `${durationLabel(end - start)} ago`;
 }
 
 function whenShort(iso?: string | null): string {
@@ -77,6 +87,20 @@ function whenShort(iso?: string | null): string {
   const d = new Date(iso);
   if (Number.isNaN(d.getTime())) return "";
   return d.toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
+}
+
+function clockShort(iso?: string | null): string {
+  if (!iso) return "";
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return "";
+  return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+}
+
+function spanLabel(iso?: string | null, endIso?: string | null): string {
+  const start = clockShort(iso);
+  if (!start) return "";
+  const end = clockShort(endIso);
+  return end ? `${start} → ${end}` : start;
 }
 
 const badgeBase: CSSProperties = {
@@ -275,10 +299,10 @@ export default function TicketCard({ ticket }: { ticket: TicketCardModel }) {
               Time
             </div>
             <div style={{ fontWeight: 700, color: colors.textDark }}>
-              {agoLabel(ticket.createdAt, ticket.completedAt)}
+              {elapsedLabel(ticket.createdAt, ticket.completedAt)}
             </div>
             <div style={{ fontSize: 10, color: colors.text, marginTop: 2 }}>
-              {ticket.createdAt ? new Date(ticket.createdAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) : ""}
+              {spanLabel(ticket.createdAt, ticket.completedAt)}
             </div>
           </div>
           <div>

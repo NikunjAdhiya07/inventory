@@ -13,9 +13,45 @@ import { cached } from "./cache";
 // no round trips at all.
 
 export async function activeLocations(db: Db): Promise<Document[]> {
-  return cached("locations:active", () =>
-    db.collection("locations").find({ status: "Active" }).sort({ name: 1 }).toArray()
-  );
+  return cached("locations:active", async () => {
+    const all = await db.collection("locations").find({ status: "Active" }).sort({ name: 1 }).toArray();
+    // Shelves and boxes are positional — "Shelf 10" belongs after "Shelf 9",
+    // and a rack can be re-shuffled to match the room. `order` is written by
+    // the reorder route for every sibling in a group at once, so a group is
+    // either fully positioned or not positioned at all; the ones without it
+    // keep the name order they already had, after the ones with it.
+    return all.sort((a, b) => {
+      const ao = typeof a.order === "number" ? a.order : Infinity;
+      const bo = typeof b.order === "number" ? b.order : Infinity;
+      if (ao !== bo) return ao - bo;
+      return String(a.name).localeCompare(String(b.name));
+    });
+  });
+}
+
+// Every descendant id of a node, itself included. The guard against moving a
+// rack into one of its own shelves — which would detach the whole branch from
+// the tree and leave its stock unreachable.
+export async function locationSubtreeIds(db: Db, rootId: string): Promise<Set<string>> {
+  const all = await activeLocations(db);
+  const childrenOf = new Map<string, string[]>();
+  for (const l of all) {
+    const parent = l.parent ? String(l.parent) : "";
+    if (!parent) continue;
+    const list = childrenOf.get(parent);
+    if (list) list.push(l._id.toString());
+    else childrenOf.set(parent, [l._id.toString()]);
+  }
+  const seen = new Set<string>([rootId]);
+  const queue = [rootId];
+  while (queue.length) {
+    for (const child of childrenOf.get(queue.pop() as string) || []) {
+      if (seen.has(child)) continue;
+      seen.add(child);
+      queue.push(child);
+    }
+  }
+  return seen;
 }
 
 export async function locationChildren(db: Db, parent: string | null): Promise<Document[]> {

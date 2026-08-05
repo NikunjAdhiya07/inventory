@@ -117,6 +117,21 @@ const INDEX_SPECS: Record<string, { key: Document; unique?: boolean; partialFilt
     { key: { status: 1, createdAt: -1 } },
     { key: { createdAt: -1 } },
   ],
+  // Material issue (ISS-) and return (RET-) tickets. One collection, two kinds:
+  // they share every piece of machinery and differ only in lifecycle, so the
+  // draft lookup that runs on each update in a store group is keyed by kind too.
+  //
+  // `recipient.userId` is what answers "what is Vijay still holding" without a
+  // scan, and `issueTicketId` is how a return finds the issue it settles.
+  issueTickets: [
+    { key: { chatId: 1, createdByUserId: 1, kind: 1, status: 1 } },
+    { key: { ticketNumber: 1 }, unique: true, partialFilterExpression: { ticketNumber: { $type: "string" } } },
+    { key: { anchorMessageId: 1 } },
+    { key: { issueTicketId: 1 } },
+    { key: { "recipient.userId": 1, status: 1 } },
+    { key: { status: 1, createdAt: -1 } },
+    { key: { createdAt: -1 } },
+  ],
 };
 
 export async function ensureIndexes(db?: Db): Promise<void> {

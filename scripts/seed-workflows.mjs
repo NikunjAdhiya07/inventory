@@ -1,5 +1,5 @@
 // Seeds the Workflow Builder + Telegram bot engine collections:
-//   stepLibrary        — the 10 predefined step types (the palette)
+//   stepLibrary        — the predefined step types (the palette)
 //   workflows          — one default workflow reproducing the fixed Story-3 flow
 //   workflowVersions   — its immutable snapshot #1
 //   telegramGroups     — a couple of groups to assign to
@@ -64,13 +64,27 @@ const stepLibrary = [
     status: "Active",
   },
   {
+    type: "nested_select",
+    name: "Nested Category Drill-down",
+    desc: "Asks a nested category tree one level at a time — Type of Wire → Subcategory → Colour → Size.",
+    icon: "⌸",
+    category: "select",
+    configSchema: [
+      { key: "tree", label: "Nested tree", type: "dataSource", appliesToDataSource: "optionTrees", blankLabel: "Match the item name" },
+      { key: "matchItem", label: "Match the tree from the item name", type: "toggle", default: true },
+      { key: "whenUnmatched", label: "When no tree matches", type: "select", options: ["skip", "ask"], default: "skip" },
+    ],
+    order: 5,
+    status: "Active",
+  },
+  {
     type: "location_tree",
     name: "Storage Location",
     desc: "Drill down a Warehouse → Floor → Rack tree to a storage location.",
     icon: "▧",
     category: "select",
     configSchema: [{ key: "dataSource", label: "Location source", type: "dataSource", default: "locations", appliesToDataSource: "locations" }],
-    order: 5,
+    order: 6,
     status: "Active",
   },
   {
@@ -83,7 +97,7 @@ const stepLibrary = [
       { key: "numberMin", label: "Minimum", type: "number", default: 1 },
       { key: "numberMax", label: "Maximum (0 = no limit)", type: "number", default: 0 },
     ],
-    order: 6,
+    order: 7,
     status: "Active",
   },
   {
@@ -93,7 +107,7 @@ const stepLibrary = [
     icon: "⚖",
     category: "select",
     configSchema: [{ key: "dataSource", label: "Unit source", type: "dataSource", default: "units", appliesToDataSource: "units" }],
-    order: 7,
+    order: 8,
     status: "Active",
   },
   {
@@ -103,7 +117,7 @@ const stepLibrary = [
     icon: "✎",
     category: "custom",
     configSchema: [{ key: "placeholder", label: "Placeholder / hint", type: "text", default: "" }],
-    order: 8,
+    order: 9,
     status: "Active",
   },
   {
@@ -116,7 +130,7 @@ const stepLibrary = [
       { key: "numberMin", label: "Minimum", type: "number", default: 0 },
       { key: "numberMax", label: "Maximum (0 = no limit)", type: "number", default: 0 },
     ],
-    order: 9,
+    order: 10,
     status: "Active",
   },
   {
@@ -129,7 +143,7 @@ const stepLibrary = [
       { key: "approvalMode", label: "Approval mode", type: "select", options: ["single", "multi"], default: "single" },
       { key: "approverRole", label: "Approver role", type: "select", default: "Admin", appliesToDataSource: "roles" },
     ],
-    order: 10,
+    order: 11,
     status: "Active",
   },
   {
@@ -139,7 +153,7 @@ const stepLibrary = [
     icon: "☑",
     category: "control",
     configSchema: [],
-    order: 11,
+    order: 12,
     status: "Active",
   },
 ];

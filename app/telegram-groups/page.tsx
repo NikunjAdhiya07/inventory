@@ -24,10 +24,15 @@ import {
 } from "@/components/dc-ui";
 
 type BotHealth = "healthy" | "unhealthy" | "unknown";
-// What the bot does here. One bot token can only have one webhook, so both flows
-// arrive at the same endpoint and this is what tells them apart:
+// What a plain typed message means here. One bot token can only have one
+// webhook, so both flows arrive at the same endpoint and this is what tells them
+// apart:
 //   entry   — the inventory-capture workflow (the original behaviour)
 //   request — search → submit → manager Accept issues stock and closes
+//
+// Material issue/return is not listed because it is not a mode: `/issue` works
+// in EVERY approved group regardless of this setting, so one group can run the
+// entry workflow and the handover lifecycle together.
 type GroupMode = "entry" | "request";
 type Group = {
   id: string;
@@ -94,11 +99,32 @@ function statusChip(active: boolean): CSSProperties {
   };
 }
 
-// Which of the two flows this group runs. Colour-coded rather than plain text
-// because getting it wrong is consequential in one direction: a group set to
-// entries treats every message as the start of an inventory entry.
+// Which of the two flows a plain message here belongs to. Colour-coded rather
+// than plain text because getting it wrong is consequential in one direction: a
+// group set to entries treats every message as the start of an inventory entry.
+const MODE_META: Record<GroupMode, { label: string; border: string; bg: string; fg: string; hint: string }> = {
+  entry: {
+    label: "📥 Entries",
+    border: "#d8d2f0",
+    bg: "#f2effc",
+    fg: "#6d5bd0",
+    hint: "Switch to capturing inventory entries in this group",
+  },
+  request: {
+    label: "🛒 Requests",
+    border: "#cdd9f7",
+    bg: "#eef3fe",
+    fg: "#1560f0",
+    hint: "Switch to searching stock and raising requests in this group",
+  },
+};
+
+function nextMode(mode: GroupMode): GroupMode {
+  return mode === "request" ? "entry" : "request";
+}
+
 function modeChip(mode: GroupMode): CSSProperties {
-  const request = mode === "request";
+  const m = MODE_META[mode] ?? MODE_META.entry;
   return {
     display: "inline-flex",
     alignItems: "center",
@@ -107,9 +133,9 @@ function modeChip(mode: GroupMode): CSSProperties {
     borderRadius: 20,
     fontSize: 12,
     fontWeight: 600,
-    border: `1px solid ${request ? "#cdd9f7" : "#d8d2f0"}`,
-    background: request ? "#eef3fe" : "#f2effc",
-    color: request ? "#1560f0" : "#6d5bd0",
+    border: `1px solid ${m.border}`,
+    background: m.bg,
+    color: m.fg,
   };
 }
 
@@ -266,11 +292,11 @@ export default function TelegramGroupsPage() {
     await api.patch(`/api/telegram-groups/${g.id}`, { manualInactive: next }).catch(() => load());
   }
 
-  // Switch a group between the two flows. Deliberately a per-group setting
-  // rather than a second bot: the same token serves both, so what a chat is for
-  // has to be an admin's decision recorded here.
+  // Cycle a group through the flows. Deliberately a per-group setting rather
+  // than one bot per flow: the same token serves all of them, so what a chat is
+  // for has to be an admin's decision recorded here.
   async function toggleMode(g: Group) {
-    const next: GroupMode = g.mode === "request" ? "entry" : "request";
+    const next = nextMode(g.mode);
     setGroups((prev) => prev.map((x) => (x.id === g.id ? { ...x, mode: next } : x)));
     await api.patch(`/api/telegram-groups/${g.id}`, { mode: next }).catch(() => load());
   }
@@ -379,18 +405,23 @@ export default function TelegramGroupsPage() {
                     </td>
                     <td style={{ ...tdStyle(), color: "#4a5878", fontFamily: "var(--font-mono)" }}>{g.chatId}</td>
                     <td style={tdStyle()}>
-                      <span style={modeChip(g.mode)}>{g.mode === "request" ? "🛒 Requests" : "📥 Entries"}</span>
+                      <span style={modeChip(g.mode)}>{(MODE_META[g.mode] ?? MODE_META.entry).label}</span>
+                      {/* Not a mode — an overlay that works in every approved
+                          group. Shown here anyway because "where can I run
+                          /issue" is the first thing an admin asks. */}
+                      <span
+                        style={{ ...modeChip("entry"), border: "1px dashed #ffddb8", background: "#fff6ea", color: "#b06a00", marginLeft: 6 }}
+                        title="Material issue/return (/issue) works in every approved group, whichever flow is selected"
+                      >
+                        + 📤 /issue
+                      </span>
                       <div style={{ marginTop: 5 }}>
                         <button
                           onClick={() => toggleMode(g)}
                           style={{ border: "none", background: "none", padding: 0, fontSize: 11, fontWeight: 600, color: "#8a97b0", cursor: "pointer", textDecoration: "underline" }}
-                          title={
-                            g.mode === "request"
-                              ? "Switch to capturing inventory entries in this group"
-                              : "Switch to searching stock and raising requests in this group"
-                          }
+                          title={MODE_META[nextMode(g.mode)].hint}
                         >
-                          {g.mode === "request" ? "Use for entries" : "Use for requests"}
+                          {`Use for ${MODE_META[nextMode(g.mode)].label.replace(/^\S+\s/, "").toLowerCase()}`}
                         </button>
                       </div>
                     </td>
