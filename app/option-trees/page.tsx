@@ -54,6 +54,13 @@ type OptionNode = {
 
 const EMPTY_LEVEL: Level = { label: "", input: "nodes", options: [], allowOther: false, placeholder: "", min: 0, max: 0 };
 
+// While the editor is open a fixed list is held as the raw text the user typed,
+// not as the parsed array. Parsing on every keystroke swallows the comma that
+// starts the next choice, so the field can only ever hold one.
+type EditorLevel = Level & { optionsText: string };
+
+const toEditorLevel = (l: Level): EditorLevel => ({ ...l, optionsText: l.options.join(", ") });
+
 const INPUT_LABELS: Record<LevelInput, string> = {
   nodes: "Options from this tree",
   list: "Fixed list",
@@ -478,11 +485,13 @@ function TreeEditor({
   const [name, setName] = useState(tree?.name ?? "");
   const [desc, setDesc] = useState(tree?.desc ?? "");
   const [matches, setMatches] = useState((tree?.matches ?? []).join(", "));
-  const [levels, setLevels] = useState<Level[]>(tree?.levels?.length ? tree.levels : [{ ...EMPTY_LEVEL, label: "" }]);
+  const [levels, setLevels] = useState<EditorLevel[]>(
+    tree?.levels?.length ? tree.levels.map(toEditorLevel) : [toEditorLevel(EMPTY_LEVEL)],
+  );
   const [error, setError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
 
-  function setLevel(i: number, patch: Partial<Level>) {
+  function setLevel(i: number, patch: Partial<EditorLevel>) {
     setLevels((prev) => prev.map((l, idx) => (idx === i ? { ...l, ...patch } : l)));
   }
   function move(i: number, delta: number) {
@@ -500,7 +509,9 @@ function TreeEditor({
       setError("A tree needs a name.");
       return;
     }
-    const cleaned = levels.filter((l) => l.label.trim());
+    const cleaned = levels
+      .filter((l) => l.label.trim())
+      .map(({ optionsText, ...l }) => ({ ...l, options: optionsText.split(",").map((o) => o.trim()).filter(Boolean) }));
     if (!cleaned.length) {
       setError("Add at least one level — a tree with no levels asks nothing.");
       return;
@@ -589,8 +600,8 @@ function TreeEditor({
               <div>
                 <label style={labelStyle}>Choices (comma separated)</label>
                 <input
-                  value={l.options.join(", ")}
-                  onChange={(e) => setLevel(i, { options: e.target.value.split(",").map((o) => o.trim()).filter(Boolean) })}
+                  value={l.optionsText}
+                  onChange={(e) => setLevel(i, { optionsText: e.target.value })}
                   placeholder="Red, Black, Blue, Green, Yellow"
                   style={inputStyle}
                 />
@@ -630,7 +641,7 @@ function TreeEditor({
           </div>
         ))}
         <button
-          onClick={() => setLevels((prev) => [...prev, { ...EMPTY_LEVEL }])}
+          onClick={() => setLevels((prev) => [...prev, toEditorLevel(EMPTY_LEVEL)])}
           style={{ ...secondaryBtnStyle, borderColor: "#cfe0ff", color: "#1560f0", alignSelf: "flex-start" }}
         >
           ＋ Add level
