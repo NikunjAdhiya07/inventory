@@ -17,15 +17,24 @@ import { type ProductAttribute } from "./products";
 //
 // Receipts come from the inventory-entry bot (a completed entry adds stock at
 // the location it was logged against). Issues come from the request bot (an
-// Inventory Manager accepting a request takes the items out). Both write through
-// `recordMovement`.
+// Inventory Manager accepting a request takes the items out). Manually captured
+// movements — purchases, returns, damage, transfers — come from Stock Movements
+// in the console (`lib/movements.ts`). All of them write through
+// `recordMovement`, so there is one ledger and one balance calculation.
 
+// WHY the stock moved: the `code` of a row in `movementTypes`, which is master
+// data an admin can extend (see lib/movements.ts). It is a string rather than a
+// union on purpose — a new movement type must not need a deploy. The codes
+// below are the ones the software itself writes and are seeded as system types,
+// so history can name them like any other.
 export type MovementReason =
   | "receipt" // an inventory entry was completed in the entry group
   | "issue" // an Inventory Manager accepted a request and handed items over
   | "return" // an accepted request was cancelled and the items went back
   | "purchase-receipt" // a purchased item was received into stock
-  | "adjustment"; // a manual correction from the console
+  | "transfer" // the same goods moved from one box/shelf/rack to another
+  | "adjustment" // a count correction from the storage map
+  | (string & {}); // any configured movement type code
 
 export type StockMovement = {
   // Deterministic id for this movement. Two attempts to record the same physical
@@ -42,9 +51,24 @@ export type StockMovement = {
   qty: number;
   unit: string;
   reason: MovementReason;
-  refType: "inventoryEntry" | "request";
+  // The type's name as it read when the movement was recorded. Display resolves
+  // the live type first, so a rename renames everywhere; this is what keeps a
+  // row readable after its type is deleted.
+  movementName?: string;
+  // An adjustment or a transfer has no ticket behind it — it is somebody at the
+  // console saying what is physically on the shelf, or carrying it to another
+  // one — so each names itself as its own source rather than borrowing a ref
+  // type that implies a ticket exists.
+  refType: "inventoryEntry" | "request" | "adjustment" | "transfer" | "movement";
   refId: string; // the ticket number that caused it
   requestId?: string;
+  // The other end of a transfer, snapshotted onto both legs so one row of
+  // history reads "out of A → into B" without having to find its partner.
+  counterpartLocationPath?: string;
+  // Captured with the movement when its type asks for them: why it happened and
+  // which document proves it.
+  remarks?: string;
+  reference?: string;
   by: string;
   createdAt: string;
 };
@@ -285,6 +309,70 @@ export async function searchStock(db: Db, query: string, limit = 40): Promise<St
   }
 
   // Best SEO / name match first, then most stock on hand.
+  scored.sort((a, b) => b.score - a.score || b.hit.total - a.hit.total || a.hit.name.localeCompare(b.hit.name));
+  return scored.slice(0, limit).map((s) => s.hit);
+}
+
+// Item lookup for recording a movement, with the same shape as a stock search
+// but WITHOUT the "must already have stock" rule.
+//
+// The two searches answer different questions. Issuing against a request can
+// only offer what is on a shelf, so `searchStock` hides the rest. Recording a
+// movement often starts from nothing on the shelf — opening stock, a first
+// purchase, a customer return of something never carried — so an item with no
+// balance anywhere still has to be findable, shown honestly as zero.
+export async function lookupProducts(db: Db, query: string, limit = 25): Promise<StockHit[]> {
+  const [products, all, byId, aliasMap] = await Promise.all([
+    activeProducts(db),
+    balances(db),
+    locationsByIdForPaths(db),
+    aliasesByProductId(db),
+  ]);
+
+  const linesByProduct = new Map<string, Balance[]>();
+  for (const b of all.values()) {
+    const list = linesByProduct.get(b.productId);
+    if (list) list.push(b);
+    else linesByProduct.set(b.productId, [b]);
+  }
+
+  const q = query.trim();
+  const scored: { hit: StockHit; score: number }[] = [];
+  for (const p of products) {
+    const productId = p._id.toString();
+    // An empty box lists the catalogue rather than nothing: the user is picking
+    // an item, and a blank result reads as "there are no items".
+    const score = q ? scoreProductQuery(p, q, aliasMap.get(productId) || []) : 100;
+    // Lower bar than stock search — the user is choosing from a short list they
+    // can see, not being sent to a shelf.
+    if (q && score < 40) continue;
+
+    const lines: StockLine[] = (linesByProduct.get(productId) ?? [])
+      .map((b) => ({
+        productId,
+        locationId: b.locationId,
+        locationPath: locationPathFrom(byId, b.locationId) || b.locationPath || "(unknown location)",
+        qty: b.qty,
+        unit: b.unit || String(p.unit ?? ""),
+      }))
+      .sort((a, b) => b.qty - a.qty || a.locationPath.localeCompare(b.locationPath));
+
+    scored.push({
+      score,
+      hit: {
+        productId,
+        name: String(p.name ?? ""),
+        productNumber: String(p.productNumber ?? ""),
+        category: String(p.category ?? ""),
+        subcategory: String(p.subcategory ?? ""),
+        unit: String(p.unit ?? ""),
+        attributes: productAttributes(p),
+        lines,
+        total: lines.reduce((sum, l) => sum + l.qty, 0),
+      },
+    });
+  }
+
   scored.sort((a, b) => b.score - a.score || b.hit.total - a.hit.total || a.hit.name.localeCompare(b.hit.name));
   return scored.slice(0, limit).map((s) => s.hit);
 }

@@ -24,7 +24,7 @@ import {
   toggleKnobStyle,
 } from "@/components/dc-ui";
 
-type ConfigField = { key: string; label: string; type: "text" | "toggle" | "select" | "number" | "dataSource"; default?: unknown; options?: string[]; appliesToDataSource?: string };
+type ConfigField = { key: string; label: string; type: "text" | "toggle" | "select" | "number" | "dataSource"; default?: unknown; options?: string[]; appliesToDataSource?: string; blankLabel?: string };
 type StepLibEntry = { id: string; type: string; name: string; desc: string; icon: string; category: string; configSchema: ConfigField[] };
 type StepInstance = { instanceId: string; type: string; label: string; required: boolean; order: number; config: Record<string, unknown> };
 type Workflow = { id: string; name: string; desc: string; status: "Draft" | "Active"; version: number; isDefault: boolean; steps: StepInstance[] };
@@ -44,6 +44,7 @@ export default function WorkflowsPage() {
   const [locations, setLocations] = useState<Named[]>([]);
   const [roles, setRoles] = useState<Named[]>([]);
   const [products, setProducts] = useState<Named[]>([]);
+  const [trees, setTrees] = useState<Named[]>([]);
   const [groups, setGroups] = useState<Group[]>([]);
 
   const [createOpen, setCreateOpen] = useState(false);
@@ -84,6 +85,7 @@ export default function WorkflowsPage() {
     api.get<Named[]>("/api/locations").then((d) => !cancelled && setLocations(d), onError);
     api.get<Named[]>("/api/roles").then((d) => !cancelled && setRoles(d), onError);
     api.get<Named[]>("/api/products").then((d) => !cancelled && setProducts(d), onError);
+    api.get<Named[]>("/api/option-trees").then((d) => !cancelled && setTrees(d), onError);
     api.get<Group[]>("/api/telegram-groups").then((d) => !cancelled && setGroups(d), onError);
     return () => {
       cancelled = true;
@@ -96,6 +98,7 @@ export default function WorkflowsPage() {
     if (source === "locations") return locations;
     if (source === "roles") return roles;
     if (source === "products") return products;
+    if (source === "optionTrees") return trees;
     return [];
   }
 
@@ -561,6 +564,7 @@ function defaultLabel(entry: StepLibEntry): string {
     product_select: "Select the product:",
     category_select: "Select a category:",
     subcategory_select: "Select a subcategory:",
+    nested_select: "Tell me more about this item:",
     location_tree: "Choose the storage location:",
     quantity: "Enter the quantity:",
     unit_select: "Select a unit:",
@@ -610,6 +614,13 @@ function StepConfigModal({
           <label style={labelStyle}>Prompt / label</label>
           <input value={label} onChange={(e) => setLabel(e.target.value)} style={inputStyle} />
         </div>
+        {step.type === "nested_select" ? (
+          <div style={{ padding: "11px 13px", borderRadius: 9, background: "#eef3fe", border: "1px solid #cdd9f7", fontSize: 11.5, color: "#3a4a68", lineHeight: 1.5 }}>
+            This step asks one question per level of a tree from <b>Nested Categories</b>. Leave the tree blank and it picks the
+            tree the item name matches — so <b>Wire</b> gets the wire questions and everything else walks straight past. The
+            prompt above is only shown when the bot has to ask <i>which</i> tree applies.
+          </div>
+        ) : null}
         {schema.map((f) => {
           const val = config[f.key];
           if (f.type === "toggle") {
@@ -637,7 +648,13 @@ function StepConfigModal({
               <div key={f.key}>
                 <label style={labelStyle}>{f.label}</label>
                 <select value={val === undefined ? "" : String(val)} onChange={(e) => setC(f.key, e.target.value)} style={{ ...inputStyle, background: "#fff" }}>
-                  {f.type === "dataSource" && f.default ? <option value={String(f.default)}>{String(f.default)}</option> : <option value="">Select…</option>}
+                  {f.type === "dataSource" && f.default ? (
+                    <option value={String(f.default)}>{String(f.default)}</option>
+                  ) : (
+                    // A field that means something specific when left blank says
+                    // so — "Match the item name" is a choice, not a missing one.
+                    <option value="">{f.blankLabel ?? "Select…"}</option>
+                  )}
                   {options.map((o) => (
                     <option key={o} value={o}>
                       {o}

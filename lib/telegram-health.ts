@@ -11,10 +11,16 @@ export type BotHealth = "healthy" | "unhealthy" | "unknown";
 export type LogType = "health" | "command" | "update" | "error";
 export type LogLevel = "info" | "error";
 
-// What the bot does in a given group. One bot token can only ever have one
+// What a group's TYPED MESSAGES mean. One bot token can only ever have one
 // webhook, so both flows arrive at the same endpoint and the group decides which
-// one it is: `entry` runs the inventory-capture workflow, `request` runs the
-// search-and-request flow.
+// one owns a plain message: `entry` starts the inventory-capture workflow,
+// `request` runs the search-and-request flow.
+//
+// Material issue/return is deliberately NOT a mode. It is an overlay that works
+// in every approved group, entered by `/issue` and driven by its own `is:`
+// buttons — so one group can run the original entry workflow and the handover
+// lifecycle side by side without either taking the group over. See
+// `lib/issue-webhook.ts`.
 //
 // Defaulting to `entry` is what keeps every group that existed before this
 // field behaving exactly as it did.

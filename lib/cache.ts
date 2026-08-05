@@ -57,6 +57,13 @@ export function invalidate(prefix: string) {
 const CACHED_COLLECTIONS = new Set([
   "categories",
   "subcategories",
+  // The nested-category master: a tree's levels and the options under them are
+  // both read on every tap of a nested step.
+  "optionTrees",
+  "optionNodes",
+  // The stock movement vocabulary: read on every movement recorded and on every
+  // history page, changed only when an admin edits the master.
+  "movementTypes",
   "units",
   "locations",
   "products",
