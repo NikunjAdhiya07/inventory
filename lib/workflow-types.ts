@@ -93,8 +93,16 @@ export type Answer = {
   // The whole point of the step is the breakdown, so it is kept level by level
   // rather than only as the joined display — the ticket lists "Colour: Red" as
   // its own field, exactly as if the workflow had asked for it directly.
+  //
+  // `identity` marks the levels that say WHICH item this is rather than
+  // something about this entry. Carried on the answer so that `finalize` can
+  // compose the variant key without re-reading the tree — which may have been
+  // edited since the walk, and the entry has to mean what it meant when it was
+  // answered. `treeId` is here for the same reason: `tree` is the display name,
+  // and a rename must not repoint an entry at a different item.
   tree?: string;
-  path?: { label: string; value: string }[];
+  treeId?: string;
+  path?: { label: string; value: string; identity?: boolean }[];
 };
 
 export type LocationCursor = {
@@ -115,7 +123,7 @@ export type NestedCursor = {
   // level offers. List/text/number levels leave it alone, so a Size level under
   // a fixed-list Colour level still finds its options under the subcategory.
   parentNodeId: string | null;
-  path: { level: number; label: string; value: string; nodeId?: string }[];
+  path: { level: number; label: string; value: string; nodeId?: string; identity?: boolean }[];
 };
 
 export type BotSession = {

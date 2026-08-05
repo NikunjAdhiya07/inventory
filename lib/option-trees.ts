@@ -22,6 +22,24 @@ import { cached } from "./cache";
 // down the forest, which is why the Size level below a `list` Colour level
 // still finds its options under the subcategory the user picked.
 //
+// Levels are also split by what their answer MEANS, which is what lets the two
+// bots share one definition (see `lib/variants.ts`):
+//
+//   • IDENTITY levels say WHICH THING this is. Type of Wire, Subcategory,
+//     Colour and Size together name one real item on one real shelf, so their
+//     answers compose the variant key that stock is counted against.
+//   • CAPTURE levels say something ABOUT this particular entry — how many
+//     metres were wanted, a remark, a batch number. They are asked and recorded
+//     on the ticket, but they must NOT enter the key: "100 m of red 2.5 sq mm"
+//     and "50 m of red 2.5 sq mm" are two entries of ONE item, and folding the
+//     quantity into identity would mint a new item per amount.
+//
+// A level authored before the flag existed has none, so it falls back to what
+// its input can mean: a `nodes` or `list` level is a kind of thing (identity), a
+// free `text` or `number` level is a measurement (capture). That keeps the trees
+// seeded so far — every level of Wire and Pipe is a `nodes` level — identifying
+// exactly as they read.
+//
 // Reads are cached whole and sliced in memory, like locations: the bot renders
 // a level on every tap and the trees change on admin action.
 
@@ -40,7 +58,25 @@ export type OptionLevel = {
   // input: "number" — keypad bounds; 0 means "no limit", as elsewhere.
   min?: number;
   max?: number;
+  // Whether this level's answer names WHICH item this is (identity) rather than
+  // something about this entry (capture). Absent on a tree authored before the
+  // flag existed — read it through `levelIsIdentity`, never directly.
+  identity?: boolean;
 };
+
+// What a level means when its author never said. See the header: a level that
+// offers a set of things names a thing; one that takes a typed value or a number
+// measures it.
+export function defaultIdentity(input: OptionLevelInput): boolean {
+  return input === "nodes" || input === "list";
+}
+
+// The one place that decides whether a level composes the variant key. Every
+// reader goes through it so an unflagged tree and a flagged one are judged by
+// the same rule.
+export function levelIsIdentity(level: { input: OptionLevelInput; identity?: boolean }): boolean {
+  return level.identity ?? defaultIdentity(level.input);
+}
 
 export type OptionTreeDoc = Document & {
   name: string;
@@ -109,15 +145,19 @@ export function treeLevels(tree: Document | null | undefined): OptionLevel[] {
   return tree.levels
     .filter((l): l is Record<string, unknown> => Boolean(l) && typeof l === "object")
     .map((l, i) => {
-      const input = String(l.input ?? "nodes");
+      const raw = String(l.input ?? "nodes");
+      const input = (["nodes", "list", "text", "number"].includes(raw) ? raw : "nodes") as OptionLevelInput;
       return {
         label: String(l.label ?? `Level ${i + 1}`),
-        input: (["nodes", "list", "text", "number"].includes(input) ? input : "nodes") as OptionLevelInput,
+        input,
         options: Array.isArray(l.options) ? l.options.map(String).filter(Boolean) : [],
         allowOther: Boolean(l.allowOther),
         placeholder: String(l.placeholder ?? ""),
         min: Number(l.min) || 0,
         max: Number(l.max) || 0,
+        // Resolved to a definite answer here, like `input` above: the engine
+        // walks these and must never have to re-apply the fallback itself.
+        identity: levelIsIdentity({ input, identity: l.identity as boolean | undefined }),
       };
     })
     .filter((l) => l.label);
@@ -156,6 +196,11 @@ export function normalizeLevels(input: unknown): OptionLevel[] {
         placeholder: String(l.placeholder ?? ""),
         min: Number(l.min) || 0,
         max: Number(l.max) || 0,
+        // Stored only when the author actually said. Leaving it absent is what
+        // keeps a tree written before the console had the toggle reading as
+        // whatever its inputs imply, rather than being frozen to today's
+        // default the first time somebody renames one of its levels.
+        ...(l.identity === undefined ? {} : { identity: Boolean(l.identity) }),
       };
     })
     .filter((l) => l.label);

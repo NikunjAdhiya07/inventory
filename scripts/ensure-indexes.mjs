@@ -28,6 +28,14 @@ const INDEX_SPECS = {
     { key: { productNumberKey: 1 }, unique: true },
     { key: { status: 1, name: 1 } },
     { key: { category: 1 } },
+    // One drill-down path resolves to exactly one product. Partial, because only
+    // a product a nested tree resolved to carries a pathKey at all — without the
+    // filter every hand-typed product would collide on a missing field.
+    {
+      key: { treeId: 1, pathKey: 1 },
+      unique: true,
+      partialFilterExpression: { pathKey: { $type: "string" } },
+    },
   ],
   productAttributes: [{ key: { order: 1 } }],
   productAliases: [

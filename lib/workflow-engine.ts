@@ -13,6 +13,7 @@ import { isDuplicateKeyError } from "./mongodb";
 import {
   activeOptionTrees,
   findTreeByName,
+  levelIsIdentity,
   matchOptionTree,
   optionNodeChildren,
   treeLevels,
@@ -25,6 +26,7 @@ import { attributeValues, productLabel, type ProductAttribute } from "./products
 import { receiptKey, recordMovement } from "./stock";
 import { buttonRows, downloadFileBytes, type InlineKeyboard } from "./telegram";
 import { nextTicketNumber } from "./ticket";
+import { resolveVariant } from "./variants";
 import type { Answer, BotSession, NestedCursor, ProductSnapshot, StepInstance } from "./workflow-types";
 
 export type RenderResult = { text: string; keyboard: InlineKeyboard };
@@ -262,7 +264,17 @@ function nestedTrail(cursor: NestedCursor): string {
 // Record one level's answer and move the cursor on. A node answer is the only
 // kind that moves the position in the forest.
 function pushNestedValue(cursor: NestedCursor, level: OptionLevel, value: string, nodeId?: string) {
-  cursor.path.push({ level: cursor.level, label: level.label, value, ...(nodeId ? { nodeId } : {}) });
+  cursor.path.push({
+    level: cursor.level,
+    label: level.label,
+    value,
+    ...(nodeId ? { nodeId } : {}),
+    // Recorded per answer rather than looked up later: the tree can be edited
+    // between this tap and the entry finishing, and what the user was asked is
+    // what the entry has to mean. `treeLevels` has already resolved the fallback
+    // for a level whose author never set the flag.
+    identity: levelIsIdentity(level),
+  });
   if (nodeId) cursor.parentNodeId = nodeId;
   cursor.level += 1;
 }
@@ -317,7 +329,8 @@ async function commitNested(db: Db, session: BotSession, step: StepInstance): Pr
     value: last.nodeId ?? nestedTrail(cursor),
     display: nestedTrail(cursor),
     tree: cursor.treeName,
-    path: cursor.path.map((p) => ({ label: p.label, value: p.value })),
+    treeId: cursor.treeId,
+    path: cursor.path.map((p) => ({ label: p.label, value: p.value, identity: p.identity })),
   };
   return advance(db, session);
 }
@@ -1469,6 +1482,45 @@ function uniqueKey(existing: Record<string, string>, label: string): string {
   }
 }
 
+// The variant a completed nested walk names, or undefined when it names none.
+//
+// Only levels explicitly flagged `identity` compose the key. A path answered by
+// an older build carries no flag at all, and those resolve nothing rather than
+// guessing: a session already in flight across a deploy finishes exactly as it
+// would have before, which is safer than inventing an item from levels nobody
+// classified.
+//
+// A failure is swallowed to undefined on purpose. The user has filled in a whole
+// entry by this point, and losing it to a catalogue write is a far worse outcome
+// than recording it against the less specific product the entry already had —
+// which is precisely the pre-variant behaviour.
+async function resolveVariantFor(
+  db: Db,
+  session: BotSession,
+  seeds: { category: string; subcategory: string; unit: string }
+): Promise<ProductSnapshot | undefined> {
+  const nested = answerFor(session, "nested_select");
+  if (!nested?.treeId || !nested.path?.length) return undefined;
+
+  const path = nested.path.filter((p) => p.identity === true).map((p) => ({ label: p.label, value: p.value }));
+  if (!path.length) return undefined;
+
+  try {
+    const variant = await resolveVariant(db, {
+      treeId: nested.treeId,
+      treeName: nested.tree ?? "",
+      path,
+      category: seeds.category,
+      subcategory: seeds.subcategory,
+      unit: seeds.unit,
+    });
+    return variant ?? undefined;
+  } catch (err) {
+    console.error("[engine] variant resolution failed:", err);
+    return undefined;
+  }
+}
+
 async function finalize(db: Db, session: BotSession): Promise<EngineResult> {
   // Cheap in-memory guard for a re-entry inside one invocation; the claim below
   // is what covers separate requests and separate instances.
@@ -1491,15 +1543,25 @@ async function finalize(db: Db, session: BotSession): Promise<EngineResult> {
   }
 
   const itemAnswer = answerFor(session, "item_capture");
-  const product = answerFor(session, "product_select")?.product;
+  const picked = answerFor(session, "product_select")?.product;
 
   // A product step supplies facts the entry would otherwise have to ask for
   // twice. An explicit answer always wins; the product only fills what the
   // workflow never asked, so a captured entry is complete either way.
-  const itemName = String(itemAnswer?.value || product?.name || "");
-  const category = String(answerValue(session, "category_select") ?? product?.category ?? "");
-  const subcategory = String(answerValue(session, "subcategory_select") ?? product?.subcategory ?? "");
-  const unit = String(answerValue(session, "unit_select") ?? product?.unit ?? "");
+  const itemName = String(itemAnswer?.value || picked?.name || "");
+  const category = String(answerValue(session, "category_select") ?? picked?.category ?? "");
+  const subcategory = String(answerValue(session, "subcategory_select") ?? picked?.subcategory ?? "");
+  const unit = String(answerValue(session, "unit_select") ?? picked?.unit ?? "");
+
+  // A completed drill-down names a more specific thing than the product step
+  // could: "Wire" is what the catalogue offered, "Wire — Copper · Flexible (FR)
+  // · 2.5 sq mm" is what is actually on the shelf. When both ran, the variant is
+  // therefore what stock counts against, and the picked product seeds the fields
+  // the tree does not carry. When neither the tree nor its identity levels
+  // resolve anything, `product` stays exactly what it was before variants
+  // existed and the entry behaves unchanged.
+  const variant = await resolveVariantFor(db, session, { category, subcategory, unit });
+  const product = variant ?? picked;
   // One shape for a quantity: a number, or null when the workflow never asked.
   // It used to land as "" on a workflow without a quantity step and as a number
   // otherwise, so anything reading entries had to handle both.

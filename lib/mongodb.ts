@@ -60,6 +60,16 @@ const INDEX_SPECS: Record<string, { key: Document; unique?: boolean; partialFilt
     { key: { productNumberKey: 1 }, unique: true },
     { key: { status: 1, name: 1 } },
     { key: { category: 1 } },
+    // One drill-down path resolves to exactly one product. This index is not an
+    // optimisation — `resolveVariant` relies on it to turn two entries racing
+    // the same new path into one row plus one re-read. Partial, because only a
+    // product a tree resolved to carries a pathKey, and without the filter every
+    // hand-typed product would collide on the missing field.
+    {
+      key: { treeId: 1, pathKey: 1 },
+      unique: true,
+      partialFilterExpression: { pathKey: { $type: "string" } },
+    },
   ],
   productAttributes: [{ key: { order: 1 } }],
   // Alternate spellings / AI labels for autocorrect on the entry bot.
