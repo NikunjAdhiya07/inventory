@@ -6,7 +6,7 @@ import { api } from "@/lib/api-client";
 import { PageIntro, tdStyle, labelStyle, inputStyle, secondaryBtnStyle, EmptyState, SortTh } from "@/components/dc-ui";
 import { useSort } from "@/lib/use-sort";
 
-const MASTERS = ["Categories", "Subcategories", "Storage Locations", "Units", "Roles"];
+const MASTERS = ["Categories", "Storage Locations", "Units", "Roles"];
 const FORMATS = ["CSV", "Excel", "PDF"];
 
 type Job = { id: string; type: string; master: string; by: string; rows: number; when: string; result: string };
@@ -30,7 +30,7 @@ export default function ImportExportPage() {
   const [importTarget, setImportTarget] = useState("Categories");
   const [hasFile, setHasFile] = useState(false);
   const [committed, setCommitted] = useState(false);
-  const [exportSel, setExportSel] = useState(["Categories", "Subcategories", "Units"]);
+  const [exportSel, setExportSel] = useState(["Categories", "Units"]);
   const [format, setFormat] = useState("Excel");
   const [exported, setExported] = useState(false);
 

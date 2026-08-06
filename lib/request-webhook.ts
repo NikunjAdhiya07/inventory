@@ -37,6 +37,14 @@ import {
   type ItemRequest,
 } from "./request-types";
 import { answerCallbackQuery, editMessageText, sendMessage, type InlineKeyboard } from "./telegram";
+import { isMoveCallback } from "./move-engine";
+
+// Recording a ledger movement from the search group: Inventory Managers (Issue)
+// and anyone who can Add Inventory. Request-only roles stay on the request path.
+const PERM_ADD = "Add Inventory";
+function canRecordMovement(perms: string[]): boolean {
+  return perms.includes(PERM_ISSUE) || perms.includes(PERM_ADD);
+}
 
 // Everything the bot does in a `request`-mode group.
 //
@@ -62,7 +70,18 @@ export type RequestContext = {
 
 // Draft-stage callbacks, which only the requester may drive. Everything else is
 // a status transition and carries its own permission check.
-const DRAFT_PREFIXES = ["rq:cart", "rq:back", "rq:new", "rq:pf:", "rq:pg:", "rq:s:", "rq:l:", "rq:q:", "rq:rm:"];
+const DRAFT_PREFIXES = [
+  "rq:cart",
+  "rq:back",
+  "rq:new",
+  "rq:pf:",
+  "rq:pg:",
+  "rq:s:",
+  "rq:l:",
+  "rq:q:",
+  "rq:rm:",
+  "rq:mv:",
+];
 
 function isDraftCallback(data: string): boolean {
   return DRAFT_PREFIXES.some((p) => data.startsWith(p));
@@ -222,11 +241,22 @@ async function routeCallback(
     return { notice: "This request is already closed." };
   }
 
-  // ---- draft stage: the requester's cart ----
+  // ---- draft stage: the requester's cart / stock-movement sub-flow ----
   if (isDraftCallback(data)) {
     if (!isRequester) return { notice: "Only the person who opened this request can change it." };
     if (request.status !== "draft") return { notice: "This request has already been submitted." };
-    const res = await applyDraftCallback(db, request, data);
+
+    // Record movement needs Issue Inventory or Add Inventory; Request item stays
+    // on the existing Request Items permission (checked when submitting).
+    if (isMoveCallback(data) && (data === "rq:mv:rec" || data === "rq:mv:ok")) {
+      if (!canRecordMovement(ctx.perms)) {
+        return {
+          notice: `Your role can't record stock movements. Ask an admin to grant "${PERM_ISSUE}" or "${PERM_ADD}".`,
+        };
+      }
+    }
+
+    const res = await applyDraftCallback(db, request, data, ctx.name);
     return { render: res.render, notice: res.notice };
   }
 

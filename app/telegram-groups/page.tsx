@@ -28,7 +28,7 @@ type BotHealth = "healthy" | "unhealthy" | "unknown";
 // webhook, so both flows arrive at the same endpoint and this is what tells them
 // apart:
 //   entry   — the inventory-capture workflow (the original behaviour)
-//   request — search → submit → manager Accept issues stock and closes
+//   request — search → Record movement (ledger) or Request item (cart → Accept)
 //
 // Material issue/return is not listed because it is not a mode: `/issue` works
 // in EVERY approved group regardless of this setting, so one group can run the
@@ -111,11 +111,11 @@ const MODE_META: Record<GroupMode, { label: string; border: string; bg: string; 
     hint: "Switch to capturing inventory entries in this group",
   },
   request: {
-    label: "🛒 Requests",
+    label: "🛒 Search",
     border: "#cdd9f7",
     bg: "#eef3fe",
     fg: "#1560f0",
-    hint: "Switch to searching stock and raising requests in this group",
+    hint: "Switch to search: record stock movements or raise item requests",
   },
 };
 
@@ -321,13 +321,13 @@ export default function TelegramGroupsPage() {
         <div>
           <PageIntro
             title="Telegram Groups"
-            description="The chats the bot listens in. Mode switches each group between Entries (inventory capture) and Requests (search → submit → manager Accept issues stock)."
+            description="The chats the bot listens in. Mode switches each group between Entries (inventory capture) and Search (type an item → Record movement or Request item)."
           />
           <Link
             href="/workflows"
             style={{ display: "inline-block", marginTop: 8, fontSize: 12.5, fontWeight: 600, color: "#1560f0", textDecoration: "none" }}
           >
-            See Search / Request animation on Workflows →
+            See search-group bot preview on Workflows →
           </Link>
         </div>
         <button onClick={openAdd} style={addBtnStyle}>

@@ -9,6 +9,10 @@ import {
   locationParentIds,
   locationPathById,
 } from "./locations";
+import {
+  activeRootCategories,
+  activeCategoryChildrenByParentName,
+} from "./categories";
 import { isDuplicateKeyError } from "./mongodb";
 import {
   activeOptionTrees,
@@ -44,16 +48,13 @@ export type EngineResult = {
 // identical to what the per-parent queries used to give.
 // ---------------------------------------------------------------------------
 async function activeCategories(db: Db) {
-  return cached("categories:active", () =>
-    db.collection("categories").find({ status: "Active" }).sort({ order: 1, name: 1 }).toArray()
-  );
+  // Bot category_select shows roots only; nested nodes are picked via subcategory_select
+  // (or deeper nesting once workflows move to a full category_tree step).
+  return activeRootCategories(db);
 }
 
 async function activeSubcategories(db: Db, parentName?: string) {
-  const all = await cached("subcategories:active", () =>
-    db.collection("subcategories").find({ status: "Active" }).sort({ order: 1, name: 1 }).toArray()
-  );
-  return parentName ? all.filter((s) => s.parent === parentName) : all;
+  return activeCategoryChildrenByParentName(db, parentName);
 }
 
 async function activeUnits(db: Db) {

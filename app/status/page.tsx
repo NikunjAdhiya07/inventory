@@ -7,7 +7,7 @@ import { PageIntro, Modal, ModalHeader, ModalFooter, thStyle, tdStyle, labelStyl
 import { useSort } from "@/lib/use-sort";
 
 const PALETTE = ["#8a97b0", "#f59e0b", "#0f9d63", "#1560f0", "#6366f1", "#94a3b8", "#ec4899", "#d63a3a"];
-const APPLIES = ["Categories", "Subcategories", "Locations", "Units", "Roles"];
+const APPLIES = ["Categories", "Locations", "Units", "Roles"];
 
 type StatusItem = {
   id: string;
@@ -21,7 +21,7 @@ type StatusItem = {
 
 type StatusForm = { name: string; color: string; behavior: string; applies: string[]; isDefault: boolean };
 
-const EMPTY_FORM: StatusForm = { name: "", color: PALETTE[2], behavior: "Editable, visible to bot", applies: ["Categories", "Subcategories", "Locations", "Units"], isDefault: false };
+const EMPTY_FORM: StatusForm = { name: "", color: PALETTE[2], behavior: "Editable, visible to bot", applies: ["Categories", "Locations", "Units"], isDefault: false };
 
 function pillStyle(c: string) {
   return {

@@ -31,8 +31,6 @@ const GROUPS: NavGroup[] = [
       { key: "products", label: "Product Master", href: "/products", icon: "❐" },
       { key: "product-attributes", label: "Product Attributes", href: "/product-attributes", icon: "≡" },
       { key: "categories", label: "Categories", href: "/categories", icon: "▦" },
-      { key: "subcategories", label: "Subcategories", href: "/subcategories", icon: "▩" },
-      { key: "option-trees", label: "Nested Categories", href: "/option-trees", icon: "⌸" },
       { key: "locations", label: "Storage Locations", href: "/locations", icon: "▧" },
       { key: "storage-map", label: "Storage Map", href: "/storage-map", icon: "▥" },
       { key: "units", label: "Units", href: "/units", icon: "⚖" },

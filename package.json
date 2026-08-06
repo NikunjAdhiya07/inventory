@@ -16,7 +16,10 @@
     "ensure-indexes": "node scripts/ensure-indexes.mjs",
     "backfill:stock": "node scripts/backfill-stock.mjs",
     "migrate:request-roles": "node scripts/migrate-request-roles.mjs",
-    "migrate:locations": "node scripts/migrate-locations-canteen.mjs"
+    "migrate:locations": "node scripts/migrate-locations-canteen.mjs",
+    "migrate:category-tree": "node scripts/migrate-category-tree.mjs",
+    "seed:pipe-categories": "node scripts/seed-pipe-categories.mjs",
+    "seed:category-trees": "node scripts/seed-all-category-trees.mjs"
   },
   "dependencies": {
     "dotenv": "^17.4.2",

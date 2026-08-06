@@ -2,7 +2,7 @@
 
 import { useEffect, useState } from "react";
 import PageShell from "@/components/page-shell";
-import RequestWorkflowPreview, { REQUEST_WORKFLOW_STEPS } from "@/components/request-workflow-preview";
+import RequestWorkflowPreview, { MOVE_WORKFLOW_STEPS, REQUEST_PATH_STEPS } from "@/components/request-workflow-preview";
 import { api } from "@/lib/api-client";
 import {
   ErrorBanner,
@@ -214,7 +214,7 @@ export default function WorkflowsPage() {
       <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", gap: 20, marginBottom: 22 }}>
         <PageIntro
           title="Workflows"
-          description="Two bots, two workflow kinds: Search / Request (2nd bot, fixed) for Requests-mode groups, and builder workflows below for Entries-mode groups."
+          description="Search-group bot (Requests mode): type an item → Record movement or Request item. Entry workflows below are for Entries-mode groups."
         />
         <button onClick={() => setCreateOpen(true)} style={addBtnStyle}>
           ＋ New Entry Workflow
@@ -222,6 +222,8 @@ export default function WorkflowsPage() {
       </div>
 
       {loadError && <ErrorBanner message={loadError} />}
+
+      <RequestWorkflowPreview variant="panel" />
 
       <div style={{ display: "grid", gridTemplateColumns: "repeat(3,1fr)", gap: 16, marginBottom: 22 }}>
         <Stat label="Workflows" value={workflows.length + 1} />
@@ -245,15 +247,17 @@ export default function WorkflowsPage() {
             <tr style={{ background: "#f8faff" }}>
               <td style={tdStyle("16px")}>
                 <div style={{ display: "flex", alignItems: "center", gap: 9, flexWrap: "wrap" }}>
-                  <div style={{ fontWeight: 600, color: "#1a2b4a" }}>Search / Request</div>
+                  <div style={{ fontWeight: 600, color: "#1a2b4a" }}>Search group bot</div>
                   <span style={{ fontSize: 10.5, fontWeight: 700, background: "#eef3fe", color: "#1560f0", borderRadius: 20, padding: "1px 8px" }}>2ND BOT</span>
                   <span style={{ fontSize: 10.5, fontWeight: 700, background: "#eafaf1", color: "#0f9d63", borderRadius: 20, padding: "1px 8px" }}>FIXED</span>
                 </div>
                 <div style={{ fontSize: 11.5, color: "#98a4bd", marginTop: 2, maxWidth: 520 }}>
-                  Requests-mode Telegram groups — search stock, submit, manager Accept issues and closes. Not built from the entry Step Library.
+                  Requests-mode groups — search → Record movement (ledger) or Request item (cart → manager Accept). Preview above; View for the full walkthrough.
                 </div>
               </td>
-              <td style={{ ...tdStyle(), textAlign: "center", color: "#4a5878" }}>{REQUEST_WORKFLOW_STEPS.length}</td>
+              <td style={{ ...tdStyle(), textAlign: "center", color: "#4a5878", fontSize: 12 }}>
+                {MOVE_WORKFLOW_STEPS.length}/{REQUEST_PATH_STEPS.length}
+              </td>
               <td style={{ ...tdStyle(), textAlign: "center", color: "#8a97b0", fontFamily: "var(--font-mono)" }}>—</td>
               <td style={tdStyle()}>
                 <span style={chipStyle(true)}>Active</span>
@@ -301,7 +305,7 @@ export default function WorkflowsPage() {
             ))}
           </tbody>
         </table>
-        {!loading && workflows.length === 0 ? <EmptyState text="No entry workflows yet. Create one for inventory-capture groups — Search / Request above already covers the 2nd bot." /> : null}
+        {!loading && workflows.length === 0 ? <EmptyState text="No entry workflows yet. Create one for inventory-capture groups — the search-group bot above already covers Requests mode." /> : null}
         {loading ? <EmptyState text="Loading…" /> : null}
       </section>
 
@@ -309,8 +313,8 @@ export default function WorkflowsPage() {
       {requestViewOpen ? (
         <Modal onClose={() => setRequestViewOpen(false)} maxWidth={1100}>
           <ModalHeader
-            title="View — Search / Request"
-            subtitle="2nd bot fixed workflow for Requests-mode groups. Steps are not added from the entry library — set a Telegram group to Requests mode to use this."
+            title="View — Search group bot"
+            subtitle="Requests-mode Telegram groups. Toggle Record movement vs Request item to see each path. Not built from the entry Step Library."
             onClose={() => setRequestViewOpen(false)}
           />
           <RequestWorkflowPreview variant="modal" />
@@ -325,7 +329,7 @@ export default function WorkflowsPage() {
       {/* Create */}
       {createOpen ? (
         <Modal onClose={() => setCreateOpen(false)} maxWidth={460}>
-          <ModalHeader title="New Entry Workflow" subtitle="For Entries-mode groups only. The Search / Request (2nd bot) flow is fixed and already listed above." onClose={() => setCreateOpen(false)} />
+          <ModalHeader title="New Entry Workflow" subtitle="For Entries-mode groups only. The search-group bot (Requests mode) is fixed and previewed above." onClose={() => setCreateOpen(false)} />
           <div style={{ padding: "22px 24px" }}>
             <label style={labelStyle}>
               Workflow Name <span style={{ color: "#e0524f" }}>*</span>
@@ -348,7 +352,7 @@ export default function WorkflowsPage() {
         <Modal onClose={() => setBuilder(null)} maxWidth={960}>
           <ModalHeader
             title={`Build — ${builder.name}`}
-            subtitle="Entry bot only. Add steps from the library for inventory capture. For the 2nd bot (search / request), close this and open View on Search / Request."
+            subtitle="Entry bot only. Add steps from the library for inventory capture. For the search-group bot (movement + request), close this and use the preview on this page."
             onClose={() => setBuilder(null)}
           />
           <div style={{ display: "grid", gridTemplateColumns: "260px 1fr", gap: 0, minHeight: 420 }}>
@@ -368,7 +372,7 @@ export default function WorkflowsPage() {
                 </button>
               ))}
               <div style={{ marginTop: 12, padding: "10px 10px", borderRadius: 9, background: "#eef3fe", border: "1px solid #cdd9f7", fontSize: 11.5, color: "#3a4a68", lineHeight: 1.45 }}>
-                Looking for search / issue stock? That is the <b>Search / Request</b> workflow — use <b>View</b> on the list, not this library.
+                Looking for search / stock movement / request? That is the <b>search group bot</b> — use the preview at the top of this page, not this library.
               </div>
             </div>
 
@@ -616,7 +620,7 @@ function StepConfigModal({
         </div>
         {step.type === "nested_select" ? (
           <div style={{ padding: "11px 13px", borderRadius: 9, background: "#eef3fe", border: "1px solid #cdd9f7", fontSize: 11.5, color: "#3a4a68", lineHeight: 1.5 }}>
-            This step asks one question per level of a tree from <b>Nested Categories</b>. Leave the tree blank and it picks the
+            This step asks one question per level of an option tree. Leave the tree blank and it picks the
             tree the item name matches — so <b>Wire</b> gets the wire questions and everything else walks straight past. The
             prompt above is only shown when the bot has to ask <i>which</i> tree applies.
           </div>

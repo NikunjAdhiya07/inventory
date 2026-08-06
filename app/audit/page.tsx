@@ -6,7 +6,7 @@ import { api } from "@/lib/api-client";
 import { PageIntro, Modal, EmptyState, thStyle, tdStyle, secondaryBtnStyle, SortTh } from "@/components/dc-ui";
 import { useSort } from "@/lib/use-sort";
 
-const TYPES = ["Category", "Subcategory", "Storage Location", "Unit", "Role"];
+const TYPES = ["Category", "Storage Location", "Unit", "Role"];
 
 type LogEntry = {
   id: string;

@@ -96,6 +96,20 @@ export type RequestEvent = {
   what: string;
 };
 
+// Where the stock-movement sub-flow has got to after the user picks an item and
+// taps Record movement. Driven by the Movement Master type they choose — the
+// bot asks only the fields that type needs, in order.
+export type MoveStage =
+  | "type"
+  | "location"
+  | "from"
+  | "to"
+  | "qty"
+  | "reference"
+  | "remarks"
+  | "review"
+  | "done";
+
 // Per-step scratch for the requester's cart-building UI. Reset whenever a new
 // search starts, exactly like the entry bot's `productQuery`/`productPage`.
 export type RequestUi = {
@@ -106,12 +120,24 @@ export type RequestUi = {
   focusProductId?: string | null;
   focusLocationId?: string | null;
   qtyDraft?: string;
+  // After opening a product: null shows stock + intent buttons (Record movement
+  // vs Request item). "request" continues the cart path; "move" the ledger path.
+  intent?: "request" | "move" | null;
+  moveStage?: MoveStage | null;
+  moveTypeCode?: string | null;
+  moveLocationId?: string | null;
+  moveFromLocationId?: string | null;
+  moveToLocationId?: string | null;
+  moveQtyDraft?: string;
+  moveReference?: string;
+  moveRemarks?: string;
   // Free-text capture for the purchase flow, one field at a time.
   purchaseField?: "name" | "qty" | "unit" | "note" | null;
   // Cursor for the location tree shown when a purchased item is received into
-  // stock. Kept separate from `focusLocationId` — that one means "the shelf this
-  // cart line is taken from", and overloading it would make Back out of the
-  // delivery picker land in the middle of a half-built cart line.
+  // stock (or when a stock-in / transfer-to picks any shelf). Kept separate from
+  // `focusLocationId` — that one means "the shelf this cart line is taken from",
+  // and overloading it would make Back out of the delivery picker land in the
+  // middle of a half-built cart line.
   locCursor?: string | null;
   locStack?: string[];
   // Where the "purchase delivered" sub-flow has got to. Absent until somebody

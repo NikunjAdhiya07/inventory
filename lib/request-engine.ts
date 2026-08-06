@@ -1,6 +1,15 @@
 import type { Db } from "mongodb";
 import { locationChildren, locationParentIds, locationPathById } from "./locations";
-import { searchStock, type StockHit } from "./stock";
+import {
+  applyMoveCallback,
+  applyMoveMessage,
+  clearMoveUi,
+  focusedProduct,
+  isMoveCallback,
+  renderMoveFlow,
+  renderProductIntent,
+} from "./move-engine";
+import { lookupProducts, type StockHit } from "./stock";
 import { buttonRows, type InlineKeyboard } from "./telegram";
 import { approversFor, mentionList, type Approver } from "./requests";
 import {
@@ -78,21 +87,26 @@ async function renderDraft(db: Db, request: ItemRequest): Promise<RenderResult> 
   const ui = request.ui;
 
   if (request.kind === "purchase") return renderPurchaseDraft(request);
-  if (ui.focusProductId && ui.focusLocationId) return renderQtyPad(db, request);
-  if (ui.focusProductId) return renderProductDetail(db, request);
+  // Stock-movement sub-flow (Record movement after picking an item).
+  if (ui.intent === "move" && ui.moveStage) return renderMoveFlow(db, request);
+  if (ui.focusProductId && ui.intent === "request" && ui.focusLocationId) return renderQtyPad(db, request);
+  if (ui.focusProductId && ui.intent === "request") return renderProductDetail(db, request);
+  // Product opened: show stock + Record movement / Request item.
+  if (ui.focusProductId) return renderProductIntent(db, request);
   if (ui.query) return renderResults(db, request);
   return renderCart(request);
 }
 
-// The results of a search: one button per product, opened to choose where from
-// and how many.
+// The results of a search: one button per product. Includes zero-stock items so
+// Opening Stock / Stock In can start from nothing on the shelf; the product
+// screen then branches into Record movement vs Request item.
 async function renderResults(db: Db, request: ItemRequest): Promise<RenderResult> {
   const ui = request.ui;
-  const hits = await searchStock(db, ui.query);
+  const hits = await lookupProducts(db, ui.query);
 
   if (!hits.length) {
     return {
-      text: `No stock for “${esc(ui.query)}”. Try another name or a reference tag (e.g. “c type cable”).`,
+      text: `No items for “${esc(ui.query)}”. Try another name or a reference tag (e.g. “c type cable”).`,
       keyboard: [
         ...(request.lines.length ? [[{ text: `Cart (${request.lines.length})`, callback_data: "rq:cart" }]] : []),
         [{ text: "✖ Cancel", callback_data: "rq:cancel" }],
@@ -107,7 +121,7 @@ async function renderResults(db: Db, request: ItemRequest): Promise<RenderResult
   const start = page * PAGE_SIZE;
   const slice = hits.slice(start, start + PAGE_SIZE);
 
-  // Product-first: name + total on hand. Locations appear after the user taps one.
+  // Product-first: name + total on hand. Intent (move vs request) comes after tap.
   const lines = [`<b>${hits.length}</b> match${hits.length === 1 ? "" : "es"} for “${esc(ui.query)}”`, ""];
   for (const [i, hit] of slice.entries()) {
     lines.push(`<b>${start + i + 1}. ${esc(hit.name)}</b> — ${money(hit.total)} ${esc(hit.unit)}`);
@@ -186,7 +200,7 @@ async function renderQtyPad(db: Db, request: ItemRequest): Promise<RenderResult>
 function renderCart(request: ItemRequest): RenderResult {
   if (!request.lines.length) {
     return {
-      text: `<b>Search stock</b>\nType a product name.`,
+      text: `<b>Search stock</b>\nType a product name to request items or record a movement.`,
       keyboard: [[{ text: "✖ Cancel", callback_data: "rq:cancel" }]],
     };
   }
@@ -409,12 +423,12 @@ function truncate(s: string, max: number): string {
   return s.length > max ? `${s.slice(0, max - 1)}…` : s;
 }
 
-// The product the requester currently has open, re-resolved from the live search
-// rather than remembered. Stock can change between taps, and rendering a
-// remembered snapshot would offer quantities that no longer exist.
+// The product the requester currently has open, re-resolved from the live
+// catalogue (including zero-stock) rather than remembered. Stock can change
+// between taps, and rendering a remembered snapshot would offer quantities that
+// no longer exist.
 async function focusedHit(db: Db, request: ItemRequest): Promise<StockHit | null> {
-  const hits = await searchStock(db, request.ui.query);
-  return hits.find((h) => h.productId === request.ui.focusProductId) ?? null;
+  return focusedProduct(db, request);
 }
 
 // ---------------------------------------------------------------------------
@@ -435,12 +449,20 @@ export async function applyRequestMessage(
 
   if (request.kind === "purchase") return applyPurchaseText(db, request, trimmed);
 
-  // Anything typed while building an inventory request is a search.
+  // Reference / remarks for a stock movement are typed answers, not a new search.
+  const moveMsg = await applyMoveMessage(db, request, trimmed);
+  if (moveMsg) {
+    if (moveMsg.render) return { render: moveMsg.render };
+    if (moveMsg.notice) return { notice: moveMsg.notice };
+  }
+
+  // Anything else typed while building an inventory request is a search.
   request.ui.query = trimmed.slice(0, 60);
   request.ui.page = 0;
   request.ui.focusProductId = null;
   request.ui.focusLocationId = null;
   request.ui.qtyDraft = "";
+  clearMoveUi(request.ui);
   return { render: await renderRequest(db, request) };
 }
 
@@ -483,21 +505,43 @@ async function applyPurchaseText(db: Db, request: ItemRequest, text: string): Pr
 
 // Handles only the draft-stage callbacks. Status transitions live in the webhook
 // so that permission checks sit next to them.
-export async function applyDraftCallback(db: Db, request: ItemRequest, data: string): Promise<RequestResult> {
+export async function applyDraftCallback(
+  db: Db,
+  request: ItemRequest,
+  data: string,
+  by = "Unknown"
+): Promise<RequestResult> {
   const ui = request.ui;
+
+  if (isMoveCallback(data)) {
+    const res = await applyMoveCallback(db, request, data, by);
+    if (res.switchToRequest) return { render: await renderRequest(db, request) };
+    if (res.render) return { render: res.render };
+    if (res.notice) return { notice: res.notice };
+    return { notice: "Use the buttons above." };
+  }
 
   if (data === "rq:cart") {
     ui.query = "";
     ui.focusProductId = null;
     ui.focusLocationId = null;
+    clearMoveUi(ui);
     return { render: await renderRequest(db, request) };
   }
 
   if (data === "rq:back") {
-    // One step back out of whatever is open: quantity → locations → results.
-    if (ui.focusLocationId) ui.focusLocationId = null;
-    else if (ui.focusProductId) ui.focusProductId = null;
-    else ui.query = "";
+    // One step back out of whatever is open: quantity → locations → intent → results.
+    if (ui.focusLocationId) {
+      ui.focusLocationId = null;
+    } else if (ui.intent === "request" && ui.focusProductId) {
+      // Leave the request path; return to the intent screen for this product.
+      ui.intent = null;
+    } else if (ui.focusProductId) {
+      ui.focusProductId = null;
+      clearMoveUi(ui);
+    } else {
+      ui.query = "";
+    }
     ui.qtyDraft = "";
     return { render: await renderRequest(db, request) };
   }
@@ -526,12 +570,13 @@ export async function applyDraftCallback(db: Db, request: ItemRequest, data: str
   }
 
   if (data.startsWith("rq:s:")) {
-    const hits = await searchStock(db, ui.query);
+    const hits = await lookupProducts(db, ui.query);
     const hit = hits[Number(data.slice("rq:s:".length))];
     if (!hit) return { notice: "That item is no longer available." };
     ui.focusProductId = hit.productId;
     ui.focusLocationId = null;
     ui.qtyDraft = "";
+    clearMoveUi(ui);
     return { render: await renderRequest(db, request) };
   }
 
