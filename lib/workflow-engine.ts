@@ -1,7 +1,14 @@
 import { ObjectId, type Db, type Document } from "mongodb";
-import { aiConfigured, identifyItemFromImage, normalizeItemName, expandReferenceNames, localReferenceExpansions } from "./ai";
+import {
+  aiConfigured,
+  identifyItemFromImage,
+  expandReferenceNames,
+  localReferenceExpansions,
+  suggestCategoryForProduct,
+  fixProductName,
+} from "./ai";
 import { logAudit } from "./audit";
-import { cached } from "./cache";
+import { cached, invalidateCollection } from "./cache";
 import { defer } from "./defer";
 import {
   activeLocations,
@@ -31,10 +38,10 @@ import {
 } from "./option-trees";
 import { findAlias, upsertAliases } from "./product-aliases";
 import { aliasesByProductId, productMatchesFuzzy, rankItemSuggestions, type MatchCandidate } from "./product-match";
-import { activeProducts, ensureProductForEntry } from "./product-store";
+import { activeProducts, ensureProductForEntry, findActiveProductByName } from "./product-store";
 import { attributeValues, productLabel, type ProductAttribute } from "./products";
 import { receiptKey, recordMovement } from "./stock";
-import { buttonRows, downloadFileBytes, type InlineKeyboard } from "./telegram";
+import { buttonRows, downloadFileBytes, sendMessage, type InlineKeyboard } from "./telegram";
 import { nextTicketNumber } from "./ticket";
 import type { Answer, BotSession, CategoryCursor, NestedCursor, ProductSnapshot, StepInstance } from "./workflow-types";
 
@@ -708,39 +715,21 @@ async function presentItemSuggestions(
     limit: 5,
   });
 
-  // Optional AI text normalize when local ranking is weak (typed path only).
-  if (opts.typed && !opts.forceSuggest && candidates[0]?.score < 75 && aiConfigured()) {
-    try {
-      const products = await activeProducts(db);
-      const guess = await normalizeItemName(
-        opts.typed,
-        products.map((p) => String(p.name ?? "")).filter(Boolean)
-      );
-      if (guess) {
-        const extra = await rankItemSuggestions(db, { typed: guess, labels: [guess], limit: 5 });
-        const merged = [...extra, ...candidates];
-        const seen = new Set<string>();
-        candidates = merged
-          .filter((c) => {
-            const k = (c.productId || c.name).toLowerCase();
-            if (seen.has(k)) return false;
-            seen.add(k);
-            return true;
-          })
-          .slice(0, 5);
-      }
-    } catch (err) {
-      console.error("[ai] normalizeItemName failed:", err);
+  // Exact product name typed → skip the picker (never for photo-driven / AI flow).
+  // Typed & caption paths never call AI here — use the worker's wording as entered.
+  if (!opts.forceSuggest && opts.typed) {
+    if (candidates[0]?.score >= 100 && candidates[0].source === "exact") {
+      return commitItemName(db, session, step, {
+        name: candidates[0].name,
+        productId: candidates[0].productId,
+        imageFileId: opts.imageFileId || session.answers[step.instanceId]?.imageFileId,
+        aliases: [...(opts.labels ?? []), opts.typed],
+      });
     }
-  }
-
-  // Exact product name typed → skip the picker (never for photo-driven flow).
-  if (!opts.forceSuggest && opts.typed && candidates[0]?.score >= 100 && candidates[0].source === "exact") {
     return commitItemName(db, session, step, {
-      name: candidates[0].name,
-      productId: candidates[0].productId,
+      name: opts.typed,
       imageFileId: opts.imageFileId || session.answers[step.instanceId]?.imageFileId,
-      aliases: [...(opts.labels ?? []), opts.typed],
+      aliases: opts.labels ?? [],
     });
   }
 
@@ -820,19 +809,24 @@ async function handleItemCaptureInput(
     return { notice: "Send a photo or type the item name." };
   }
 
-  // Photo path: download + vision, then suggest.
+  // Photo + text/caption: never call vision — keep the worker's wording.
+  if (image && name) {
+    return presentItemSuggestions(db, session, step, {
+      typed: name,
+      imageFileId: image,
+    });
+  }
+
+  // Image-only: download + vision, then suggest.
   if (image) {
     if (!aiConfigured()) {
-      // No AI key — keep photo and wait for a typed name, or use caption if any.
+      // No AI key — keep photo and wait for a typed name.
       session.answers[step.instanceId] = {
         type: "item_capture",
-        value: name || session.answers[step.instanceId]?.value || "",
-        display: name || String(session.answers[step.instanceId]?.value || "(image)"),
+        value: session.answers[step.instanceId]?.value || "",
+        display: String(session.answers[step.instanceId]?.value || "(image)"),
         imageFileId: image,
       };
-      if (name) {
-        return presentItemSuggestions(db, session, step, { typed: name, imageFileId: image });
-      }
       return {
         render: {
           text: `${step.label || "Item"}\n\n📷 Photo saved. Type the item name.`,
@@ -847,10 +841,10 @@ async function handleItemCaptureInput(
       const file = await downloadFileBytes(image);
       if (file) {
         console.log(`[ai] vision start bytes=${file.bytes.length} mime=${file.mime}`);
-        labels = await identifyItemFromImage(file.bytes, file.mime, name || undefined);
+        labels = await identifyItemFromImage(file.bytes, file.mime);
         console.log(`[ai] vision labels=${JSON.stringify(labels)}`);
       } else if (/^(1|true|yes)$/i.test(process.env.AI_MOCK || "")) {
-        labels = await identifyItemFromImage(Buffer.from([]), "image/jpeg", name || undefined);
+        labels = await identifyItemFromImage(Buffer.from([]), "image/jpeg");
       } else {
         visionError = "could not download photo from Telegram";
       }
@@ -859,13 +853,6 @@ async function handleItemCaptureInput(
       console.error("[ai] identifyItemFromImage failed:", err);
     }
 
-    if (!labels.length && name) {
-      return presentItemSuggestions(db, session, step, {
-        typed: name,
-        imageFileId: image,
-        forceSuggest: true,
-      });
-    }
     if (!labels.length) {
       session.answers[step.instanceId] = {
         type: "item_capture",
@@ -885,7 +872,6 @@ async function handleItemCaptureInput(
     }
 
     return presentItemSuggestions(db, session, step, {
-      typed: name || undefined,
       labels,
       imageFileId: image,
       forceSuggest: true,
@@ -913,23 +899,18 @@ async function commitItemName(
   if (!name) return { notice: "Pick or type an item name." };
 
   let productId = opts.productId;
-  let productName = name;
   let productSnap: ProductSnapshot | undefined;
   if (!productId) {
     const products = await activeProducts(db);
     const hit = products.find((p) => String(p.name ?? "").toLowerCase() === name.toLowerCase());
     if (hit) {
       productId = hit._id.toString();
-      productName = String(hit.name ?? name);
       productSnap = productSnapshot(hit);
     }
   } else {
     try {
       const p = await db.collection("products").findOne({ _id: new ObjectId(productId) });
-      if (p) {
-        if (p.name) productName = String(p.name);
-        productSnap = productSnapshot(p);
-      }
+      if (p) productSnap = productSnapshot(p);
     } catch {
       /* keep name */
     }
@@ -940,7 +921,6 @@ async function commitItemName(
     const aliased = await findAlias(db, name);
     if (aliased?.productId) {
       productId = aliased.productId;
-      productName = aliased.productName || name;
       try {
         const p = await db.collection("products").findOne({ _id: new ObjectId(productId) });
         if (p) productSnap = productSnapshot(p);
@@ -960,7 +940,6 @@ async function commitItemName(
     const top = ranked[0];
     if (top?.productId && top.score >= 55) {
       productId = top.productId;
-      productName = top.name;
       try {
         const p = await db.collection("products").findOne({ _id: new ObjectId(productId) });
         if (p) productSnap = productSnapshot(p);
@@ -979,20 +958,9 @@ async function commitItemName(
     // without re-resolving when the user picked / matched an existing product.
     ...(productSnap ? { product: productSnap } : {}),
   };
-  const seedAliases = [...(opts.aliases ?? []), name, ...localReferenceExpansions(name), ...localReferenceExpansions(productName)];
+  // Reference-name / category AI runs after submit (see enrichProductAfterSubmit),
+  // not mid-conversation — keep capture responsive and honour typed names as-is.
   session.itemSuggest = undefined;
-
-  // Persist AI + alternate reference names on Product Master so Item Master /
-  // Telegram autocorrect keep learning (e.g. "c type cable" → USB-C cable).
-  if (productId) {
-    const pid = productId;
-    const pname = productName;
-    defer(async () => {
-      const expanded = await expandReferenceNames(pname, seedAliases);
-      await upsertAliases(db, pid, pname, expanded, "ai");
-      console.log(`[ai] saved ${expanded.length} reference names for ${pname}`);
-    });
-  }
 
   return advance(db, session);
 }
@@ -1747,17 +1715,16 @@ async function finalize(db: Db, session: BotSession): Promise<EngineResult> {
         unit: ensured.unit || unit,
         attributes: ensured.attributes,
       };
-      // Keep learning reference names for the newly linked / created product.
-      defer(async () => {
-        const expanded = await expandReferenceNames(ensured.name, [
-          itemName,
-          ...localReferenceExpansions(itemName),
-          ...localReferenceExpansions(ensured.name),
-        ]);
-        await upsertAliases(db, ensured.id, ensured.name, expanded, "ai");
-      });
     }
   }
+
+  // Did the worker explicitly pick category in this session? If so, keep it —
+  // otherwise post-submit AI may fill / correct the product category.
+  const userPickedCategory = Boolean(
+    answerFor(session, "category_select") ||
+      answerFor(session, "subcategory_select") ||
+      (categoryTree && categoryTree.value)
+  );
 
   const entry = {
     ticketNumber,
@@ -1856,6 +1823,50 @@ async function finalize(db: Db, session: BotSession): Promise<EngineResult> {
       by: session.submittedByName,
       createdAt: now.toISOString(),
     }).catch((err) => console.error("[engine] stock receipt failed:", err));
+  } else if (!product) {
+    console.error("[engine] entry stored without product — stock not posted", ticketNumber);
+  } else if (!entry.fields.locationId || quantity === null || quantity <= 0) {
+    console.warn(
+      "[engine] entry stored without stock receipt (need location + qty)",
+      ticketNumber,
+      { locationId: entry.fields.locationId, quantity }
+    );
+  }
+
+  // Background AI: reference names + category placement for Item Master / search.
+  // Entry + stock stay awaited above so inventory data is durable first.
+  //
+  // Seed aliases (typed name + local spellings) are awaited BEFORE confirmation
+  // so the Search / request group can find the item on the very next message —
+  // without waiting for Nemotron. Full AI expansion stays deferred.
+  if (product) {
+    const productId = product.id;
+    const productName = product.name;
+    const seedNames = [itemName, productName].filter(Boolean);
+    const localSeeds = [
+      ...seedNames,
+      ...seedNames.flatMap((s) => localReferenceExpansions(s)),
+    ];
+    await upsertAliases(db, productId, productName, localSeeds, "user").catch((err) =>
+      console.error("[engine] seed aliases failed:", err)
+    );
+    // Belt-and-braces: product create already invalidates, but an existing
+    // product / failed seed path must still refresh the search catalogue.
+    invalidateCollection("products");
+
+    const allowAiCategory =
+      !userPickedCategory && !String(product.category || category || "").trim();
+    defer(() =>
+      enrichProductAfterSubmit(db, {
+        productId,
+        productName,
+        productNumber: product.productNumber,
+        ticketNumber,
+        chatId: session.chatId,
+        seedNames,
+        allowAiCategory,
+      })
+    );
   }
 
   const productLine: [string, string][] = product
@@ -1885,6 +1896,124 @@ async function finalize(db: Db, session: BotSession): Promise<EngineResult> {
   );
 
   return { finished: true, render: { text: confirmationText(session, ticketNumber), keyboard: [] } };
+}
+
+/** After inventory is durable: fix name, expand reference names, assign category. */
+async function enrichProductAfterSubmit(
+  db: Db,
+  opts: {
+    productId: string;
+    productName: string;
+    productNumber: string;
+    ticketNumber: string;
+    chatId: string;
+    seedNames: string[];
+    allowAiCategory: boolean;
+  }
+): Promise<void> {
+  let canonicalName = opts.productName;
+  const seeds = [
+    ...opts.seedNames,
+    opts.productName,
+    ...opts.seedNames.flatMap((s) => localReferenceExpansions(s)),
+    ...localReferenceExpansions(opts.productName),
+  ];
+
+  if (!aiConfigured()) return;
+
+  // Auto-created entry products get a cleaned Product Master name in the
+  // background — never mid-conversation. Existing catalogue picks keep their names.
+  const canRename = /^AUTO-/i.test(opts.productNumber || "");
+  if (canRename) {
+    const fixed = await fixProductName(opts.productName);
+    if (fixed && fixed.trim().toLowerCase() !== opts.productName.trim().toLowerCase()) {
+      const conflict = await findActiveProductByName(db, fixed);
+      if (conflict && conflict._id.toString() !== opts.productId) {
+        // Another product already owns the cleaned name — keep ours, tag the
+        // suggestion as an alias so search still learns the spelling.
+        await upsertAliases(db, opts.productId, opts.productName, [fixed, ...opts.seedNames], "ai");
+        console.warn(
+          `[ai] name fix "${opts.productName}" → "${fixed}" skipped (conflicts with ${conflict.productNumber})`
+        );
+      } else {
+        const at = new Date().toISOString();
+        const previous = opts.productName;
+        await db.collection("products").updateOne(
+          { _id: new ObjectId(opts.productId) },
+          { $set: { name: fixed, updatedAt: at } }
+        );
+        await db.collection("inventoryEntries").updateOne(
+          { ticketNumber: opts.ticketNumber },
+          {
+            $set: {
+              "fields.itemName": fixed,
+              "fields.productName": fixed,
+            },
+          }
+        );
+        await db.collection("stockMovements").updateMany(
+          { refType: "inventoryEntry", refId: opts.ticketNumber, productId: opts.productId },
+          { $set: { productName: fixed } }
+        );
+        // Old typing stays searchable; new name is canonical.
+        await upsertAliases(db, opts.productId, fixed, [previous, ...opts.seedNames], "user");
+        invalidateCollection("products");
+        canonicalName = fixed;
+        console.log(`[ai] fixed product name "${previous}" → "${fixed}"`);
+
+        await sendMessage(
+          opts.chatId,
+          `✏️ <b>Item name was fixed</b>\n` +
+            `<i>${escHtml(previous)}</i> → <b>${escHtml(fixed)}</b>\n` +
+            `Ticket: <code>${escHtml(opts.ticketNumber)}</code>`
+        ).catch((err) => console.error("[ai] name-fix notice failed:", err));
+      }
+    }
+  }
+
+  const expanded = await expandReferenceNames(canonicalName, seeds);
+  await upsertAliases(db, opts.productId, canonicalName, expanded, "ai");
+  console.log(`[ai] saved ${expanded.length} reference names for ${canonicalName}`);
+
+  if (opts.allowAiCategory) {
+    const cats = await allActiveCategories(db);
+    const byId = await categoriesById(db);
+    const paths = [
+      ...new Set(
+        cats
+          .map((c) => categoryPathFrom(byId, c._id.toString()))
+          .map((p) => p.trim())
+          .filter(Boolean)
+      ),
+    ];
+    const suggestion = await suggestCategoryForProduct(canonicalName, paths);
+    if (suggestion?.category) {
+      const at = new Date().toISOString();
+      await db.collection("products").updateOne(
+        { _id: new ObjectId(opts.productId) },
+        {
+          $set: {
+            category: suggestion.category,
+            subcategory: suggestion.subcategory || "",
+            updatedAt: at,
+          },
+        }
+      );
+      await db.collection("inventoryEntries").updateOne(
+        { ticketNumber: opts.ticketNumber },
+        {
+          $set: {
+            "fields.category": suggestion.category,
+            "fields.subcategory": suggestion.subcategory || "",
+          },
+        }
+      );
+      invalidateCollection("products");
+      console.log(
+        `[ai] category ${suggestion.category}${suggestion.subcategory ? ` › ${suggestion.subcategory}` : ""} for ${canonicalName}`
+      );
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------

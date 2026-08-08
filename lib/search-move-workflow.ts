@@ -539,7 +539,7 @@ export function stockEffectKindForDirection(
  */
 export function ensureStockEffectStepsOnBranches(workflow: SearchMoveWorkflow): SearchMoveWorkflow {
   const moves = movementBranches(workflow);
-  let nodes = cloneNodes(workflow);
+  const nodes = cloneNodes(workflow);
   let changed = false;
 
   for (const move of moves) {

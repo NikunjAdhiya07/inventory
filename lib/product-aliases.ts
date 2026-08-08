@@ -1,5 +1,5 @@
 import type { Db } from "mongodb";
-import { invalidate } from "./cache";
+import { invalidateCollection } from "./cache";
 
 // Alternate spellings / AI labels linked to a Product Master row.
 // Exact alias hits are the cheapest autocorrect for repeat typos.
@@ -75,5 +75,8 @@ export async function upsertAliases(
       { upsert: true }
     );
   }
-  invalidate("products");
+  // Search group reads products + aliases from process cache — clear both so a
+  // just-submitted entry is findable on the next message in this instance.
+  invalidateCollection("productAliases");
+  invalidateCollection("products");
 }
