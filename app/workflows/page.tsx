@@ -3,6 +3,7 @@
 import { useEffect, useState } from "react";
 import PageShell from "@/components/page-shell";
 import RequestWorkflowPreview, { MOVE_WORKFLOW_STEPS, REQUEST_PATH_STEPS } from "@/components/request-workflow-preview";
+import MovementFlowTree, { type MovementTypeRow } from "@/components/movement-flow-tree";
 import { api } from "@/lib/api-client";
 import {
   ErrorBanner,
@@ -65,6 +66,7 @@ export default function WorkflowsPage() {
   const [delId, setDelId] = useState<string | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [requestViewOpen, setRequestViewOpen] = useState(false);
+  const [movementTypes, setMovementTypes] = useState<MovementTypeRow[]>([]);
 
   useEffect(() => {
     let cancelled = false;
@@ -87,6 +89,7 @@ export default function WorkflowsPage() {
     api.get<Named[]>("/api/products").then((d) => !cancelled && setProducts(d), onError);
     api.get<Named[]>("/api/option-trees").then((d) => !cancelled && setTrees(d), onError);
     api.get<Group[]>("/api/telegram-groups").then((d) => !cancelled && setGroups(d), onError);
+    api.get<MovementTypeRow[]>("/api/movement-types").then((d) => !cancelled && setMovementTypes(d), onError);
     return () => {
       cancelled = true;
     };
@@ -210,11 +213,11 @@ export default function WorkflowsPage() {
   const activeCount = workflows.filter((w) => w.status === "Active").length;
 
   return (
-    <PageShell section="Automation" page="Workflows" maxWidth={1320}>
+    <PageShell section="Automation" page="Workflows" maxWidth={false}>
       <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", gap: 20, marginBottom: 22 }}>
         <PageIntro
           title="Workflows"
-          description="Search-group bot (Requests mode): type an item → Record movement or Request item. Entry workflows below are for Entries-mode groups."
+          description="Search-group flowchart (drag movements & questions, edit Telegram messages), plus Entry workflows for Entries-mode groups."
         />
         <button onClick={() => setCreateOpen(true)} style={addBtnStyle}>
           ＋ New Entry Workflow
@@ -222,6 +225,8 @@ export default function WorkflowsPage() {
       </div>
 
       {loadError && <ErrorBanner message={loadError} />}
+
+      <MovementFlowTree types={movementTypes} />
 
       <RequestWorkflowPreview variant="panel" />
 
@@ -568,6 +573,7 @@ function defaultLabel(entry: StepLibEntry): string {
     product_select: "Select the product:",
     category_select: "Select a category:",
     subcategory_select: "Select a subcategory:",
+    category_tree: "Choose the category:",
     nested_select: "Tell me more about this item:",
     location_tree: "Choose the storage location:",
     quantity: "Enter the quantity:",
@@ -623,6 +629,13 @@ function StepConfigModal({
             This step asks one question per level of an option tree. Leave the tree blank and it picks the
             tree the item name matches — so <b>Wire</b> gets the wire questions and everything else walks straight past. The
             prompt above is only shown when the bot has to ask <i>which</i> tree applies.
+          </div>
+        ) : null}
+        {step.type === "category_tree" ? (
+          <div style={{ padding: "11px 13px", borderRadius: 9, background: "#eef3fe", border: "1px solid #cdd9f7", fontSize: 11.5, color: "#3a4a68", lineHeight: 1.5 }}>
+            Walks the <b>Categories</b> master until a leaf. If the item name matches a node (e.g. typing{" "}
+            <b>pipe</b>), the bot opens under that node and shows <b>every</b> child — Material → Type → Class → Size —
+            until the user picks the end. Back climbs one level at a time.
           </div>
         ) : null}
         {schema.map((f) => {

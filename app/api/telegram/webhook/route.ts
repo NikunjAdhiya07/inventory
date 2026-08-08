@@ -164,6 +164,7 @@ function newSession(
     stepIndex: 0,
     answers: {},
     locationCursor: { parentStack: [], currentParent: null },
+    categoryCursor: { parentStack: [], currentParent: null, matchedId: null },
     numberDraft: "",
     status: "active",
     processedUpdateIds: [],

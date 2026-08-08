@@ -7,6 +7,7 @@ export type StepType =
   | "product_select"
   | "category_select"
   | "subcategory_select"
+  | "category_tree"
   | "nested_select"
   | "location_tree"
   | "quantity"
@@ -27,9 +28,10 @@ export type StepConfig = {
   // item the user already named", which is what lets ONE workflow ask wire
   // questions for wire and pipe questions for pipe.
   tree?: string;
+  // category_tree / nested_select: open from the item name ("pipe" → Pipe).
   matchItem?: boolean;
-  // What to do when no tree matches the item: step aside, or ask the user which
-  // tree applies.
+  // What to do when no tree/category matches the item: step aside, or ask the
+  // user to pick from the full list.
   whenUnmatched?: "skip" | "ask";
   placeholder?: string;
   approvalMode?: "single" | "multi";
@@ -102,6 +104,15 @@ export type LocationCursor = {
   currentParent: string | null; // whose children are currently offered
 };
 
+// Same shape as LocationCursor: walks the Categories master until a leaf.
+// `matchedId` is the node opened from the item name (e.g. Pipe) so the prompt
+// can say so and Back can climb out of that landing cleanly.
+export type CategoryCursor = {
+  parentStack: string[];
+  currentParent: string | null;
+  matchedId?: string | null;
+};
+
 // Where a nested_select step has got to. Per-step scratch like `locationCursor`,
 // reset by `primeStep` on every entry into a step.
 export type NestedCursor = {
@@ -130,6 +141,7 @@ export type BotSession = {
   stepIndex: number;
   answers: Record<string, Answer>;
   locationCursor: LocationCursor;
+  categoryCursor?: CategoryCursor;
   nestedCursor?: NestedCursor;
   // Digits typed so far on a number step's inline keypad. Per-step scratch, like
   // `locationCursor` — reset by `primeStep` on every entry into a step. The

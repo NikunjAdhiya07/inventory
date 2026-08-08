@@ -73,6 +73,7 @@ export type RequestContext = {
 const DRAFT_PREFIXES = [
   "rq:cart",
   "rq:back",
+  "rq:again",
   "rq:new",
   "rq:pf:",
   "rq:pg:",
@@ -81,6 +82,9 @@ const DRAFT_PREFIXES = [
   "rq:q:",
   "rq:rm:",
   "rq:mv:",
+  "rq:cat:",
+  "rq:sub:",
+  "rq:iloc:",
 ];
 
 function isDraftCallback(data: string): boolean {
@@ -246,9 +250,9 @@ async function routeCallback(
     if (!isRequester) return { notice: "Only the person who opened this request can change it." };
     if (request.status !== "draft") return { notice: "This request has already been submitted." };
 
-    // Record movement needs Issue Inventory or Add Inventory; Request item stays
-    // on the existing Request Items permission (checked when submitting).
-    if (isMoveCallback(data) && (data === "rq:mv:rec" || data === "rq:mv:ok")) {
+    // Adding the completed flowchart line to cart uses the same permission as
+    // building a request; ledger write happens later on manager Accept.
+    if (isMoveCallback(data) && data === "rq:mv:ok") {
       if (!canRecordMovement(ctx.perms)) {
         return {
           notice: `Your role can't record stock movements. Ask an admin to grant "${PERM_ISSUE}" or "${PERM_ADD}".`,

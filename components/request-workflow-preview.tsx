@@ -12,49 +12,42 @@ export type PreviewStep = {
   icon: string;
 };
 
-/** Shared + movement path — used for step counts on the workflows list. */
+/** Default template steps — the live flowchart on this page is fully editable. */
 export const MOVE_WORKFLOW_STEPS: PreviewStep[] = [
   {
     id: "search",
     label: "Search",
     title: "Type an item name",
-    blurb: "In a Requests-mode Telegram group, anyone with Request Items types a product name. No slash command.",
+    blurb: "In a Requests-mode Telegram group, type a product name. No slash command. This step is a normal editable node in the flowchart.",
     icon: "🔍",
   },
   {
-    id: "intent",
-    label: "Choose action",
-    title: "Stock details · pick what to do",
-    blurb: "Bot shows on-hand by location. Record movement updates the ledger now; Request item builds a cart for a manager.",
-    icon: "⇄",
+    id: "location",
+    label: "Location",
+    title: "Select location",
+    blurb: "Configurable — pick a shelf. Admins can remove, rename, or reorder this node in the Movement flowchart.",
+    icon: "📍",
   },
   {
     id: "type",
-    label: "Movement type",
-    title: "Pick from Movement Master",
-    blurb: "Active non-system types from Movement Types — Stock In, Stock Out, Transfer. Inactive types stay hidden.",
+    label: "Movement",
+    title: "Select movement",
+    blurb: "Offers Movement Master types configured on the Select movement node (not a fixed Record vs Request fork).",
     icon: "📋",
   },
   {
     id: "fields",
-    label: "Answer fields",
-    title: "Only what that type needs",
-    blurb: "Location (or from/to), quantity pad, then reference/remarks when the type requires them. Optional fields are skipped.",
+    label: "Qty & questions",
+    title: "Quantity and custom fields",
+    blurb: "Qty pad, then any question nodes the admin added (plant, reason, etc.). Entirely driven by the flowchart.",
     icon: "⌨️",
   },
   {
-    id: "review",
-    label: "Review",
-    title: "Confirm the movement",
-    blurb: "Summary of type, qty, and locations. Confirm runs the same validation as the console (oversell blocked unless allowed).",
-    icon: "✅",
-  },
-  {
-    id: "done",
-    label: "Recorded",
-    title: "Ledger updated",
-    blurb: "Stock moves immediately. Confirmation shows new on-hand. Search again or close.",
-    icon: "📈",
+    id: "cart",
+    label: "Add to cart",
+    title: "Line goes into the cart",
+    blurb: "Terminal step adds the completed line to the cart. Submit later for a manager to Accept.",
+    icon: "🧺",
   },
 ];
 
@@ -528,14 +521,14 @@ function MovePhoneScreen({ step }: { step: number }) {
         <div style={{ ...cardLine, marginTop: 6 }}>
           <b>Stock In</b>
         </div>
-        <div style={cardMuted}>· Opening Stock · Return from Plant</div>
+        <div style={cardMuted}>· Return from Plant · Department Return</div>
         <div style={{ ...cardLine, marginTop: 4 }}>
           <b>Stock Out</b>
         </div>
         <div style={cardMuted}>· Issue to Plant · Damaged/Lost</div>
         <div style={{ ...btnRow, marginTop: 10 }}>
           <FakeBtn label="Return from Plant" primary pulse teal />
-          <FakeBtn label="Opening Stock" />
+          <FakeBtn label="Return from Plant" />
           <FakeBtn label="Issue to Plant" />
         </div>
       </BotCard>

@@ -12,6 +12,13 @@ import {
 import {
   activeRootCategories,
   activeCategoryChildrenByParentName,
+  activeCategories as allActiveCategories,
+  categoryAncestorChain,
+  categoryChildren,
+  categoryParentIds,
+  categoryPathFrom,
+  categoriesById,
+  matchCategory,
 } from "./categories";
 import { isDuplicateKeyError } from "./mongodb";
 import {
@@ -24,12 +31,12 @@ import {
 } from "./option-trees";
 import { findAlias, upsertAliases } from "./product-aliases";
 import { aliasesByProductId, productMatchesFuzzy, rankItemSuggestions, type MatchCandidate } from "./product-match";
-import { activeProducts } from "./product-store";
+import { activeProducts, ensureProductForEntry } from "./product-store";
 import { attributeValues, productLabel, type ProductAttribute } from "./products";
 import { receiptKey, recordMovement } from "./stock";
 import { buttonRows, downloadFileBytes, type InlineKeyboard } from "./telegram";
 import { nextTicketNumber } from "./ticket";
-import type { Answer, BotSession, NestedCursor, ProductSnapshot, StepInstance } from "./workflow-types";
+import type { Answer, BotSession, CategoryCursor, NestedCursor, ProductSnapshot, StepInstance } from "./workflow-types";
 
 export type RenderResult = { text: string; keyboard: InlineKeyboard };
 export type EngineResult = {
@@ -49,7 +56,7 @@ export type EngineResult = {
 // ---------------------------------------------------------------------------
 async function activeCategories(db: Db) {
   // Bot category_select shows roots only; nested nodes are picked via subcategory_select
-  // (or deeper nesting once workflows move to a full category_tree step).
+  // or the full category_tree step.
   return activeRootCategories(db);
 }
 
@@ -64,6 +71,83 @@ async function activeUnits(db: Db) {
 }
 
 // ---------------------------------------------------------------------------
+// Category tree (Categories master — Material → Type → Class → Size …)
+//
+// One step walks the same tree the console Categories screen edits. Typing
+// "pipe" opens under Pipe and shows every child; each tap drills one level
+// until a leaf is chosen. Unlike nested_select, there is no separate option
+// tree — the category adjacency list IS the drill-down.
+// ---------------------------------------------------------------------------
+function emptyCategoryCursor(): CategoryCursor {
+  return { parentStack: [], currentParent: null, matchedId: null };
+}
+
+function categoryCursorOf(session: BotSession): CategoryCursor {
+  return (session.categoryCursor ??= emptyCategoryCursor());
+}
+
+async function categoryOptions(db: Db, session: BotSession) {
+  return categoryChildren(db, categoryCursorOf(session).currentParent);
+}
+
+// Open the step under the category the item name matches (Pipe for "pipe"),
+// or at the roots when nothing matches and the author chose to ask.
+async function primeCategoryTree(db: Db, session: BotSession, step: StepInstance): Promise<"ok" | "skip"> {
+  const cursor = emptyCategoryCursor();
+  session.categoryCursor = cursor;
+
+  if (step.config.matchItem === false) return "ok";
+
+  const all = await allActiveCategories(db);
+  const matched = matchCategory(all, itemNameForTree(session));
+  if (matched) {
+    cursor.currentParent = matched._id.toString();
+    cursor.matchedId = cursor.currentParent;
+    return "ok";
+  }
+
+  if (String(step.config.whenUnmatched ?? "ask") === "skip") return "skip";
+  return "ok";
+}
+
+function categoryLevelLabel(children: Document[], fallback = "category"): string {
+  for (const c of children) {
+    const level = String(c.level ?? "").trim();
+    if (level) return level;
+  }
+  return fallback;
+}
+
+async function selectCategory(
+  db: Db,
+  session: BotSession,
+  step: StepInstance,
+  id: string
+): Promise<EngineResult> {
+  const byId = await categoriesById(db);
+  const chain = categoryAncestorChain(byId, id);
+  const path = chain.map((node) => ({
+    label: String(node.level ?? "").trim() || "Category",
+    value: String(node.name ?? ""),
+  }));
+  const leaf = byId.get(id);
+  // Carry default unit from the leaf (or nearest ancestor) so unit_select can
+  // still be skipped later if the workflow wants to prefer the category's unit.
+  const unitFromTree =
+    [...chain].reverse().map((n) => String(n.defaultUnit ?? "").trim()).find(Boolean) || "";
+
+  session.answers[step.instanceId] = {
+    type: "category_tree",
+    value: id,
+    display: categoryPathFrom(byId, id) || String(leaf?.name ?? id),
+    path,
+    ...(unitFromTree ? { tree: unitFromTree } : {}),
+  };
+  session.categoryCursor = emptyCategoryCursor();
+  return advance(db, session);
+}
+
+// ---------------------------------------------------------------------------
 // Product Master
 //
 // A catalogue is the one master that can outgrow a single inline keyboard, so
@@ -75,12 +159,20 @@ const PRODUCT_PAGE_SIZE = 8;
 
 async function productOptions(db: Db, session: BotSession, step: StepInstance): Promise<Document[]> {
   const all = await activeProducts(db);
-  const category = step.config.filterByCategory ? answerValue(session, "category_select") : undefined;
+  const category = step.config.filterByCategory ? categoryFilterValue(session) : undefined;
   const scoped = category ? all.filter((p) => String(p.category ?? "") === String(category)) : all;
   const query = session.productQuery ?? "";
   if (!query) return scoped;
   const aliasMap = await aliasesByProductId(db);
   return scoped.filter((p) => productMatchesFuzzy(p, query, aliasMap.get(p._id.toString()) || []));
+}
+
+function categoryFilterValue(session: BotSession): string | undefined {
+  const flat = answerValue(session, "category_select");
+  if (flat !== undefined && flat !== "") return String(flat);
+  const path = answerFor(session, "category_tree")?.path;
+  if (path?.length) return path[0].value;
+  return undefined;
 }
 
 function productAttributes(p: Document): ProductAttribute[] {
@@ -472,6 +564,7 @@ function currentStep(session: BotSession): StepInstance {
 function canGoBack(session: BotSession): boolean {
   const step = currentStep(session);
   if (step?.type === "location_tree" && session.locationCursor.currentParent !== null) return true;
+  if (step?.type === "category_tree" && categoryCursorOf(session).currentParent !== null) return true;
   // Inside a nested step, Back undoes the last level answered — and the tree
   // choice itself when the user was the one who made it.
   if (step?.type === "nested_select" && session.nestedCursor) {
@@ -821,17 +914,22 @@ async function commitItemName(
 
   let productId = opts.productId;
   let productName = name;
+  let productSnap: ProductSnapshot | undefined;
   if (!productId) {
     const products = await activeProducts(db);
     const hit = products.find((p) => String(p.name ?? "").toLowerCase() === name.toLowerCase());
     if (hit) {
       productId = hit._id.toString();
       productName = String(hit.name ?? name);
+      productSnap = productSnapshot(hit);
     }
   } else {
     try {
-      const p = await db.collection("products").findOne({ _id: new ObjectId(productId) }, { projection: { name: 1 } });
-      if (p?.name) productName = String(p.name);
+      const p = await db.collection("products").findOne({ _id: new ObjectId(productId) });
+      if (p) {
+        if (p.name) productName = String(p.name);
+        productSnap = productSnapshot(p);
+      }
     } catch {
       /* keep name */
     }
@@ -843,6 +941,12 @@ async function commitItemName(
     if (aliased?.productId) {
       productId = aliased.productId;
       productName = aliased.productName || name;
+      try {
+        const p = await db.collection("products").findOne({ _id: new ObjectId(productId) });
+        if (p) productSnap = productSnapshot(p);
+      } catch {
+        /* snapshot optional */
+      }
     }
   }
 
@@ -857,6 +961,12 @@ async function commitItemName(
     if (top?.productId && top.score >= 55) {
       productId = top.productId;
       productName = top.name;
+      try {
+        const p = await db.collection("products").findOne({ _id: new ObjectId(productId) });
+        if (p) productSnap = productSnapshot(p);
+      } catch {
+        /* snapshot optional */
+      }
     }
   }
 
@@ -865,6 +975,9 @@ async function commitItemName(
     value: name,
     display: name,
     imageFileId: opts.imageFileId || session.itemSuggest?.imageFileId || session.answers[step.instanceId]?.imageFileId,
+    // Carry the linked Product Master row forward so finalize can post stock
+    // without re-resolving when the user picked / matched an existing product.
+    ...(productSnap ? { product: productSnap } : {}),
   };
   const seedAliases = [...(opts.aliases ?? []), name, ...localReferenceExpansions(name), ...localReferenceExpansions(productName)];
   session.itemSuggest = undefined;
@@ -996,6 +1109,34 @@ export async function renderCurrentStep(db: Db, session: BotSession): Promise<Re
       return { text, keyboard: [...buttonRows(btns, 2), ...navRow(session)] };
     }
 
+    case "category_tree": {
+      const cursor = categoryCursorOf(session);
+      const [options, parents, byId] = await Promise.all([
+        categoryOptions(db, session),
+        categoryParentIds(db),
+        categoriesById(db),
+      ]);
+      const here = cursor.currentParent ? categoryPathFrom(byId, cursor.currentParent) : "";
+      const levelName = categoryLevelLabel(options, here ? "next" : "category");
+      const btns = options.map((c, i) => ({
+        text: `${parents.has(c._id.toString()) ? "📁" : "🏷"} ${c.name}`,
+        callback_data: `ctree:${i}`,
+      }));
+      const rows: InlineKeyboard = buttonRows(btns, 2);
+      // A branch can be the answer when the branch itself is stockable — rare,
+      // but matches location_tree so the user is never stuck without a leaf.
+      if (cursor.currentParent !== null) {
+        rows.push([{ text: `✔ Select this ${levelName.toLowerCase()}`, callback_data: "ctreesel" }]);
+      }
+      const heading = here
+        ? `${label}\n<b>${escHtml(here)}</b>\n<i>Select ${escHtml(levelName)} — all ${options.length} shown</i>`
+        : `${label}\n<i>Select ${escHtml(levelName)} — all ${options.length} shown</i>`;
+      const empty = options.length
+        ? heading
+        : `${heading}\n<i>No categories under here. Use ✔ to select this level, or Back.</i>`;
+      return { text: empty, keyboard: [...rows, ...navRow(session)] };
+    }
+
     case "nested_select":
       return renderNested(db, session, step);
 
@@ -1125,6 +1266,7 @@ export async function applyCallback(db: Db, session: BotSession, data: string): 
     // Skip on a nested step abandons the whole drill-down, not just the level on
     // screen — partial levels would be a half-described item.
     session.nestedCursor = emptyNestedCursor();
+    session.categoryCursor = emptyCategoryCursor();
     return advance(db, session);
   }
 
@@ -1190,6 +1332,32 @@ export async function applyCallback(db: Db, session: BotSession, data: string): 
       if (!s) return { notice: "That option is no longer available." };
       session.answers[step.instanceId] = { type: "subcategory_select", value: String(s.name), display: String(s.name) };
       return advance(db, session);
+    }
+
+    case "category_tree": {
+      if (data === "ctreesel") {
+        const chosen = categoryCursorOf(session).currentParent;
+        if (!chosen) return { notice: "Pick a category first." };
+        return selectCategory(db, session, step, chosen);
+      }
+
+      const options = await categoryOptions(db, session);
+      const chosen = options[indexOf(data, "ctree:")];
+      if (!chosen) return { notice: "That category is no longer available." };
+
+      const chosenId = chosen._id.toString();
+      const parents = await categoryParentIds(db);
+      // A leaf can only ever be the answer — selecting it finishes the step.
+      if (!parents.has(chosenId)) return selectCategory(db, session, step, chosenId);
+
+      const cursor = categoryCursorOf(session);
+      if ((chosen.parent ?? null) === cursor.currentParent) {
+        if (cursor.currentParent) cursor.parentStack.push(cursor.currentParent);
+      } else {
+        cursor.parentStack = [];
+      }
+      cursor.currentParent = chosenId;
+      return { render: await renderCurrentStep(db, session) };
     }
 
     case "unit_select": {
@@ -1288,6 +1456,8 @@ export async function primeStep(db: Db, session: BotSession) {
   // A nested step always re-opens at the top of its tree: the tree itself is
   // re-resolved from the item, which may have changed since the last visit.
   session.nestedCursor = emptyNestedCursor();
+  // Category tree is re-matched from the item name on every entry into the step.
+  session.categoryCursor = emptyCategoryCursor();
   const step = currentStep(session);
   if (!step) return;
 
@@ -1299,9 +1469,15 @@ export async function primeStep(db: Db, session: BotSession) {
       ? String(prior)
       : "";
 
-  if (step.type !== "location_tree") return;
-  const node = await defaultLocationNode(db, step);
-  if (node) session.locationCursor.currentParent = node._id.toString();
+  if (step.type === "location_tree") {
+    const node = await defaultLocationNode(db, step);
+    if (node) session.locationCursor.currentParent = node._id.toString();
+    return;
+  }
+
+  if (step.type === "category_tree") {
+    await primeCategoryTree(db, session, step);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -1312,6 +1488,7 @@ async function advance(db: Db, session: BotSession): Promise<EngineResult> {
 
   if (session.stepIndex >= session.steps.length) {
     session.locationCursor = { parentStack: [], currentParent: null };
+    session.categoryCursor = emptyCategoryCursor();
     return finalize(db, session);
   }
 
@@ -1322,6 +1499,16 @@ async function advance(db: Db, session: BotSession): Promise<EngineResult> {
   if (next.type === "approval") {
     session.status = "awaiting_approval";
     session.approval = { stepInstanceId: next.instanceId, awaitingRole: String(next.config.approverRole || "Admin") };
+  }
+  if (next.type === "category_tree") {
+    // No category matched the item and the author chose to step aside.
+    if (String(next.config.whenUnmatched ?? "ask") === "skip" && next.config.matchItem !== false) {
+      const all = await allActiveCategories(db);
+      if (!matchCategory(all, itemNameForTree(session))) {
+        session.answers[next.instanceId] = { type: "category_tree", value: "", display: "(skipped)" };
+        return advance(db, session);
+      }
+    }
   }
   if (next.type === "nested_select") {
     // Nothing to ask about this item — record it as skipped and keep going, so a
@@ -1341,6 +1528,13 @@ async function goBack(db: Db, session: BotSession): Promise<EngineResult> {
   // Within the location tree, Back climbs one level before leaving the step.
   if (step?.type === "location_tree" && session.locationCursor.currentParent !== null) {
     session.locationCursor.currentParent = session.locationCursor.parentStack.pop() ?? null;
+    return { render: await renderCurrentStep(db, session) };
+  }
+  // Within the category tree, Back climbs one level (Pipe ← PVC ← …) before
+  // leaving the step. From the matched landing (e.g. Pipe), Back shows roots.
+  if (step?.type === "category_tree" && categoryCursorOf(session).currentParent !== null) {
+    const cursor = categoryCursorOf(session);
+    cursor.currentParent = cursor.parentStack.pop() ?? null;
     return { render: await renderCurrentStep(db, session) };
   }
   // Within a nested step, Back undoes one level at a time before leaving it.
@@ -1486,21 +1680,41 @@ async function finalize(db: Db, session: BotSession): Promise<EngineResult> {
     // A nested step captured several named details, and each one is a field of
     // the entry in its own right: the ticket says "Colour: Red", not a single
     // opaque "Copper › Flexible › Red › 2.5 sq mm".
-    if (s.type === "nested_select") {
+    if (s.type === "nested_select" || s.type === "category_tree") {
       for (const level of a.path ?? []) custom[uniqueKey(custom, level.label)] = level.value;
     }
   }
 
   const itemAnswer = answerFor(session, "item_capture");
-  const product = answerFor(session, "product_select")?.product;
+  let product = answerFor(session, "product_select")?.product ?? itemAnswer?.product;
 
   // A product step supplies facts the entry would otherwise have to ask for
   // twice. An explicit answer always wins; the product only fills what the
   // workflow never asked, so a captured entry is complete either way.
   const itemName = String(itemAnswer?.value || product?.name || "");
-  const category = String(answerValue(session, "category_select") ?? product?.category ?? "");
-  const subcategory = String(answerValue(session, "subcategory_select") ?? product?.subcategory ?? "");
-  const unit = String(answerValue(session, "unit_select") ?? product?.unit ?? "");
+  const categoryTree = answerFor(session, "category_tree");
+  const categoryPath = categoryTree?.path ?? [];
+  // Prefer the full Categories drill-down; fall back to the legacy two-step
+  // category + subcategory picks (and then the product snapshot).
+  const category = String(
+    answerValue(session, "category_select") ??
+      categoryPath[0]?.value ??
+      product?.category ??
+      ""
+  );
+  const subcategory = String(
+    answerValue(session, "subcategory_select") ??
+      categoryPath[1]?.value ??
+      (categoryPath.length > 1 ? categoryPath[categoryPath.length - 1]?.value : "") ??
+      product?.subcategory ??
+      ""
+  );
+  const unit = String(
+    answerValue(session, "unit_select") ??
+      (typeof categoryTree?.tree === "string" ? categoryTree.tree : "") ??
+      product?.unit ??
+      ""
+  );
   // One shape for a quantity: a number, or null when the workflow never asked.
   // It used to land as "" on a workflow without a quantity step and as a number
   // otherwise, so anything reading entries had to handle both.
@@ -1510,6 +1724,40 @@ async function finalize(db: Db, session: BotSession): Promise<EngineResult> {
 
   const now = new Date();
   const ticketNumber = await nextTicketNumber(db, now);
+
+  // Default entry workflows capture a free-text item name (item_capture) rather
+  // than a Product Master pick. Search and the stock ledger are product-keyed,
+  // so resolve or create a product BEFORE writing the entry — otherwise the
+  // ticket is durable but invisible to the Search group and never posts stock.
+  if (!product && itemName) {
+    const ensured = await ensureProductForEntry(db, {
+      name: itemName,
+      ticketNumber,
+      category,
+      subcategory,
+      unit,
+    });
+    if (ensured) {
+      product = {
+        id: ensured.id,
+        name: ensured.name,
+        productNumber: ensured.productNumber,
+        category: ensured.category || category,
+        subcategory: ensured.subcategory || subcategory,
+        unit: ensured.unit || unit,
+        attributes: ensured.attributes,
+      };
+      // Keep learning reference names for the newly linked / created product.
+      defer(async () => {
+        const expanded = await expandReferenceNames(ensured.name, [
+          itemName,
+          ...localReferenceExpansions(itemName),
+          ...localReferenceExpansions(ensured.name),
+        ]);
+        await upsertAliases(db, ensured.id, ensured.name, expanded, "ai");
+      });
+    }
+  }
 
   const entry = {
     ticketNumber,
@@ -1538,6 +1786,12 @@ async function finalize(db: Db, session: BotSession): Promise<EngineResult> {
         : {}),
       category,
       subcategory,
+      ...(categoryTree && categoryTree.value
+        ? {
+            categoryId: String(categoryTree.value),
+            categoryPath: String(categoryTree.display ?? ""),
+          }
+        : {}),
       locationId: String(answerValue(session, "location_tree") ?? ""),
       locationPath: answerDisplay(session, "location_tree") ?? "",
       quantity,
@@ -1573,18 +1827,19 @@ async function finalize(db: Db, session: BotSession): Promise<EngineResult> {
   }
   session.status = "completed";
 
-  // A completed entry is stock arriving, so it posts to the ledger the request
-  // bot reads. The movement key is derived from the ticket number, so a retry
-  // that got this far a second time writes the same row and the index keeps one.
+  // A completed entry is stock arriving, so it posts to the ledger the search /
+  // request bot reads. The movement key is derived from the ticket number, so a
+  // retry that got this far a second time writes the same row and the index
+  // keeps one.
   //
   // Awaited so a frozen instance cannot drop it, but a failure is logged rather
   // than thrown: the entry row is already durable and the user is watching for
   // their ticket, so the recoverable outcome is a missing balance that
   // `scripts/backfill-stock.mjs` can replay — not a confirmation that never came.
   //
-  // A workflow with no product step, no location or no quantity cannot post —
-  // there is nothing to add, nowhere to add it, or no amount to add. Those
-  // entries stay a record of what happened without pretending to be a balance.
+  // Needs product + location + quantity. Product is now resolved above for
+  // item_capture workflows; without location or qty there is nowhere / nothing
+  // to add, and the entry stays a record without pretending to be a balance.
   if (product && entry.fields.locationId && quantity !== null && quantity > 0) {
     await recordMovement(db, {
       movementKey: receiptKey(ticketNumber),
@@ -1666,6 +1921,10 @@ function summaryText(session: BotSession): string {
       for (const level of a.path) lines.push(`• <b>${escHtml(level.label)}:</b> ${escHtml(level.value)}`);
       continue;
     }
+    if (s.type === "category_tree" && a.path?.length) {
+      for (const level of a.path) lines.push(`• <b>${escHtml(level.label)}:</b> ${escHtml(level.value)}`);
+      continue;
+    }
     const label = s.label.replace(/[:：]\s*$/, "");
     lines.push(`• <b>${shortLabel(label, s.type)}:</b> ${a.display}`);
     // A product's attributes ARE the product for a user checking their entry —
@@ -1685,6 +1944,7 @@ function shortLabel(label: string, type: string): string {
     product_select: "Product",
     category_select: "Category",
     subcategory_select: "Subcategory",
+    category_tree: "Category",
     nested_select: "Details",
     location_tree: "Location",
     quantity: "Quantity",

@@ -7,7 +7,7 @@ import { withErrors } from "@/lib/api-error";
 // Prefer children already folded into `categories`; fall back to the legacy
 // `subcategories` collection until migrate-category-tree has been applied.
 
-async function GET() {
+async function list() {
   const db = await getDb();
   const treeKids = await db
     .collection("categories")
@@ -32,12 +32,12 @@ async function GET() {
   return NextResponse.json(toClientList(legacy));
 }
 
-async function POST() {
+async function create() {
   return NextResponse.json(
     { error: "Subcategories are part of the category tree. Add a child under Categories." },
     { status: 410 }
   );
 }
 
-export const GET = withErrors(GET);
-export const POST = withErrors(POST);
+export const GET = withErrors(list);
+export const POST = withErrors(create);

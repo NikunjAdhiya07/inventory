@@ -178,8 +178,8 @@ async function main() {
   await db.collection("requests").deleteMany({ chatId: String(CHAT), requesterUserId: String(STORE_ID) });
 
   // Ensure movement types exist
-  const opening = await db.collection("movementTypes").findOne({ code: "opening-stock" });
-  check("fixture: opening-stock type exists", Boolean(opening), "run seed:movement-types");
+  const ret = await db.collection("movementTypes").findOne({ code: "return-from-plant" });
+  check("fixture: return-from-plant type exists", Boolean(ret), "run seed:movement-types");
   const transfer = await db.collection("movementTypes").findOne({ code: "bin-transfer" });
   check("fixture: bin-transfer type exists", Boolean(transfer));
 
@@ -203,7 +203,7 @@ async function main() {
   check("2. product opened (intent screen)", req?.ui?.focusProductId === productId, String(req?.ui?.focusProductId));
   check("2. intent not yet chosen", !req?.ui?.intent);
 
-  // ---- 2. Record movement → Opening Stock --------------------------------
+  // ---- 2. Record movement → Return from Plant ----------------------------
   await tap(CHAT, STORE_ID, "rq:mv:rec", anchor);
   req = await draft();
   check("3. entered move flow", req?.ui?.intent === "move" && req?.ui?.moveStage === "type", JSON.stringify({ intent: req?.ui?.intent, stage: req?.ui?.moveStage }));
@@ -217,12 +217,12 @@ async function main() {
   for (const d of ["in", "out", "transfer"]) {
     for (const t of manual.filter((x) => x.direction === d)) flat.push(t);
   }
-  const openingIdx = flat.findIndex((t) => t.code === "opening-stock");
-  check("3. opening-stock in picker", openingIdx >= 0, `idx=${openingIdx}`);
+  const returnIdx = flat.findIndex((t) => t.code === "return-from-plant");
+  check("3. return-from-plant in picker", returnIdx >= 0, `idx=${returnIdx}`);
 
-  await tap(CHAT, STORE_ID, `rq:mv:t:${openingIdx}`, anchor);
+  await tap(CHAT, STORE_ID, `rq:mv:t:${returnIdx}`, anchor);
   req = await draft();
-  check("4. type chosen → location", req?.ui?.moveTypeCode === "opening-stock" && req?.ui?.moveStage === "location", JSON.stringify(req?.ui));
+  check("4. type chosen → location", req?.ui?.moveTypeCode === "return-from-plant" && req?.ui?.moveStage === "location", JSON.stringify(req?.ui));
 
   // Root location A is a leaf — tapping loc:0 should select it if it's first child of root
   const rootChildren = await db
@@ -254,7 +254,7 @@ async function main() {
   check("7. confirmed → done", req?.ui?.moveStage === "done", String(req?.ui?.moveStage));
   const after = await onHand(productId, req.ui.moveLocationId || locAId);
   check("7. stock increased by 10", after === before + 10, `before=${before} after=${after}`);
-  const mv = await db.collection("stockMovements").findOne({ productId, reason: "opening-stock" }, { sort: { createdAt: -1 } });
+  const mv = await db.collection("stockMovements").findOne({ productId, reason: "return-from-plant" }, { sort: { createdAt: -1 } });
   check("7. history row written", Boolean(mv) && mv.qty === 10, JSON.stringify(mv && { qty: mv.qty, reason: mv.reason }));
 
   // ---- 3. oversell blocked ------------------------------------------------

@@ -64,10 +64,30 @@ export type RequestLine = {
   locationPath: string;
   qty: number;
   unit: string;
+  // Movement snapshot when the line came from a search-group flowchart (e.g. Vendor Replacement).
+  movementCode?: string;
+  movementName?: string;
+  vendorId?: string;
+  vendorName?: string;
+  departmentId?: string;
+  departmentName?: string;
+  reference?: string;
+  answers?: { label: string; display: string }[];
+  /** Snapshotted Movement Master direction for Accept ledger posting. */
+  movementDirection?: "in" | "out" | "transfer" | "adjust";
+  /**
+   * New Purchase receipt intent. `expected` = ordered only (no stock on Accept);
+   * `received` = goods arrived (stock-in on Accept).
+   */
+  purchaseStatus?: "expected" | "received";
+  /**
+   * LOV option stock effect from a List question (overrides movementDirection on Accept).
+   */
+  stockEffect?: "stock_in" | "stock_out";
   // Set when the manager accepts. A line can be refused on its own — the store
   // has one of the three things asked for — so the outcome lives per line rather
   // than only on the ticket.
-  outcome?: "issued" | "unavailable";
+  outcome?: "issued" | "unavailable" | "recorded";
 };
 
 // What a purchase ticket is asking to buy. Free text by necessity: the whole
@@ -96,15 +116,14 @@ export type RequestEvent = {
   what: string;
 };
 
-// Where the stock-movement sub-flow has got to after the user picks an item and
-// taps Record movement. Driven by the Movement Master type they choose — the
-// bot asks only the fields that type needs, in order.
+// Legacy stage names kept for older drafts mid-flight; new flows use flowNodeId.
 export type MoveStage =
   | "type"
   | "location"
   | "from"
   | "to"
   | "qty"
+  | "question"
   | "reference"
   | "remarks"
   | "review"
@@ -119,18 +138,37 @@ export type RequestUi = {
   // Null when they are looking at the results list.
   focusProductId?: string | null;
   focusLocationId?: string | null;
+  // When a search hits products in several categories (e.g. "pipe"), the bot
+  // walks the Categories tree from the chosen match down to a leaf before
+  // listing products. `categoryPath` is the name trail (e.g. MS Pipe › Round › …).
+  // focusCategory / focusSubcategory stay in sync for older drafts (path[0] / path[1]).
+  categoryPath?: string[];
+  focusCategory?: string | null;
+  focusSubcategory?: string | null;
+  // After a product is opened, if it sits in multiple locations the bot asks
+  // which shelf before continuing the configured workflow.
+  intentLocationPicked?: boolean;
   qtyDraft?: string;
-  // After opening a product: null shows stock + intent buttons (Record movement
-  // vs Request item). "request" continues the cart path; "move" the ledger path.
+  // Cursor into the configurable search-move flowchart (Workflows page).
+  flowNodeId?: string | null;
+  // Legacy: older drafts may still carry intent/moveStage mid-conversation.
   intent?: "request" | "move" | null;
   moveStage?: MoveStage | null;
   moveTypeCode?: string | null;
   moveLocationId?: string | null;
   moveFromLocationId?: string | null;
   moveToLocationId?: string | null;
+  moveVendorId?: string | null;
+  moveVendorName?: string | null;
+  moveDepartmentId?: string | null;
+  moveDepartmentName?: string | null;
   moveQtyDraft?: string;
   moveReference?: string;
   moveRemarks?: string;
+  // Answers to flowchart question nodes (and Movement Type extras).
+  moveQuestionIndex?: number;
+  moveAnswers?: Record<string, { value: string | number | boolean; display: string }>;
+  moveNumberDraft?: string;
   // Free-text capture for the purchase flow, one field at a time.
   purchaseField?: "name" | "qty" | "unit" | "note" | null;
   // Cursor for the location tree shown when a purchased item is received into

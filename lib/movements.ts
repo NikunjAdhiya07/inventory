@@ -3,6 +3,7 @@ import { randomUUID } from "node:crypto";
 import { cached } from "./cache";
 import { locationPathById, locationsByIdForPaths, locationPathFrom } from "./locations";
 import { onHandLive, recordMovement, recordMovements, type StockMovement } from "./stock";
+import { normalizeQuestions, type MoveAnswer, type MoveQuestion } from "./movement-questions";
 
 // Stock movement types — the configurable vocabulary of WHY stock moved.
 //
@@ -21,6 +22,8 @@ import { onHandLive, recordMovement, recordMovements, type StockMovement } from 
 //     purchase is meaningless without an invoice number.
 //   • `allowNegative` is the explicit permission in AC-08: without it, stock
 //     cannot be taken out beyond what is on hand.
+//   • `questions` is the configurable Telegram workflow: boolean / string /
+//     number / select prompts built on the Workflows page.
 //
 // `isSystem` marks the types the SOFTWARE writes — an entry-bot receipt, a
 // request issue, a storage-map count correction. They are real types (history
@@ -39,6 +42,7 @@ export type MovementType = {
   // Out only: permit taking more than is on hand (a negative balance), for the
   // organisations that reconcile later rather than blocking the storekeeper.
   allowNegative: boolean;
+  questions: MoveQuestion[];
   isSystem: boolean;
   order: number;
   status: string;
@@ -53,6 +57,7 @@ export type RecordMovementInput = {
   toLocationId?: string; // transfer
   remarks?: string;
   reference?: string;
+  answers?: MoveAnswer[];
   by: string;
 };
 
@@ -87,6 +92,7 @@ export function toMovementType(doc: Document): MovementType {
     requireRemarks: Boolean(doc.requireRemarks),
     requireReference: Boolean(doc.requireReference),
     allowNegative: Boolean(doc.allowNegative),
+    questions: normalizeQuestions(doc.questions),
     isSystem: Boolean(doc.isSystem),
     order: Number(doc.order) || 0,
     status: String(doc.status ?? "Active"),
@@ -120,6 +126,7 @@ export function normalizeMovementTypeInput(body: Record<string, unknown>) {
     // Only an outward movement can be permitted to go below zero; carrying the
     // flag on an inward type would read as a rule that does nothing.
     allowNegative: direction === "out" && Boolean(body.allowNegative),
+    questions: normalizeQuestions(body.questions),
     order: Number(body.order) || 0,
     status: body.status === "Inactive" ? "Inactive" : "Active",
   };
@@ -163,6 +170,16 @@ export async function recordStockMovement(db: Db, input: RecordMovementInput): P
   if (type.requireRemarks && !remarks) return { ok: false, status: 400, error: `“${type.name}” needs remarks.` };
   if (type.requireReference && !reference) {
     return { ok: false, status: 400, error: `“${type.name}” needs a reference (document / ticket number).` };
+  }
+
+  // Configurable workflow answers — every required question must be present.
+  const answers = Array.isArray(input.answers) ? input.answers : [];
+  for (const q of type.questions) {
+    if (!q.required) continue;
+    const a = answers.find((x) => x.id === q.id);
+    if (!a || a.display === "" || a.value === undefined || a.value === null) {
+      return { ok: false, status: 400, error: `“${q.label}” is required.` };
+    }
   }
 
   const transfer = type.direction === "transfer";
@@ -217,6 +234,7 @@ export async function recordStockMovement(db: Db, input: RecordMovementInput): P
     createdAt: new Date().toISOString(),
     ...(remarks ? { remarks } : {}),
     ...(reference ? { reference } : {}),
+    ...(answers.length ? { answers } : {}),
   };
 
   // One id ties the legs of a transfer together, and gives an in/out movement a

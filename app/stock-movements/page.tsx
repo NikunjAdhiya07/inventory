@@ -293,7 +293,7 @@ export default function StockMovementsPage() {
                     </span>
                   ))}
                   {item.lines.length === 0 ? (
-                    <span style={{ fontSize: 12.5, color: "#98a4bd" }}>Nothing on hand anywhere yet — record an Opening Stock or a purchase to put some in.</span>
+                    <span style={{ fontSize: 12.5, color: "#98a4bd" }}>Nothing on hand anywhere yet — receive stock via the Entries bot, or record a purchase / return.</span>
                   ) : null}
                 </div>
               </section>

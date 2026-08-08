@@ -1,5 +1,6 @@
 import { ObjectId, type Db, type Document } from "mongodb";
-import { cached } from "./cache";
+import { cached, invalidateCollection } from "./cache";
+import { isDuplicateKeyError } from "./mongodb";
 import { MAX_ATTRIBUTES, normalizeAttributes, productNumberKey, trimmed, type ProductAttribute } from "./products";
 
 // Server-side Product Master access. Kept out of `lib/products.ts` so that the
@@ -73,6 +74,119 @@ export async function activeProducts(db: Db): Promise<Document[]> {
   return cached("products:active", () =>
     db.collection("products").find({ status: "Active" }).sort({ name: 1, productNumber: 1 }).toArray()
   );
+}
+
+// Find an Active product by name, ignoring case and surrounding whitespace.
+// Used when a Telegram entry typed a free-text item name that should still
+// land on Product Master (and therefore be searchable from the Search group).
+export async function findActiveProductByName(db: Db, name: string): Promise<Document | null> {
+  const needle = name.trim().toLowerCase();
+  if (!needle) return null;
+  const products = await activeProducts(db);
+  return products.find((p) => String(p.name ?? "").trim().toLowerCase() === needle) ?? null;
+}
+
+// Ensure a Product Master row exists for a free-text inventory entry. The
+// ledger and Search group are product-keyed — without this, a completed entry
+// that only captured an item name never appears in search and never posts stock.
+//
+// Reuses an existing Active product of the same name (case-insensitive) when
+// one exists; otherwise creates an AUTO- numbered product stamped with the
+// entry's category / unit so the catalogue is immediately usable.
+export async function ensureProductForEntry(
+  db: Db,
+  opts: {
+    name: string;
+    ticketNumber: string;
+    category?: string;
+    subcategory?: string;
+    unit?: string;
+  }
+): Promise<{ id: string; name: string; productNumber: string; category: string; subcategory: string; unit: string; attributes: ProductAttribute[] } | null> {
+  const name = trimmed(opts.name, 120);
+  if (!name) return null;
+
+  const existing = await findActiveProductByName(db, name);
+  if (existing) {
+    return {
+      id: existing._id.toString(),
+      name: String(existing.name ?? name),
+      productNumber: String(existing.productNumber ?? ""),
+      category: String(existing.category ?? ""),
+      subcategory: String(existing.subcategory ?? ""),
+      unit: String(existing.unit ?? ""),
+      attributes: Array.isArray(existing.attributes)
+        ? (existing.attributes as ProductAttribute[]).filter((a) => a?.name && a?.value)
+        : [],
+    };
+  }
+
+  const productNumber = `AUTO-${opts.ticketNumber}`;
+  const now = new Date().toISOString();
+  const category = trimmed(opts.category, 120);
+  const subcategory = trimmed(opts.subcategory, 120);
+  const unit = trimmed(opts.unit, 120);
+  const doc = {
+    name,
+    productNumber,
+    productNumberKey: productNumberKey(productNumber),
+    category,
+    subcategory,
+    unit,
+    desc: `Created automatically from inventory entry ${opts.ticketNumber}.`,
+    attributes: [] as ProductAttribute[],
+    status: "Active" as const,
+    createdAt: now,
+    updatedAt: now,
+  };
+
+  try {
+    const res = await db.collection("products").insertOne(doc as never);
+    // Search reads the catalogue from cache; without this the new product is
+    // invisible until the TTL lapses.
+    invalidateCollection("products");
+    return {
+      id: res.insertedId.toString(),
+      name,
+      productNumber,
+      category,
+      subcategory,
+      unit,
+      attributes: [],
+    };
+  } catch (err) {
+    if (!isDuplicateKeyError(err)) throw err;
+    // Two entries finishing at once minted the same AUTO number, or a product
+    // of this name landed between the read and the write. Prefer the name match
+    // (same physical item) then fall back to the raced AUTO row.
+    const byName = await findActiveProductByName(db, name);
+    if (byName) {
+      return {
+        id: byName._id.toString(),
+        name: String(byName.name ?? name),
+        productNumber: String(byName.productNumber ?? ""),
+        category: String(byName.category ?? ""),
+        subcategory: String(byName.subcategory ?? ""),
+        unit: String(byName.unit ?? ""),
+        attributes: Array.isArray(byName.attributes)
+          ? (byName.attributes as ProductAttribute[]).filter((a) => a?.name && a?.value)
+          : [],
+      };
+    }
+    const raced = await db.collection("products").findOne({ productNumberKey: productNumberKey(productNumber) });
+    if (!raced) return null;
+    return {
+      id: raced._id.toString(),
+      name: String(raced.name ?? name),
+      productNumber: String(raced.productNumber ?? productNumber),
+      category: String(raced.category ?? ""),
+      subcategory: String(raced.subcategory ?? ""),
+      unit: String(raced.unit ?? ""),
+      attributes: Array.isArray(raced.attributes)
+        ? (raced.attributes as ProductAttribute[]).filter((a) => a?.name && a?.value)
+        : [],
+    };
+  }
 }
 
 // Audit-trail rendering: attributes are a nested array, and the generic
