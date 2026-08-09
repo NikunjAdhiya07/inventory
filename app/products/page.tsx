@@ -26,6 +26,7 @@ import { useSort } from "@/lib/use-sort";
 import { MAX_ATTRIBUTES, productMatches, type Product, type ProductAttribute, type ProductAttributeDef } from "@/lib/products";
 
 type Named = { id: string; name: string };
+type CatNode = { id: string; name: string; parent: string | null };
 type SubRef = { id: string; name: string; parent: string };
 
 type Form = {
@@ -45,7 +46,7 @@ const CUSTOM = "__custom__";
 export default function ProductsPage() {
   const [products, setProducts] = useState<Product[]>([]);
   const [defs, setDefs] = useState<ProductAttributeDef[]>([]);
-  const [categories, setCategories] = useState<Named[]>([]);
+  const [categories, setCategories] = useState<CatNode[]>([]);
   const [subcategories, setSubcategories] = useState<SubRef[]>([]);
   const [units, setUnits] = useState<Named[]>([]);
   const [loading, setLoading] = useState(true);
@@ -70,7 +71,7 @@ export default function ProductsPage() {
     Promise.all([
       api.get<Product[]>("/api/products"),
       api.get<ProductAttributeDef[]>("/api/product-attributes"),
-      api.get<Named[]>("/api/categories"),
+      api.get<CatNode[]>("/api/categories"),
       api.get<SubRef[]>("/api/subcategories"),
       api.get<Named[]>("/api/units"),
     ])
@@ -184,7 +185,15 @@ export default function ProductsPage() {
     if (id) await api.del(`/api/products/${id}`);
   }
 
-  const subsForCategory = form.category ? subcategories.filter((s) => s.parent === form.category) : subcategories;
+  const rootCategories = categories.filter((c) => (c.parent ?? null) === null);
+  const parentRoot = form.category ? rootCategories.find((c) => c.name === form.category) : null;
+  const treeSubs = parentRoot ? categories.filter((c) => c.parent === parentRoot.id) : [];
+  const subsForCategory =
+    treeSubs.length > 0
+      ? treeSubs
+      : form.category
+        ? subcategories.filter((s) => s.parent === form.category)
+        : subcategories;
   const activeCount = products.filter((p) => p.status === "Active").length;
 
   return (
@@ -217,7 +226,7 @@ export default function ProductsPage() {
               style={{ padding: "7px 10px", border: "1px solid #dfe5ee", borderRadius: 8, fontSize: 12.5, background: "#fbfcfe", color: "#3a4a68" }}
             >
               <option value="">All categories</option>
-              {categories.map((c) => (
+              {rootCategories.map((c) => (
                 <option key={c.id} value={c.name}>
                   {c.name}
                 </option>
@@ -332,7 +341,7 @@ export default function ProductsPage() {
                   style={{ ...inputStyle, background: "#fff" }}
                 >
                   <option value="">—</option>
-                  {categories.map((c) => (
+                  {rootCategories.map((c) => (
                     <option key={c.id} value={c.name}>
                       {c.name}
                     </option>

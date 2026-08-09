@@ -1,4 +1,5 @@
-// Loads the real v1 master data (categories, subcategories, locations) into
+// Loads the real v1 master data (category tree, locations) into
+// Mongo as a one-shot replace of those collections.
 // MongoDB, REPLACING whatever is currently in those three collections.
 // Run with: node scripts/seed-real-data.mjs
 import { MongoClient } from "mongodb";
@@ -153,7 +154,6 @@ async function main() {
   console.log("cleared categories, subcategories, locations");
 
   const categories = db.collection("categories");
-  const subcategories = db.collection("subcategories");
   const locations = db.collection("locations");
 
   let order = 1;
@@ -162,34 +162,40 @@ async function main() {
   let subInserted = 0;
   for (const [name, icon, code, priority, subCount, named] of CATEGORY_DATA) {
     const fullName = `${icon} ${name}`;
-    await categories.insertOne({
+    const result = await categories.insertOne({
       name: fullName,
       code,
       desc: "",
       defaultUnit: "Pieces",
+      parent: null,
+      level: "Category",
       order: order++,
       priority,
       color: PALETTE[(order - 1) % PALETTE.length],
       status: "Active",
-      subCount,
       refCount: 0,
     });
     catInserted += 1;
+    const parentId = result.insertedId.toString();
 
     subOrder = 0;
     for (const subName of named) {
-      await subcategories.insertOne({
+      await categories.insertOne({
         name: subName,
-        parent: fullName,
+        parent: parentId,
+        code: "",
         desc: "",
+        level: "Subcategory",
+        defaultUnit: "Pieces",
+        color: PALETTE[(order - 1) % PALETTE.length],
         order: ++subOrder,
         status: "Active",
+        refCount: 0,
       });
       subInserted += 1;
     }
   }
-  console.log(`seeded categories: ${catInserted} docs (${CATEGORY_DATA.reduce((a, c) => a + c[4], 0)} real subcategory total)`);
-  console.log(`seeded subcategories: ${subInserted} named docs`);
+  console.log(`seeded category tree: ${catInserted} roots + ${subInserted} nested (${CATEGORY_DATA.reduce((a, c) => a + c[4], 0)} real subcategory total)`);
 
   const locCount = await insertTree(locations, LOCATION_TREE, null);
   console.log(`seeded locations: ${locCount} docs`);

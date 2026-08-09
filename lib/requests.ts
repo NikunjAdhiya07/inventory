@@ -3,6 +3,7 @@ import { cached, invalidateCollection } from "./cache";
 import { isDuplicateKeyError } from "./mongodb";
 import { productNumberKey } from "./products";
 import { issueKey, onHandLive, recordMovements, returnKey, type StockMovement } from "./stock";
+import { findOutboundShortage, isInboundMovement, persistOutboundShortage } from "./outbound-stock";
 import { nextTicketNumber, TicketSeries } from "./ticket";
 import {
   isTerminal,
@@ -181,6 +182,43 @@ export async function submitInventoryRequest(db: Db, request: ItemRequest): Prom
   if (request.status !== "draft") return { ok: false, reason: "This request has already been submitted." };
   if (!request.lines.length) return { ok: false, reason: "Add at least one item first." };
 
+  // Live re-check outbound lines so a stale cart cannot submit oversell.
+  for (const line of request.lines) {
+    const inbound = isInboundMovement({
+      stockEffect: line.stockEffect,
+      movementDirection: line.movementDirection,
+      movementCode: line.movementCode,
+    });
+    const expectedOnly = line.movementCode === "new-purchase" && line.purchaseStatus !== "received";
+    if (inbound && expectedOnly) continue;
+    if (inbound) continue;
+    const shortage = await findOutboundShortage(db, {
+      productId: line.productId,
+      productName: line.productName,
+      productNumber: line.productNumber,
+      locationId: line.locationId,
+      locationPath: line.locationPath,
+      unit: line.unit,
+      qty: line.qty,
+      inbound: false,
+    });
+    if (shortage) {
+      await persistOutboundShortage(db, request, shortage, "submit", {
+        code: line.movementCode,
+        name: line.movementName,
+      });
+      note(
+        request,
+        request.requesterName || "Requester",
+        `Out of stock on submit: ${line.productName} — requested ${line.qty} ${line.unit}, available ${shortage.available}.`
+      );
+      return {
+        ok: false,
+        reason: `Out of stock: ${line.productName} — only ${shortage.available} ${line.unit} available at ${line.locationPath}. Remove or reduce that line, then submit again.`,
+      };
+    }
+  }
+
   const now = new Date();
   const ticketNumber = await nextTicketNumber(db, now, TicketSeries.REQUEST);
   const claimed = await claim(db, request, "draft", "pending_manager", {
@@ -228,19 +266,57 @@ export async function acceptInventoryRequest(
   const claimed = await claim(db, request, "pending_manager", "completed", { closedAt: at });
   if (!claimed) return { ok: false, reason: "Someone has already actioned this request." };
 
-  // Re-check every line against the live ledger. The cart was built from a
+  // Re-check every outbound line against the live ledger. The cart was built from a
   // cached balance minutes or days ago, and another request may have emptied the
-  // shelf since. A line that can no longer be filled is marked unavailable and
-  // moves no stock, so the manager issues what exists and the ticket says so.
+  // shelf since. Stock-in lines (e.g. Department Return, Received New Purchase, or
+  // LOV stock_in) skip the on-hand cap and post a positive qty. Expected / Ordered
+  // New Purchase lines are recorded without touching inventory.
   const movements: StockMovement[] = [];
   const lines: RequestLine[] = [];
   for (const line of claimed.lines) {
-    const available = await onHandLive(db, line.productId, line.locationId);
-    if (available < line.qty) {
-      lines.push({ ...line, outcome: "unavailable" });
+    const inbound =
+      line.stockEffect === "stock_in"
+        ? true
+        : line.stockEffect === "stock_out"
+          ? false
+          : line.movementDirection === "in" ||
+            line.movementCode === "department-return" ||
+            line.movementCode === "new-purchase";
+    const expectedOnly =
+      line.movementCode === "new-purchase" && line.purchaseStatus !== "received";
+
+    if (inbound && expectedOnly) {
+      lines.push({ ...line, outcome: "recorded" });
       continue;
     }
+
+    if (!inbound) {
+      const available = await onHandLive(db, line.productId, line.locationId);
+      if (available < line.qty) {
+        lines.push({ ...line, outcome: "unavailable" });
+        await persistOutboundShortage(
+          db,
+          claimed,
+          {
+            available,
+            productId: line.productId,
+            productName: line.productName,
+            productNumber: line.productNumber,
+            locationId: line.locationId,
+            locationPath: line.locationPath,
+            unit: line.unit,
+            qtyRequested: line.qty,
+          },
+          "accept",
+          { code: line.movementCode, name: line.movementName }
+        );
+        continue;
+      }
+    }
     lines.push({ ...line, outcome: "issued" });
+    const reason =
+      (line.movementCode as StockMovement["reason"] | undefined) ||
+      (inbound ? "new-purchase" : "issue");
     movements.push({
       movementKey: issueKey(String(claimed.ticketNumber), line.lineId),
       productId: line.productId,
@@ -248,10 +324,11 @@ export async function acceptInventoryRequest(
       productNumber: line.productNumber,
       locationId: line.locationId,
       locationPath: line.locationPath,
-      // Negative: this is stock leaving.
-      qty: -line.qty,
+      qty: inbound ? line.qty : -line.qty,
       unit: line.unit,
-      reason: "issue",
+      reason,
+      movementName: line.movementName,
+      reference: line.reference,
       refType: "request",
       refId: String(claimed.ticketNumber),
       requestId: String(claimed._id),
@@ -262,18 +339,38 @@ export async function acceptInventoryRequest(
 
   await recordMovements(db, movements);
 
-  const issued = lines.filter((l) => l.outcome === "issued").length;
+  const issued = lines.filter((l) => l.outcome === "issued" || l.outcome === "recorded").length;
   claimed.lines = lines;
   claimed.decisions = [
     ...(claimed.decisions ?? []),
     { role: MANAGER_ROLE, by, byUserId, decision: "approved", at },
   ];
+  const allOk = issued === lines.length;
+  const lineWasInbound = (l: RequestLine) =>
+    l.stockEffect === "stock_in"
+      ? true
+      : l.stockEffect === "stock_out"
+        ? false
+        : l.movementDirection === "in" ||
+          l.movementCode === "department-return" ||
+          l.movementCode === "new-purchase";
+  const hasStockIn = lines.some((l) => l.outcome === "issued" && lineWasInbound(l));
+  const hasStockOut = lines.some((l) => l.outcome === "issued" && !lineWasInbound(l));
+  const hasExpectedOnly = lines.some((l) => l.outcome === "recorded");
   note(
     claimed,
     by,
-    issued === lines.length
-      ? "Accepted — stock issued and request closed."
-      : `Accepted ${issued} of ${lines.length} lines — stock issued and request closed.`
+    allOk
+      ? hasExpectedOnly && !hasStockIn && !hasStockOut
+        ? "Accepted — purchase recorded (no stock change; still expected)."
+        : hasStockIn && hasStockOut
+          ? "Accepted — stock updated and request closed."
+          : hasStockIn
+            ? "Accepted — stock received and request closed."
+            : hasExpectedOnly
+              ? "Accepted — stock updated; expected purchases recorded without stock."
+              : "Accepted — stock issued and request closed."
+      : `Accepted ${issued} of ${lines.length} lines — request closed.`
   );
 
   await db.collection(COLLECTION).updateOne(

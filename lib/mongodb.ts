@@ -51,7 +51,7 @@ function getClient(): Promise<MongoClient> {
 // One `createIndexes` command per collection rather than one per index: same
 // result, a third of the round trips.
 const INDEX_SPECS: Record<string, { key: Document; unique?: boolean; partialFilterExpression?: Document }[]> = {
-  categories: [{ key: { order: 1 } }],
+  categories: [{ key: { parent: 1 } }, { key: { order: 1 } }],
   subcategories: [{ key: { parent: 1 } }],
   locations: [{ key: { parent: 1 } }],
   // The Product Master. Uniqueness is enforced on the normalised key, not the

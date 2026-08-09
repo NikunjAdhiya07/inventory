@@ -31,16 +31,19 @@ const GROUPS: NavGroup[] = [
       { key: "products", label: "Product Master", href: "/products", icon: "❐" },
       { key: "product-attributes", label: "Product Attributes", href: "/product-attributes", icon: "≡" },
       { key: "categories", label: "Categories", href: "/categories", icon: "▦" },
-      { key: "subcategories", label: "Subcategories", href: "/subcategories", icon: "▩" },
-      { key: "option-trees", label: "Nested Categories", href: "/option-trees", icon: "⌸" },
       { key: "locations", label: "Storage Locations", href: "/locations", icon: "▧" },
       { key: "storage-map", label: "Storage Map", href: "/storage-map", icon: "▥" },
+      { key: "vendors", label: "Vendors", href: "/vendors", icon: "◈" },
+      { key: "departments", label: "Departments", href: "/departments", icon: "⌂" },
       { key: "units", label: "Units", href: "/units", icon: "⚖" },
     ],
   },
   {
     title: "Inventory",
-    items: [{ key: "stock-movements", label: "Stock Movements", href: "/stock-movements", icon: "⇄" }],
+    items: [
+      { key: "stock-movements", label: "Stock Movements", href: "/stock-movements", icon: "⇄" },
+      { key: "stock-unavailable", label: "Out of Stock", href: "/stock-unavailable", icon: "⚠" },
+    ],
   },
   {
     title: "Configuration",

@@ -13,10 +13,16 @@
     "seed:products": "node scripts/seed-products.mjs",
     "seed:option-trees": "node scripts/seed-option-trees.mjs",
     "seed:movement-types": "node scripts/seed-movement-types.mjs",
+    "seed:vendors": "node scripts/seed-vendors.mjs",
+    "seed:departments": "node scripts/seed-departments.mjs",
     "ensure-indexes": "node scripts/ensure-indexes.mjs",
     "backfill:stock": "node scripts/backfill-stock.mjs",
     "migrate:request-roles": "node scripts/migrate-request-roles.mjs",
-    "migrate:locations": "node scripts/migrate-locations-canteen.mjs"
+    "migrate:locations": "node scripts/migrate-locations-canteen.mjs",
+    "migrate:category-tree": "node scripts/migrate-category-tree.mjs",
+    "seed:pipe-categories": "node scripts/seed-pipe-categories.mjs",
+    "seed:pipe-stock": "node scripts/seed-pipe-stock.mjs",
+    "seed:category-trees": "node scripts/seed-all-category-trees.mjs"
   },
   "dependencies": {
     "dotenv": "^17.4.2",

@@ -318,3 +318,128 @@ export async function normalizeItemName(typed: string, knownNames: string[]): Pr
     return null;
   }
 }
+
+/**
+ * Canonical Product Master name for a free-text entry (spelling, casing, clarity).
+ * Always returns a short name when the model responds; callers compare to decide
+ * whether anything actually changed.
+ */
+export async function fixProductName(raw: string): Promise<string | null> {
+  const q = raw.trim().slice(0, 80);
+  if (!q) return null;
+
+  if (MOCK) {
+    // Deterministic "cleanup" so tests see a rename without NVIDIA.
+    const titled = q
+      .toLowerCase()
+      .split(/\s+/)
+      .map((w) => (w ? w[0].toUpperCase() + w.slice(1) : ""))
+      .join(" ")
+      .trim();
+    return titled || q;
+  }
+  if (!API_KEY) return null;
+
+  try {
+    const rawOut = await nvidiaChat(
+      TEXT_MODEL,
+      [
+        {
+          role: "user",
+          content:
+            `Warehouse inventory item name typed by a worker: "${q}"\n` +
+            `Rewrite it as the official Product Master name:\n` +
+            `- Fix spelling and obvious typos\n` +
+            `- Use clear Title Case (e.g. "USB-C Cable", "HDMI Cable 2m")\n` +
+            `- Keep it short (product name only, no sentences)\n` +
+            `- Keep meaningful size/colour details the worker included\n` +
+            `Reply with ONLY the fixed name. If it is already perfect, reply with the same name.`,
+        },
+      ],
+      TEXT_MAX_TOKENS
+    );
+    const cleaned = rawOut
+      .replace(/<think>[\s\S]*?<\/think>/gi, "")
+      .replace(/^["']|["']$/g, "")
+      .replace(/^[-*]\s*/, "")
+      .trim()
+      .split(/\n/)[0]
+      ?.trim()
+      .slice(0, 80);
+    if (!cleaned || /^none$/i.test(cleaned)) return null;
+    return cleaned;
+  } catch (err) {
+    console.error("[ai] fixProductName failed:", err);
+    return null;
+  }
+}
+
+export type CategorySuggestion = { category: string; subcategory: string };
+
+/**
+ * Pick the best existing category / subcategory for a product name.
+ * `categoryPaths` are display trails like "Electronics" or "Electronics › Cables".
+ */
+export async function suggestCategoryForProduct(
+  productName: string,
+  categoryPaths: string[]
+): Promise<CategorySuggestion | null> {
+  const name = productName.trim();
+  if (!name || !categoryPaths.length) return null;
+
+  if (MOCK) {
+    const first = categoryPaths[0] || "";
+    const parts = first.split(/\s*›\s*/).map((s) => s.trim()).filter(Boolean);
+    return parts.length
+      ? { category: parts[0], subcategory: parts[1] || "" }
+      : null;
+  }
+  if (!API_KEY) return null;
+
+  const sample = categoryPaths.slice(0, 80).join("\n");
+  try {
+    const raw = await nvidiaChat(
+      TEXT_MODEL,
+      [
+        {
+          role: "user",
+          content:
+            `Product name: "${name}"\n` +
+            `Choose the single best category path from this list (exact spelling):\n${sample}\n\n` +
+            `Reply ONLY JSON: {"path":"<exact path from list>"}\n` +
+            `If none fit, reply {"path":""}.`,
+        },
+      ],
+      200
+    );
+    const cleaned = raw
+      .replace(/<think>[\s\S]*?<\/think>/gi, "")
+      .replace(/```(?:json)?\s*([\s\S]*?)```/gi, "$1")
+      .trim();
+    const match = cleaned.match(/\{[\s\S]*?\}/);
+    if (!match) return null;
+    const parsed = JSON.parse(match[0]) as { path?: unknown; category?: unknown; subcategory?: unknown };
+    let path = typeof parsed.path === "string" ? parsed.path.trim() : "";
+    if (!path && typeof parsed.category === "string") {
+      const cat = parsed.category.trim();
+      const sub = typeof parsed.subcategory === "string" ? parsed.subcategory.trim() : "";
+      path = sub ? `${cat} › ${sub}` : cat;
+    }
+    if (!path) return null;
+
+    const norm = (s: string) => s.toLowerCase().replace(/\s+/g, " ").trim();
+    const hit =
+      categoryPaths.find((p) => norm(p) === norm(path)) ||
+      categoryPaths.find((p) => norm(p).includes(norm(path)) || norm(path).includes(norm(p)));
+    if (!hit) return null;
+    const parts = hit.split(/\s*›\s*/).map((s) => s.trim()).filter(Boolean);
+    if (!parts.length) return null;
+    return {
+      category: parts[0],
+      subcategory: parts.length > 1 ? parts[parts.length - 1] : "",
+    };
+  } catch (err) {
+    console.error("[ai] suggestCategoryForProduct failed:", err);
+    return null;
+  }
+}

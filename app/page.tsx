@@ -8,7 +8,7 @@ import { api } from "@/lib/api-client";
 
 const AV = ["#1560f0", "#0d9488", "#f59e0b", "#8b5cf6", "#ec4899", "#6366f1"];
 
-type Category = { id: string; status: string; subCount: number };
+type Category = { id: string; parent: string | null; status: string; refCount: number };
 type Unit = { id: string; type: string; status: string };
 type LocationNode = { id: string; parent: string | null; refCount: number };
 type ActivityRow = { id: string; user: string; action: "Created" | "Edited" | "Deleted"; dataType: string; entity: string; ts: string };
@@ -56,7 +56,6 @@ const verbFor: Record<string, string> = { Created: "created", Edited: "edited", 
 
 export default function DashboardPage() {
   const [categories, setCategories] = useState<Category[]>([]);
-  const [subcategoriesCount, setSubcategoriesCount] = useState(0);
   const [units, setUnits] = useState<Unit[]>([]);
   const [locations, setLocations] = useState<LocationNode[]>([]);
   const [rolesCount, setRolesCount] = useState(0);
@@ -68,16 +67,14 @@ export default function DashboardPage() {
     // One batch of parallel GETs on mount — no polling, no interval timers.
     Promise.all([
       api.get<Category[]>("/api/categories"),
-      api.get<unknown[]>("/api/subcategories"),
       api.get<Unit[]>("/api/units"),
       api.get<LocationNode[]>("/api/locations"),
       api.get<unknown[]>("/api/roles"),
       api.get<unknown[]>("/api/users"),
       api.get<{ rows: ActivityRow[] }>("/api/audit-log?limit=5"),
     ])
-      .then(([cats, subs, us, locs, roles, users, log]) => {
+      .then(([cats, us, locs, roles, users, log]) => {
         setCategories(cats);
-        setSubcategoriesCount(subs.length);
         setUnits(us);
         setLocations(locs);
         setRolesCount(roles.length);
@@ -87,17 +84,19 @@ export default function DashboardPage() {
       .catch((err: Error) => setLoadError(err.message));
   }, []);
 
+  const roots = categories.filter((c) => (c.parent ?? null) === null);
+  const nested = categories.filter((c) => c.parent != null && c.parent !== "");
   const activeCats = categories.filter((c) => c.status === "Active").length;
   const inactiveCats = categories.length - activeCats;
-  const unusedCats = categories.filter((c) => c.subCount === 0).length;
+  const unusedCats = categories.filter((c) => (c.refCount || 0) === 0 && (c.parent ?? null) === null).length;
   const unitTypes = new Set(units.map((u) => u.type)).size;
   const inactiveUnits = units.filter((u) => u.status === "Inactive").length;
   const rootLocations = locations.filter((l) => l.parent === null).length;
   const emptyLocations = locations.filter((l) => l.refCount === 0).length;
 
   const tiles = [
-    { href: "/categories", icon: "▦", bg: "#eaf2ff", fg: "#1560f0", value: categories.length, label: "Categories", tag: `${activeCats} active`, tagGood: true },
-    { href: "/subcategories", icon: "▩", bg: "#f0ecff", fg: "#7c4ddb", value: subcategoriesCount, label: "Subcategories", tag: "", tagGood: true },
+    { href: "/categories", icon: "▦", bg: "#eaf2ff", fg: "#1560f0", value: categories.length, label: "Category nodes", tag: `${roots.length} roots`, tagGood: true },
+    { href: "/categories", icon: "▤", bg: "#f0ecff", fg: "#7c4ddb", value: nested.length, label: "Nested categories", tag: "", tagGood: true },
     { href: "/locations", icon: "▧", bg: "#e9f7f4", fg: "#0d9488", value: locations.length, label: "Location nodes", tag: `${rootLocations} whs`, tagGood: false },
     { href: "/units", icon: "⚖", bg: "#fff2e5", fg: "#c9760a", value: units.length, label: "Units", tag: `${unitTypes} types`, tagGood: false },
   ];
@@ -148,7 +147,7 @@ export default function DashboardPage() {
         <div style={{ padding: "16px 20px", borderLeft: "1px solid #f1f4f8" }}>
           <div style={{ fontSize: 12, color: "#8a97b0", fontWeight: 600, marginBottom: 6 }}>Records Synced</div>
           <div style={{ fontSize: 20, fontWeight: 800, color: "#0b1b45" }}>
-            {categories.length + subcategoriesCount + units.length + locations.length}
+            {categories.length + units.length + locations.length}
           </div>
         </div>
         <div style={{ padding: "16px 20px", borderLeft: "1px solid #f1f4f8", display: "flex", alignItems: "center", justifyContent: "space-between" }}>

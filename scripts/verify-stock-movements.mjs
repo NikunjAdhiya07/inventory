@@ -84,7 +84,6 @@ async function main() {
     ["opening-stock", "Record Opening Stock", 100, {}],
     ["new-purchase", "Record New Purchase", 50, { reference: "PO-1099" }],
     ["return-from-plant", "Record Return from Plant", 10, {}],
-    ["vendor-replacement", "Record Vendor Replacement", 5, { reference: "RMA-77" }],
     ["department-return", "Record Department Return", 7, {}],
     ["warehouse-transfer-in", "Record Warehouse Transfer In", 20, { reference: "WT-IN-3" }],
     ["adjustment-in", "Record Inventory Adjustment (+)", 3, { remarks: "found behind the rack" }],
@@ -103,6 +102,7 @@ async function main() {
   const stockOut = [
     ["issue-to-plant", "Record Issue to Plant", 12, {}],
     ["department-issue", "Record Department Issue", 8, {}],
+    ["vendor-replacement", "Record Vendor Replacement", 5, { reference: "RMA-77" }],
     ["warehouse-transfer-out", "Record Warehouse Transfer Out", 5, { reference: "WT-OUT-9" }],
     ["damaged-lost", "Record Damaged/Lost", 2, { remarks: "crushed in handling" }],
     ["expired-disposed", "Record Expired/Disposed", 1, { remarks: "past shelf life" }],

@@ -20,22 +20,23 @@ const seeds = {
     { name: "Roll", symbol: "roll", type: "Count", decimals: false, precision: "2", factor: "", baseUnit: "", status: "Inactive", refCount: 0 },
   ],
   categories: [
-    { name: "Plumbing", code: "PLM", desc: "Pipes, fittings and valves", defaultUnit: "Pieces", order: 1, color: "#3392ff", status: "Active", subCount: 6, refCount: 34 },
-    { name: "Electrical", code: "ELE", desc: "Wiring, switches and boards", defaultUnit: "Meter", order: 2, color: "#f59e0b", status: "Active", subCount: 9, refCount: 58 },
-    { name: "Paints & Finishes", code: "PNT", desc: "Emulsions, primers, enamels", defaultUnit: "Liter", order: 3, color: "#8b5cf6", status: "Active", subCount: 4, refCount: 0 },
-    { name: "Hardware", code: "HDW", desc: "Screws, hinges, brackets", defaultUnit: "Box", order: 4, color: "#0d9488", status: "Active", subCount: 12, refCount: 120 },
-    { name: "Sanitaryware", code: "SAN", desc: "Basins, taps, cisterns", defaultUnit: "Pieces", order: 5, color: "#ec4899", status: "Active", subCount: 5, refCount: 0 },
-    { name: "Tools & Machinery", code: "TLS", desc: "Power and hand tools", defaultUnit: "Pieces", order: 6, color: "#6366f1", status: "Inactive", subCount: 3, refCount: 0 },
+    { name: "Plumbing", code: "PLM", desc: "Pipes, fittings and valves", defaultUnit: "Pieces", parent: null, level: "Category", order: 1, color: "#3392ff", status: "Active", refCount: 34 },
+    { name: "Electrical", code: "ELE", desc: "Wiring, switches and boards", defaultUnit: "Meter", parent: null, level: "Category", order: 2, color: "#f59e0b", status: "Active", refCount: 58 },
+    { name: "Paints & Finishes", code: "PNT", desc: "Emulsions, primers, enamels", defaultUnit: "Liter", parent: null, level: "Category", order: 3, color: "#8b5cf6", status: "Active", refCount: 0 },
+    { name: "Hardware", code: "HDW", desc: "Screws, hinges, brackets", defaultUnit: "Box", parent: null, level: "Category", order: 4, color: "#0d9488", status: "Active", refCount: 120 },
+    { name: "Sanitaryware", code: "SAN", desc: "Basins, taps, cisterns", defaultUnit: "Pieces", parent: null, level: "Category", order: 5, color: "#ec4899", status: "Active", refCount: 0 },
+    { name: "Tools & Machinery", code: "TLS", desc: "Power and hand tools", defaultUnit: "Pieces", parent: null, level: "Category", order: 6, color: "#6366f1", status: "Inactive", refCount: 0 },
   ],
-  subcategories: [
-    { name: "Pipe Fittings", parent: "Plumbing", desc: "Elbows, tees, couplings", order: 1, status: "Active" },
-    { name: "Valves", parent: "Plumbing", desc: "Gate, ball and check valves", order: 2, status: "Active" },
-    { name: "Switches & Sockets", parent: "Electrical", desc: "Modular switches and plates", order: 1, status: "Active" },
-    { name: "Circuit Breakers", parent: "Electrical", desc: "MCB, RCCB and distribution", order: 2, status: "Active" },
-    { name: "Cables & Wires", parent: "Electrical", desc: "Copper and aluminium conductors", order: 3, status: "Active" },
-    { name: "Emulsion Paints", parent: "Paints & Finishes", desc: "Interior and exterior emulsions", order: 1, status: "Active" },
-    { name: "Fasteners", parent: "Hardware", desc: "Screws, bolts and anchors", order: 1, status: "Active" },
-    { name: "Hinges & Brackets", parent: "Hardware", desc: "Door and cabinet hardware", order: 2, status: "Inactive" },
+  // Nested under categories by name → resolved to parent ids at seed time.
+  categoryChildren: [
+    { name: "Pipe Fittings", parentName: "Plumbing", desc: "Elbows, tees, couplings", order: 1, status: "Active" },
+    { name: "Valves", parentName: "Plumbing", desc: "Gate, ball and check valves", order: 2, status: "Active" },
+    { name: "Switches & Sockets", parentName: "Electrical", desc: "Modular switches and plates", order: 1, status: "Active" },
+    { name: "Circuit Breakers", parentName: "Electrical", desc: "MCB, RCCB and distribution", order: 2, status: "Active" },
+    { name: "Cables & Wires", parentName: "Electrical", desc: "Copper and aluminium conductors", order: 3, status: "Active" },
+    { name: "Emulsion Paints", parentName: "Paints & Finishes", desc: "Interior and exterior emulsions", order: 1, status: "Active" },
+    { name: "Fasteners", parentName: "Hardware", desc: "Screws, bolts and anchors", order: 1, status: "Active" },
+    { name: "Hinges & Brackets", parentName: "Hardware", desc: "Door and cabinet hardware", order: 2, status: "Inactive" },
   ],
   roles: [
     { name: "Admin", desc: "Full control over all master data", color: "#1560f0", users: 2, status: "Active", perms: ["Add Inventory", "Manage Masters", "Manage Workflows", "Approve Entries", "View Reports"] },
@@ -62,11 +63,11 @@ const seeds = {
     { username: "Meera Joshi", handle: "@meeraj", tgId: "778120654", role: "Workflow Designer", status: "Active" },
   ],
   statuses: [
-    { name: "Draft", color: "#94a3b8", behavior: "Hidden from bot", applies: ["Categories", "Subcategories"], records: 4, isDefault: false, order: 1 },
+    { name: "Draft", color: "#94a3b8", behavior: "Hidden from bot", applies: ["Categories"], records: 4, isDefault: false, order: 1 },
     { name: "Pending", color: "#f59e0b", behavior: "Locked, awaiting approval", applies: ["Categories", "Locations", "Units"], records: 7, isDefault: false, order: 2 },
-    { name: "Active", color: "#0f9d63", behavior: "Editable, visible to bot", applies: ["Categories", "Subcategories", "Locations", "Units", "Roles"], records: 186, isDefault: true, order: 3 },
+    { name: "Active", color: "#0f9d63", behavior: "Editable, visible to bot", applies: ["Categories", "Locations", "Units", "Roles"], records: 186, isDefault: true, order: 3 },
     { name: "Archived", color: "#6366f1", behavior: "Read-only archive", applies: ["Categories", "Locations"], records: 12, isDefault: false, order: 4 },
-    { name: "Inactive", color: "#8a97b0", behavior: "Hidden from bot", applies: ["Categories", "Subcategories", "Locations", "Units", "Roles"], records: 23, isDefault: false, order: 5 },
+    { name: "Inactive", color: "#8a97b0", behavior: "Hidden from bot", applies: ["Categories", "Locations", "Units", "Roles"], records: 23, isDefault: false, order: 5 },
   ],
   colors: [
     { name: "Brand Primary", hex: "#1560f0", group: "Corporate Colors" },
@@ -101,7 +102,9 @@ async function main() {
   await client.connect();
   const db = client.db(dbName);
 
-  for (const [collection, docs] of Object.entries(seeds)) {
+  const { categoryChildren, ...simpleSeeds } = seeds;
+
+  for (const [collection, docs] of Object.entries(simpleSeeds)) {
     const count = await db.collection(collection).countDocuments();
     if (count > 0) {
       console.log(`skip ${collection} (already has ${count} docs)`);
@@ -109,6 +112,39 @@ async function main() {
     }
     await db.collection(collection).insertMany(docs);
     console.log(`seeded ${collection}: ${docs.length} docs`);
+  }
+
+  // Category children need parent ids — seed after roots exist.
+  const catCount = await db.collection("categories").countDocuments({ parent: { $nin: [null, ""] } });
+  if (catCount === 0 && categoryChildren?.length) {
+    const roots = await db.collection("categories").find({ $or: [{ parent: null }, { parent: { $exists: false } }] }).toArray();
+    const byName = new Map(roots.map((r) => [String(r.name), r]));
+    const kids = [];
+    for (const child of categoryChildren) {
+      const parent = byName.get(child.parentName);
+      if (!parent) {
+        console.warn(`skip child "${child.name}" — parent "${child.parentName}" missing`);
+        continue;
+      }
+      kids.push({
+        name: child.name,
+        parent: parent._id.toString(),
+        code: "",
+        desc: child.desc || "",
+        level: "Subcategory",
+        defaultUnit: parent.defaultUnit || "Pieces",
+        color: parent.color || "#3392ff",
+        order: child.order,
+        status: child.status,
+        refCount: 0,
+      });
+    }
+    if (kids.length) {
+      await db.collection("categories").insertMany(kids);
+      console.log(`seeded category children: ${kids.length} docs`);
+    }
+  } else {
+    console.log(`skip category children (already has ${catCount} nested docs)`);
   }
 
   // Storage Locations needs parent references by _id, so seed it separately

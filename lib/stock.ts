@@ -69,6 +69,8 @@ export type StockMovement = {
   // which document proves it.
   remarks?: string;
   reference?: string;
+  // Configurable workflow answers from the Movement Type's question list.
+  answers?: { id: string; label: string; type: string; value: string | number | boolean; display: string }[];
   by: string;
   createdAt: string;
 };

@@ -64,6 +64,20 @@ const stepLibrary = [
     status: "Active",
   },
   {
+    type: "category_tree",
+    name: "Category Tree",
+    desc: "Drill the Categories master until a leaf — typing “pipe” opens Pipe, then Material → Type → Class → Size.",
+    icon: "▤",
+    category: "select",
+    configSchema: [
+      { key: "dataSource", label: "Category source", type: "dataSource", default: "categories", appliesToDataSource: "categories" },
+      { key: "matchItem", label: "Open from the item name", type: "toggle", default: true },
+      { key: "whenUnmatched", label: "When no category matches", type: "select", options: ["ask", "skip"], default: "ask" },
+    ],
+    order: 5,
+    status: "Active",
+  },
+  {
     type: "nested_select",
     name: "Nested Category Drill-down",
     desc: "Asks a nested category tree one level at a time — Type of Wire → Subcategory → Colour → Size.",
@@ -74,7 +88,7 @@ const stepLibrary = [
       { key: "matchItem", label: "Match the tree from the item name", type: "toggle", default: true },
       { key: "whenUnmatched", label: "When no tree matches", type: "select", options: ["skip", "ask"], default: "skip" },
     ],
-    order: 5,
+    order: 6,
     status: "Active",
   },
   {
@@ -84,7 +98,7 @@ const stepLibrary = [
     icon: "▧",
     category: "select",
     configSchema: [{ key: "dataSource", label: "Location source", type: "dataSource", default: "locations", appliesToDataSource: "locations" }],
-    order: 6,
+    order: 7,
     status: "Active",
   },
   {
@@ -97,7 +111,7 @@ const stepLibrary = [
       { key: "numberMin", label: "Minimum", type: "number", default: 1 },
       { key: "numberMax", label: "Maximum (0 = no limit)", type: "number", default: 0 },
     ],
-    order: 7,
+    order: 8,
     status: "Active",
   },
   {
@@ -107,7 +121,7 @@ const stepLibrary = [
     icon: "⚖",
     category: "select",
     configSchema: [{ key: "dataSource", label: "Unit source", type: "dataSource", default: "units", appliesToDataSource: "units" }],
-    order: 8,
+    order: 9,
     status: "Active",
   },
   {
@@ -117,7 +131,7 @@ const stepLibrary = [
     icon: "✎",
     category: "custom",
     configSchema: [{ key: "placeholder", label: "Placeholder / hint", type: "text", default: "" }],
-    order: 9,
+    order: 10,
     status: "Active",
   },
   {
@@ -130,7 +144,7 @@ const stepLibrary = [
       { key: "numberMin", label: "Minimum", type: "number", default: 0 },
       { key: "numberMax", label: "Maximum (0 = no limit)", type: "number", default: 0 },
     ],
-    order: 10,
+    order: 11,
     status: "Active",
   },
   {
@@ -143,7 +157,7 @@ const stepLibrary = [
       { key: "approvalMode", label: "Approval mode", type: "select", options: ["single", "multi"], default: "single" },
       { key: "approverRole", label: "Approver role", type: "select", default: "Admin", appliesToDataSource: "roles" },
     ],
-    order: 11,
+    order: 12,
     status: "Active",
   },
   {
@@ -153,7 +167,7 @@ const stepLibrary = [
     icon: "☑",
     category: "control",
     configSchema: [],
-    order: 12,
+    order: 13,
     status: "Active",
   },
 ];
@@ -163,16 +177,21 @@ function step(type, label, config = {}, required = true, order = 0) {
   return { instanceId: randomUUID(), type, label, required, order, config };
 }
 
-// The default workflow reproduces the fixed Story-3 conversation flow.
+// The default workflow: item → category tree (matched from the name) → location → qty → unit → review.
 function defaultSteps() {
   return [
     step("item_capture", "Send the item name and/or a photo of the product.", { requireImage: false }, true, 1),
-    step("category_select", "Select a category:", { dataSource: "categories" }, true, 2),
-    step("subcategory_select", "Select a subcategory:", { filterByCategory: true }, true, 3),
-    step("location_tree", "Choose the storage location:", { dataSource: "locations" }, true, 4),
-    step("quantity", "Enter the quantity:", { numberMin: 1, numberMax: 0 }, true, 5),
-    step("unit_select", "Select a unit:", { dataSource: "units" }, true, 6),
-    step("review_confirm", "Please review your entry:", {}, true, 7),
+    step(
+      "category_tree",
+      "Choose the category:",
+      { dataSource: "categories", matchItem: true, whenUnmatched: "ask" },
+      true,
+      2
+    ),
+    step("location_tree", "Choose the storage location:", { dataSource: "locations" }, true, 3),
+    step("quantity", "Enter the quantity:", { numberMin: 1, numberMax: 0 }, true, 4),
+    step("unit_select", "Select a unit:", { dataSource: "units" }, true, 5),
+    step("review_confirm", "Please review your entry:", {}, true, 6),
   ];
 }
 
@@ -206,6 +225,61 @@ async function syncStepLibrary(db) {
   console.log(`stepLibrary: ${stepLibrary.length} step types synced (${added} new)`);
 }
 
+// Replace legacy category_select + subcategory_select with category_tree so
+// existing installs get the Pipe → Material → Type → … drill-down without a
+// manual rebuild. Only rewrites workflows that still use that exact pair and
+// do not already include category_tree.
+async function migrateCategoryTreeSteps(db) {
+  const workflows = await db.collection("workflows").find({}).toArray();
+  let updated = 0;
+  for (const wf of workflows) {
+    const steps = Array.isArray(wf.steps) ? [...wf.steps] : [];
+    if (steps.some((s) => s.type === "category_tree")) continue;
+    const catIdx = steps.findIndex((s) => s.type === "category_select");
+    const subIdx = steps.findIndex((s) => s.type === "subcategory_select");
+    if (catIdx < 0) continue;
+
+    const treeStep = step(
+      "category_tree",
+      "Choose the category:",
+      { dataSource: "categories", matchItem: true, whenUnmatched: "ask" },
+      true,
+      steps[catIdx].order ?? catIdx + 1
+    );
+    const remove = new Set([catIdx, subIdx].filter((i) => i >= 0));
+    const next = steps.filter((_, i) => !remove.has(i));
+    next.splice(Math.min(catIdx, next.length), 0, treeStep);
+    next.forEach((s, i) => {
+      s.order = i + 1;
+    });
+
+    const now = new Date().toISOString();
+    const version = Number(wf.version || 1) + 1;
+    await db.collection("workflows").updateOne(
+      { _id: wf._id },
+      {
+        $set: {
+          steps: next,
+          version,
+          updatedAt: now,
+          desc: wf.desc || "Guided flow with category tree drill-down from the item name.",
+        },
+      }
+    );
+    await db.collection("workflowVersions").insertOne({
+      workflowId: wf._id.toString(),
+      version,
+      name: wf.name,
+      steps: next,
+      createdAt: now,
+      createdBy: "seed:category_tree",
+    });
+    updated++;
+    console.log(`migrated workflow "${wf.name}" → category_tree (v${version})`);
+  }
+  if (!updated) console.log("skip category_tree migration (nothing to rewrite)");
+}
+
 async function main() {
   const client = new MongoClient(uri);
   await client.connect();
@@ -222,7 +296,7 @@ async function main() {
     const steps = defaultSteps();
     const wf = await db.collection("workflows").insertOne({
       name: "Standard Inventory Entry",
-      desc: "The default guided flow: item → category → subcategory → location → quantity → unit → review.",
+      desc: "The default guided flow: item → category tree → location → quantity → unit → review.",
       status: "Active",
       version: 1,
       isDefault: true,
@@ -251,6 +325,7 @@ async function main() {
     console.log("seeded workflows: 1 default workflow + version 1 snapshot + 1 group assignment");
   } else {
     console.log(`skip workflows (already has ${wfCount} docs)`);
+    await migrateCategoryTreeSteps(db);
   }
 
   await client.close();

@@ -1,10 +1,19 @@
-import { createItemHandlers } from "@/lib/crud";
+import { NextResponse } from "next/server";
+import { withErrors } from "@/lib/api-error";
 
-const handlers = createItemHandlers({
-  collection: "subcategories",
-  dataType: "Subcategory",
-  entityName: (d) => String(d.name ?? ""),
-  recycleDetail: (d) => `Parent: ${d.parent ?? ""}`,
-});
+async function update() {
+  return NextResponse.json(
+    { error: "Subcategories are part of the category tree. Edit the node under Categories." },
+    { status: 410 }
+  );
+}
 
-export const { PATCH, DELETE } = handlers;
+async function remove() {
+  return NextResponse.json(
+    { error: "Subcategories are part of the category tree. Delete the node under Categories." },
+    { status: 410 }
+  );
+}
+
+export const PATCH = withErrors(update);
+export const DELETE = withErrors(remove);

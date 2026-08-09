@@ -273,7 +273,7 @@ export function Modal({
         inset: 0,
         background: "rgba(11,27,69,.42)",
         backdropFilter: "blur(2px)",
-        zIndex: 50,
+        zIndex: 13000,
         display: "flex",
         alignItems: align,
         justifyContent: "center",

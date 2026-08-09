@@ -29,11 +29,18 @@ const dbName = process.env.MONGODB_DB || "inventory";
 // take out more than is on hand.
 const movementTypes = [
   // ---- Stock In ----------------------------------------------------------
-  { code: "opening-stock", name: "Opening Stock", direction: "in", desc: "What was already on the shelf when the system went live.", requireReference: false, requireRemarks: false, order: 10 },
-  { code: "new-purchase", name: "New Purchase", direction: "in", desc: "Goods received against a purchase order.", requireReference: true, requireRemarks: false, order: 11 },
+  { code: "opening-stock", name: "Opening Stock", direction: "in", desc: "One-time go-live: what was already on the shelf. Day-to-day stock-in is the Entries bot (receipt).", requireReference: false, requireRemarks: false, order: 10 },
+  {
+    code: "new-purchase",
+    name: "New Purchase",
+    direction: "in",
+    desc: "Purchase from a Vendor Master vendor into a storage location. Inventory increases on ticket Accept only when status is Received (Expected / Ordered does not move stock).",
+    requireReference: true,
+    requireRemarks: false,
+    order: 11,
+  },
   { code: "return-from-plant", name: "Return from Plant", direction: "in", desc: "Unused material coming back from the plant.", requireReference: false, requireRemarks: false, order: 12 },
-  { code: "vendor-replacement", name: "Vendor Replacement", direction: "in", desc: "A vendor's replacement for rejected or faulty goods.", requireReference: true, requireRemarks: false, order: 13 },
-  { code: "department-return", name: "Department Return", direction: "in", desc: "Stock handed back by a department.", requireReference: false, requireRemarks: false, order: 14 },
+  { code: "department-return", name: "Department Return", direction: "in", desc: "Material previously issued to a department, returned to warehouse storage. Increases warehouse stock after ticket Accept.", requireReference: true, requireRemarks: false, order: 14 },
   { code: "warehouse-transfer-in", name: "Warehouse Transfer In", direction: "in", desc: "Arriving from another warehouse that this system does not hold.", requireReference: true, requireRemarks: false, order: 15 },
   { code: "adjustment-in", name: "Inventory Adjustment (+)", direction: "in", desc: "A count correction that adds stock. Say why.", requireReference: false, requireRemarks: true, order: 16 },
   { code: "customer-return", name: "Customer Return", direction: "in", desc: "Goods returned by a customer.", requireReference: false, requireRemarks: false, order: 17 },
@@ -42,6 +49,15 @@ const movementTypes = [
   // ---- Stock Out ---------------------------------------------------------
   { code: "issue-to-plant", name: "Issue to Plant", direction: "out", desc: "Material issued to the plant.", requireReference: false, requireRemarks: false, order: 30 },
   { code: "department-issue", name: "Department Issue", direction: "out", desc: "Material issued to a department.", requireReference: false, requireRemarks: false, order: 31 },
+  {
+    code: "vendor-replacement",
+    name: "Vendor Replacement",
+    direction: "out",
+    desc: "Defective, damaged, incorrect, expired, or rejected goods returned to the vendor for replacement. Decreases warehouse stock; replacement receipt is a separate inbound later.",
+    requireReference: true,
+    requireRemarks: false,
+    order: 38,
+  },
   { code: "warehouse-transfer-out", name: "Warehouse Transfer Out", direction: "out", desc: "Sent to another warehouse that this system does not hold.", requireReference: true, requireRemarks: false, order: 32 },
   { code: "damaged-lost", name: "Damaged/Lost", direction: "out", desc: "Written off as damaged or missing. Say what happened.", requireReference: false, requireRemarks: true, order: 33 },
   { code: "expired-disposed", name: "Expired/Disposed", direction: "out", desc: "Past its life and disposed of. Say what happened.", requireReference: false, requireRemarks: true, order: 34 },
@@ -97,6 +113,68 @@ async function main() {
       { upsert: true }
     );
     if (res.upsertedCount) added++;
+  }
+
+  // Business correction: Vendor Replacement is warehouse → vendor (stock out).
+  // Earlier seeds marked it as stock-in; force the meaning on existing installs.
+  const vr = movementTypes.find((t) => t.code === "vendor-replacement");
+  if (vr) {
+    const now = new Date().toISOString();
+    const { isSystem: _s, ...doc } = full(vr);
+    await db.collection("movementTypes").updateOne(
+      { code: "vendor-replacement" },
+      {
+        $set: {
+          direction: doc.direction,
+          desc: doc.desc,
+          requireReference: doc.requireReference,
+          requireRemarks: doc.requireRemarks,
+          order: doc.order,
+          updatedAt: now,
+        },
+      }
+    );
+    console.log("movementTypes: vendor-replacement forced to direction=out");
+  }
+
+  const dr = movementTypes.find((t) => t.code === "department-return");
+  if (dr) {
+    const now = new Date().toISOString();
+    const { isSystem: _s, ...doc } = full(dr);
+    await db.collection("movementTypes").updateOne(
+      { code: "department-return" },
+      {
+        $set: {
+          direction: doc.direction,
+          desc: doc.desc,
+          requireReference: doc.requireReference,
+          requireRemarks: doc.requireRemarks,
+          order: doc.order,
+          updatedAt: now,
+        },
+      }
+    );
+    console.log("movementTypes: department-return forced requireReference=true");
+  }
+
+  const np = movementTypes.find((t) => t.code === "new-purchase");
+  if (np) {
+    const now = new Date().toISOString();
+    const { isSystem: _s, ...doc } = full(np);
+    await db.collection("movementTypes").updateOne(
+      { code: "new-purchase" },
+      {
+        $set: {
+          direction: doc.direction,
+          desc: doc.desc,
+          requireReference: doc.requireReference,
+          requireRemarks: doc.requireRemarks,
+          order: doc.order,
+          updatedAt: now,
+        },
+      }
+    );
+    console.log("movementTypes: new-purchase forced direction=in + desc");
   }
 
   const total = await db.collection("movementTypes").countDocuments();

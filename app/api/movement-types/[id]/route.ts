@@ -20,6 +20,9 @@ async function update(req: NextRequest, ctx: { params: Promise<{ id: string }> }
   for (const key of ["name", "desc", "direction", "requireRemarks", "requireReference", "allowNegative", "order", "status"] as const) {
     if (Object.prototype.hasOwnProperty.call(body, key)) patch[key] = full[key];
   }
+  if (Object.prototype.hasOwnProperty.call(body, "questions")) {
+    patch.questions = full.questions;
+  }
   if (patch.name === "") return NextResponse.json({ error: "A movement type needs a name." }, { status: 400 });
 
   // The code is the ledger's reference to this type. Renaming the label is
