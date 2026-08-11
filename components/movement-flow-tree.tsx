@@ -14,9 +14,9 @@ import {
   applyMessageTemplate,
   applyPreviewAction,
   branchSteps,
+  buildAddToStockWorkflow,
   buildExampleWorkflow,
   dropAt,
-  ensureConfiguredMovementBranches,
   findSelectMovement,
   initialPreviewState,
   leadInPath,
@@ -53,6 +53,7 @@ const KIND_META: Record<string, { icon: string; color: string; tip: string; labe
   pick_category: { icon: "📂", color: "#b45309", tip: "Walk the full category tree, then list matches" },
   pick_location: { icon: "📍", color: "#2563eb", tip: "Selectable list of storage locations" },
   pick_vendor: { icon: "◈", color: "#0d9488", tip: "Pick from Vendor Master" },
+  pick_plant: { icon: "🏭", color: "#b45309", tip: "Pick from Plant Master" },
   pick_department: { icon: "⌂", color: "#0369a1", tip: "Pick from Department Master" },
   select_movement: { icon: "📋", color: "#7c3aed", tip: "Pick a Movement Master type" },
   movement: { icon: "◆", color: "#0f9d63", tip: "A Movement Master type" },
@@ -88,6 +89,7 @@ const STEP_PALETTE: FlowNodeKind[] = [
   "pick_category",
   "pick_location",
   "pick_vendor",
+  "pick_plant",
   "pick_department",
   "select_movement",
   "location",
@@ -111,9 +113,15 @@ const SAMPLE = {
 
 const DND_MIME = "application/x-move-flow";
 
-type Props = { types: MovementTypeRow[] };
+type Props = {
+  types: MovementTypeRow[];
+  /** Telegram group chatId — each group has its own saved tree. */
+  chatId: string | null;
+  groupTitle?: string;
+  groupMode?: "entry" | "request";
+};
 
-export default function MovementFlowTree({ types }: Props) {
+export default function MovementFlowTree({ types, chatId, groupTitle, groupMode = "request" }: Props) {
   const [workflow, setWorkflow] = useState<SearchMoveWorkflow | null>(null);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
@@ -143,22 +151,28 @@ export default function MovementFlowTree({ types }: Props) {
   }, [fullscreen]);
 
   useEffect(() => {
+    if (!chatId) {
+      setWorkflow(null);
+      setSelectedId(null);
+      setLoadError(null);
+      return;
+    }
     let cancelled = false;
+    setWorkflow(null);
+    setLoadError(null);
+    setSaveMsg(null);
     api
-      .get<SearchMoveWorkflow>("/api/search-move-workflow")
+      .get<SearchMoveWorkflow>(`/api/search-move-workflow?chatId=${encodeURIComponent(chatId)}`)
       .then((wf) => {
         if (cancelled) return;
-        // Guarantee configured movement branches (VR / DR / New Purchase) appear
-        // even if the API briefly returns a tree that predated those ensures.
-        const next = ensureConfiguredMovementBranches(wf);
-        setWorkflow(next);
-        setSelectedId(next.rootId);
+        setWorkflow(wf);
+        setSelectedId(wf.rootId);
       })
       .catch((e: Error) => !cancelled && setLoadError(e.message));
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [chatId]);
 
   const manualTypes = useMemo(
     () => types.filter((t) => !t.isSystem && t.status !== "Inactive"),
@@ -175,8 +189,11 @@ export default function MovementFlowTree({ types }: Props) {
   const hub = workflow ? findSelectMovement(workflow) : null;
   const movements = workflow ? movementBranches(workflow) : [];
 
-  function apply(next: SearchMoveWorkflow) {
-    setWorkflow(next);
+  function apply(next: SearchMoveWorkflow | ((prev: SearchMoveWorkflow) => SearchMoveWorkflow)) {
+    setWorkflow((prev) => {
+      if (!prev) return prev;
+      return typeof next === "function" ? next(prev) : next;
+    });
     setSaveMsg(null);
   }
 
@@ -186,13 +203,21 @@ export default function MovementFlowTree({ types }: Props) {
   }
 
   async function save() {
-    if (!workflow) return;
+    if (!workflow || !chatId) return;
     setSaving(true);
     setSaveMsg(null);
     try {
-      const saved = await api.put<SearchMoveWorkflow>("/api/search-move-workflow", workflow);
+      const saved = await api.put<SearchMoveWorkflow>(
+        `/api/search-move-workflow?chatId=${encodeURIComponent(chatId)}`,
+        workflow
+      );
       setWorkflow(saved);
-      setSaveMsg("Saved — Telegram search groups use this tree now.");
+      const label = groupTitle || chatId;
+      setSaveMsg(
+        groupMode === "entry"
+          ? `Saved — Entries group “${label}” uses this tree in Telegram now.`
+          : `Saved — Requests group “${label}” uses this tree in Telegram now.`
+      );
     } catch (e) {
       setSaveMsg(e instanceof Error ? e.message : "Save failed");
     } finally {
@@ -230,13 +255,26 @@ export default function MovementFlowTree({ types }: Props) {
     if (!workflow) return;
     const payload = readPayload(e);
     if (!payload) return;
-    apply(dropAt(workflow, { parentId, index }, payload));
+    apply((prev) => dropAt(prev, { parentId, index }, payload));
   }
 
   function resetExample() {
-    const example = buildExampleWorkflow();
+    const example =
+      groupMode === "entry"
+        ? buildAddToStockWorkflow(chatId || undefined)
+        : buildExampleWorkflow();
     apply(example);
     setSelectedId(example.rootId);
+  }
+
+  if (!chatId) {
+    return (
+      <section style={panelStyle}>
+        <div style={{ padding: 28, color: "#8a97b0" }}>
+          Select a Telegram group above to load or create that group’s flowchart.
+        </div>
+      </section>
+    );
   }
 
   if (loadError) {
@@ -249,7 +287,7 @@ export default function MovementFlowTree({ types }: Props) {
   if (!workflow || !lead.length) {
     return (
       <section style={panelStyle}>
-        <div style={{ padding: 28, color: "#8a97b0" }}>Loading flowchart…</div>
+        <div style={{ padding: 28, color: "#8a97b0" }}>Loading flowchart for {groupTitle || chatId}…</div>
       </section>
     );
   }
@@ -285,10 +323,19 @@ export default function MovementFlowTree({ types }: Props) {
           ) : null}
           <div style={{ minWidth: 0 }}>
             <div style={{ fontSize: 14, fontWeight: 700, color: "#0b1b45" }}>
-              {fullscreen ? "Workflow builder — fullscreen" : "Movement flowchart"}
+              {fullscreen
+                ? "Workflow builder — fullscreen"
+                : groupMode === "entry"
+                  ? "Entries flowchart"
+                  : "Requests flowchart"}
+              {groupTitle ? (
+                <span style={{ fontWeight: 600, color: "#1560f0", marginLeft: 8 }}>— {groupTitle}</span>
+              ) : null}
             </div>
             <div style={{ fontSize: 12.5, color: "#8a97b0", marginTop: 4, lineHeight: 1.45 }}>
-              Same tree Telegram walks in Requests-mode groups — save to push live. Every node is editable.
+              {groupMode === "entry"
+                ? "Add to Stock + New Purchase for this Entries-mode group — same builder as Requests. Save to push live to Telegram."
+                : "Search → movements / requests for this Requests-mode group. Save to push live to Telegram."}
             </div>
           </div>
         </div>
@@ -318,7 +365,7 @@ export default function MovementFlowTree({ types }: Props) {
             {editorOpen ? "Hide editor" : "Show editor"}
           </button>
           <button type="button" style={secondaryBtnStyle} onClick={resetExample}>
-            Load default example
+            {groupMode === "entry" ? "Load Entries template" : "Load default example"}
           </button>
           <button type="button" style={secondaryBtnStyle} onClick={() => setPreviewOpen(true)}>
             ▶ Try it like Telegram
@@ -505,7 +552,7 @@ export default function MovementFlowTree({ types }: Props) {
                       onRemove={
                         node.kind !== "select_movement" && lead.length > 1
                           ? () => {
-                              apply(removeNode(workflow, node.id));
+                              apply((prev) => removeNode(prev, node.id));
                               if (selectedId === node.id) setSelectedId(workflow.rootId);
                             }
                           : undefined
@@ -562,7 +609,7 @@ export default function MovementFlowTree({ types }: Props) {
                               onDragStart={(e) => startDrag(e, { source: "tree-node", nodeId: move.id })}
                               onDragEnd={endDrag}
                               onRemove={() => {
-                                apply(removeNode(workflow, move.id));
+                                apply((prev) => removeNode(prev, move.id));
                                 if (selectedId === move.id) setSelectedId(hub.id);
                               }}
                             />
@@ -594,7 +641,7 @@ export default function MovementFlowTree({ types }: Props) {
                                     onDragStart={(e) => startDrag(e, { source: "tree-node", nodeId: step.id })}
                                     onDragEnd={endDrag}
                                     onRemove={() => {
-                                      apply(removeNode(workflow, step.id));
+                                      apply((prev) => removeNode(prev, step.id));
                                       if (selectedId === step.id) setSelectedId(move.id);
                                     }}
                                   />
@@ -670,12 +717,12 @@ export default function MovementFlowTree({ types }: Props) {
                   <EditorPanel
                     node={selected}
                     types={manualTypes}
-                    onChange={(patch) => apply(updateNode(workflow, selected.id, patch))}
+                    onChange={(patch) => apply((prev) => updateNode(prev, selected.id, patch))}
                     onRemove={
                       selected.kind === "select_movement"
                         ? undefined
                         : () => {
-                            apply(removeNode(workflow, selected.id));
+                            apply((prev) => removeNode(prev, selected.id));
                             setSelectedId(workflow.rootId);
                           }
                     }
@@ -1123,39 +1170,61 @@ function TelegramPreviewModal({
   const [log, setLog] = useState<{ who: "bot" | "you"; text: string }[]>([]);
   const chatRef = useRef<HTMLDivElement>(null);
 
+  function seedLog(state: PreviewSimState) {
+    const first = previewScreen(workflow, state);
+    setLog([{ who: "bot", text: stripHtml(first.text) }]);
+  }
+
   useEffect(() => {
     if (!open) return;
-    setSim({ ...initialPreviewState(), nodeId: workflow.rootId });
+    const start = { ...initialPreviewState(), nodeId: workflow.rootId };
+    setSim(start);
     setDraft("");
-    setLog([]);
+    seedLog(start);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open, workflow.rootId]);
 
   const screen = useMemo(() => previewScreen(workflow, sim), [workflow, sim]);
 
   useEffect(() => {
-    if (!open) return;
-    if (log.length === 0) {
-      setLog([{ who: "bot", text: stripHtml(screen.text) }]);
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [open]);
-
-  useEffect(() => {
     const el = chatRef.current;
     if (!el) return;
     el.scrollTop = el.scrollHeight;
-  }, [log, screen.text, sim.qtyDraft, open]);
+  }, [log, open]);
 
   function pushLog(who: "bot" | "you", text: string) {
     setLog((prev) => [...prev, { who, text }]);
   }
 
+  /** Telegram edits the same bot message while the qty pad is used — not one bubble per digit. */
+  function replaceLastBot(text: string) {
+    setLog((prev) => {
+      const copy = [...prev];
+      for (let i = copy.length - 1; i >= 0; i--) {
+        if (copy[i].who === "bot") {
+          copy[i] = { who: "bot", text };
+          return copy;
+        }
+      }
+      return [...copy, { who: "bot", text }];
+    });
+  }
+
   function run(action: PreviewButton["action"], value?: string, userLabel?: string) {
+    const isKeypad = action === "qty_digit" || action === "qty_del";
+
+    // Keypad taps only update the draft + live bot bubble (never chat as "you").
+    if (isKeypad) {
+      const next = applyPreviewAction(workflow, sim, action, value);
+      setSim(next);
+      replaceLastBot(stripHtml(previewScreen(workflow, next).text));
+      return;
+    }
+
     if (userLabel) pushLog("you", userLabel);
     const next = applyPreviewAction(workflow, sim, action, value);
     setSim(next);
     setDraft("");
-    if (action === "qty_digit" || action === "qty_del") return;
     const nextScreen = previewScreen(workflow, next);
     pushLog("bot", stripHtml(nextScreen.text));
   }
@@ -1171,15 +1240,20 @@ function TelegramPreviewModal({
   }
 
   function reset() {
-    setSim({ ...initialPreviewState(), nodeId: workflow.rootId });
-    setLog([]);
+    const start = { ...initialPreviewState(), nodeId: workflow.rootId };
+    setSim(start);
     setDraft("");
+    seedLog(start);
   }
 
   if (!open) return null;
 
-  const qtyPad = screen.buttons.filter((b) => b.action === "qty_digit" || b.action === "qty_del");
+  const qtyKeys = screen.buttons.filter((b) => b.action === "qty_digit" || b.action === "qty_del");
+  const qtyDigits = qtyKeys.filter((b) => b.label !== "×");
+  const qtyTimes = qtyKeys.find((b) => b.label === "×");
   const otherBtns = screen.buttons.filter((b) => b.action !== "qty_digit" && b.action !== "qty_del");
+  const qtyNext = otherBtns.find((b) => b.action === "qty_ok");
+  const restBtns = otherBtns.filter((b) => b.action !== "qty_ok");
 
   return (
     <div
@@ -1273,24 +1347,42 @@ function TelegramPreviewModal({
         </div>
 
         <div style={{ flexShrink: 0, padding: "10px 12px 14px", background: "#17212b", borderTop: "1px solid rgba(255,255,255,.06)" }}>
-          {qtyPad.length ? (
-            <div
-              style={{
-                display: "grid",
-                gridTemplateColumns: "repeat(3, 1fr)",
-                gap: 6,
-                marginBottom: 8,
-              }}
-            >
-              {qtyPad.map((b, i) => (
-                <button key={`${b.label}-${i}`} type="button" style={tgBtn} onClick={() => run(b.action, b.value, b.label)}>
-                  {b.label}
-                </button>
-              ))}
-            </div>
+          {qtyDigits.length ? (
+            <>
+              <div
+                style={{
+                  display: "grid",
+                  gridTemplateColumns: "repeat(3, 1fr)",
+                  gap: 6,
+                  marginBottom: 8,
+                }}
+              >
+                {qtyDigits.map((b, i) => (
+                  <button key={`${b.label}-${i}`} type="button" style={tgBtn} onClick={() => run(b.action, b.value)}>
+                    {b.label}
+                  </button>
+                ))}
+              </div>
+              <div style={{ display: "flex", gap: 6, marginBottom: 8 }}>
+                {qtyTimes ? (
+                  <button type="button" style={{ ...tgBtn, flex: 1 }} onClick={() => run(qtyTimes.action, qtyTimes.value)}>
+                    ×
+                  </button>
+                ) : null}
+                {qtyNext ? (
+                  <button
+                    type="button"
+                    style={{ ...tgBtn, flex: 2 }}
+                    onClick={() => run("qty_ok", undefined, sim.qtyDraft.trim() || "—")}
+                  >
+                    ✔ Next
+                  </button>
+                ) : null}
+              </div>
+            </>
           ) : null}
           <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
-            {otherBtns.map((b, i) => (
+            {restBtns.map((b, i) => (
               <button key={`${b.label}-${i}`} type="button" style={tgBtn} onClick={() => run(b.action, b.value, b.label)}>
                 {b.label}
               </button>

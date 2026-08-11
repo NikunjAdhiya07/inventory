@@ -4,6 +4,7 @@ import {
   applyMoveCallback,
   applyMoveMessage,
   categoryPathOf,
+  categoryPickOptions,
   clearCategoryPath,
   clearMoveUi,
   continueAfterProductPick,
@@ -14,6 +15,8 @@ import {
   setCategoryPath,
   startSearchFlow,
 } from "./move-engine";
+import { rootCategoryNames } from "./categories";
+import { parseQuantityRepeat, pressQuantityKey, quantityRepeatHint, draftQtyParts, formatQtyUnit, formatItemQtySummary } from "./quantity-repeat";
 import { getSearchMoveWorkflow, leadInHasKind, leadInNode, collectQuestions, resolveStockEffectFromBranch } from "./search-move-workflow";
 import { resolveStockEffectFromAnswers } from "./movement-questions";
 import { activeMovementTypes, toMovementType } from "./movements";
@@ -308,10 +311,15 @@ async function renderQtyPad(db: Db, request: ItemRequest): Promise<RenderResult>
   }
 
   const draft = request.ui.qtyDraft ?? "";
+  const parts = draftQtyParts(draft);
+  const unit = line.unit || hit.unit || "";
+  const qtyLine = `Qty: <b>${esc(parts.qtyLabel)}</b>${unit ? ` ${esc(unit)}` : ""}`;
+  const entriesLine = parts.hasTimes ? `\nEntries: <b>${esc(parts.entriesLabel || "—")}</b>` : "";
   const text =
     `<b>${esc(hit.name)}</b>\n` +
-    `${esc(line.locationPath)} · ${money(line.qty)} ${esc(line.unit)} available\n\n` +
-    `Qty: <b>${draft || "—"}</b>`;
+    `${esc(line.locationPath)} · ${money(line.qty)} ${esc(unit)} available\n\n` +
+    `How many?\n\n${qtyLine}${entriesLine}\n\n` +
+    quantityRepeatHint();
 
   const key = (d: string) => ({ text: d, callback_data: `rq:q:${d}` });
   const keyboard: InlineKeyboard = [
@@ -319,7 +327,10 @@ async function renderQtyPad(db: Db, request: ItemRequest): Promise<RenderResult>
     ["4", "5", "6"].map(key),
     ["7", "8", "9"].map(key),
     [key("."), key("0"), { text: "⌫", callback_data: "rq:q:del" }],
-    [{ text: "✔ Add", callback_data: "rq:q:ok" }],
+    [
+      { text: "×", callback_data: "rq:q:x" },
+      { text: "✔ Add", callback_data: "rq:q:ok" },
+    ],
     [{ text: "⬅ Back", callback_data: "rq:back" }],
     footer(request),
   ];
@@ -347,7 +358,7 @@ function renderCart(request: ItemRequest): RenderResult {
     text: lines.join("\n"),
     keyboard: [
       ...buttonRows(removes, 2),
-      [{ text: "➕ Add another movement", callback_data: "rq:again" }],
+      [{ text: "➕ Add Another Item", callback_data: "rq:again" }],
       [{ text: "✅ Submit", callback_data: "rq:sub" }],
       [{ text: "✖ Cancel", callback_data: "rq:cancel" }],
     ],
@@ -357,15 +368,25 @@ function renderCart(request: ItemRequest): RenderResult {
 function cartLines(lines: RequestLine[]): string[] {
   return lines.map((l, i) => {
     const moveLabel = l.movementName ? `${esc(l.movementName)} · ` : "";
-    const head = `<b>${i + 1}. ${moveLabel}${esc(l.productName)}</b> × ${money(l.qty)} ${esc(l.unit)}`;
+    // Em dash — never use × between item and quantity (× means entry repeat).
+    const head = `<b>${i + 1}. ${moveLabel}${esc(l.productName)}</b> — ${esc(formatQtyUnit(l.qty, l.unit))}`;
     const mark =
       l.outcome === "unavailable"
         ? "  ⚠️ <i>not available</i>"
         : l.outcome === "issued" || l.outcome === "recorded"
           ? "  ✅"
           : "";
-    const extras: string[] = [`   📍 ${esc(l.locationPath)}${mark}`];
+    const extras: string[] = [];
+    if (l.fromLocationId && l.toLocationId) {
+      extras.push(`   From: ${esc(l.fromLocationPath || l.locationPath)}`);
+      extras.push(`   To: ${esc(l.toLocationPath || "—")}`);
+      if (l.outcome === "unavailable") extras[extras.length - 1] += "  ⚠️ <i>not available</i>";
+      else if (l.outcome === "issued" || l.outcome === "recorded") extras[extras.length - 1] += "  ✅";
+    } else {
+      extras.push(`   📍 ${esc(l.locationPath)}${mark}`);
+    }
     if (l.vendorName) extras.push(`   Vendor: ${esc(l.vendorName)}`);
+    if (l.plantName) extras.push(`   From Plant: ${esc(l.plantName)}`);
     if (l.departmentName) extras.push(`   Department: ${esc(l.departmentName)}`);
     for (const a of l.answers ?? []) {
       extras.push(`   ${esc(a.label)}: ${esc(a.display)}`);
@@ -418,8 +439,8 @@ export function resolvePurchaseStatus(
   if (/received/i.test(display) && !/expected|ordered/i.test(display)) return "received";
   if (/ordered|expected/i.test(display)) return "expected";
   if (/received/i.test(display)) return "received";
-  // Unclear → do not invent a stock receipt.
-  return "expected";
+  // Simple New Purchase flow has no status question — treat as received stock-in.
+  return "received";
 }
 
 // ---------------------------------------------------------------------------
@@ -733,7 +754,7 @@ export async function applyDraftCallback(
       ui.focusLocationId = null;
       ui.intentLocationPicked = false;
       clearMoveUi(ui);
-      const wf = await getSearchMoveWorkflow(db);
+      const wf = await getSearchMoveWorkflow(db, request.chatId);
       ui.flowNodeId = wf.rootId;
       ui.intent = "move";
       return { render: await renderMoveFlow(db, request) };
@@ -747,7 +768,7 @@ export async function applyDraftCallback(
       ui.intentLocationPicked = false;
       clearMoveUi(ui);
       if (ui.query) {
-        const wf = await getSearchMoveWorkflow(db);
+        const wf = await getSearchMoveWorkflow(db, request.chatId);
         ui.flowNodeId = wf.rootId;
         ui.intent = "move";
         return { render: await renderMoveFlow(db, request) };
@@ -758,9 +779,10 @@ export async function applyDraftCallback(
       setCategoryPath(ui, path);
       ui.page = 0;
       if (!path.length) {
-        const raw = await lookupProducts(db, ui.query);
-        const categories = uniqueCategories(raw);
-        if (categories.length <= 1) {
+        // Back to empty path: if master still auto-matches the query to one
+        // category, clear the search instead of bouncing into a one-item list.
+        const options = await categoryPickOptions(db, ui.query);
+        if (options.length <= 1) {
           ui.query = "";
           clearMoveUi(ui);
         }
@@ -798,8 +820,8 @@ export async function applyDraftCallback(
   }
 
   if (data.startsWith("rq:cat:")) {
-    const hits = await lookupProducts(db, ui.query);
-    const categories = uniqueCategories(hits);
+    // Indices match Category Master roots shown on the pick keyboard.
+    const categories = await rootCategoryNames(db);
     const cat = categories[Number(data.slice("rq:cat:".length))];
     if (!cat) return { notice: "That category is no longer available." };
     setCategoryPath(ui, [cat]);
@@ -808,7 +830,7 @@ export async function applyDraftCallback(
     ui.focusLocationId = null;
     ui.intentLocationPicked = false;
     // Stay on pick_category (or search) node — renderMoveFlow drills children / items.
-    const wf = await getSearchMoveWorkflow(db);
+    const wf = await getSearchMoveWorkflow(db, request.chatId);
     if (leadInHasKind(wf, "pick_category")) {
       const catNode = leadInNode(wf, "pick_category");
       if (catNode) ui.flowNodeId = catNode.id;
@@ -831,7 +853,7 @@ export async function applyDraftCallback(
     ui.focusLocationId = null;
     ui.intentLocationPicked = false;
     ui.intent = "move";
-    const wf = await getSearchMoveWorkflow(db);
+    const wf = await getSearchMoveWorkflow(db, request.chatId);
     if (leadInHasKind(wf, "pick_category")) {
       const catNode = leadInNode(wf, "pick_category");
       // Stay on pick_category while more children remain; otherwise back to search for items.
@@ -852,7 +874,9 @@ export async function applyDraftCallback(
     ui.focusLocationId = null;
     ui.intentLocationPicked = false;
     ui.qtyDraft = "";
-    // Continue the same flowchart after discovery (location → select movement → …)
+    // Product Master category is source of truth — do not re-ask.
+    const catPath = [hit.category, hit.subcategory].map((s) => String(s ?? "").trim()).filter(Boolean);
+    if (catPath.length) setCategoryPath(ui, catPath);
     return { render: await continueAfterProductPick(db, request) };
   }
 
@@ -894,9 +918,11 @@ export async function applyDraftCallback(
     clearMoveUi(ui);
     return {
       render: {
-        text: `<b>Cart — ${request.lines.length}</b> line${request.lines.length === 1 ? "" : "s"} saved.\n\nType an item name to add another movement.`,
+        text: `<b>Add another item</b>\n\nType a product name to search.`,
         keyboard: [
-          [{ text: `🧺 View cart (${request.lines.length})`, callback_data: "rq:cart" }],
+          ...(request.lines.length
+            ? [[{ text: `🛒 View Cart (${request.lines.length})`, callback_data: "rq:cart" }]]
+            : []),
           [{ text: "✖ Cancel", callback_data: "rq:cancel" }],
         ],
       },
@@ -912,39 +938,58 @@ async function applyQtyKey(db: Db, request: ItemRequest, pressed: string): Promi
 
   if (pressed === "ok") return commitLine(db, request, draft);
 
-  if (pressed === "del") draft = draft.slice(0, -1);
-  else if (pressed === ".") {
-    if (draft.includes(".")) return { notice: "Only one decimal point." };
-    draft = draft === "" ? "0." : `${draft}.`;
-  } else {
-    if (draft.replace(".", "").length >= 9) return { notice: "That's as large as a quantity can get." };
-    draft = draft === "0" ? pressed : draft + pressed;
-  }
-
-  ui.qtyDraft = draft;
+  const next = pressQuantityKey(draft, pressed);
+  if (next.notice) return { notice: next.notice };
+  ui.qtyDraft = next.value;
   return { render: await renderRequest(db, request) };
 }
 
 // Add the focused product+location+quantity to the cart.
+// Draft may be "200" or "200 × 5" — times creates that many independent lines
+// of qty each (not qty×times as a single amount).
 async function commitLine(db: Db, request: ItemRequest, draft: string): Promise<RequestResult> {
-  const qty = Number(draft);
-  if (!draft || !Number.isFinite(qty) || qty <= 0) return { notice: "Enter a quantity first." };
-  if (request.lines.length >= MAX_LINES) {
-    return { notice: `A request can hold at most ${MAX_LINES} items.` };
+  const parsed = parseQuantityRepeat(draft);
+  if (!parsed.ok) return { notice: parsed.notice };
+  const { qty, times } = parsed.value;
+
+  if (request.lines.length + times > MAX_LINES) {
+    const room = MAX_LINES - request.lines.length;
+    return {
+      notice:
+        room <= 0
+          ? `A request can hold at most ${MAX_LINES} items.`
+          : `Only ${room} more entr${room === 1 ? "y" : "ies"} fit (max ${MAX_LINES}). Lower × entries.`,
+    };
   }
 
   const hit = await focusedHit(db, request);
   if (!hit) return { notice: "That item is no longer available." };
 
-  const locationId = request.ui.focusLocationId || request.ui.moveLocationId || request.ui.moveToLocationId;
-  if (!locationId) return { notice: "Pick a storage location first." };
-
   const moveCode = request.ui.moveTypeCode || undefined;
   const types = moveCode ? (await activeMovementTypes(db)).map(toMovementType) : [];
   const moveType = moveCode ? types.find((t) => t.code === moveCode) : undefined;
   const direction = moveType?.direction;
+  const isTransfer = direction === "transfer" || moveCode === "warehouse-transfer";
 
-  const wf = moveCode ? await getSearchMoveWorkflow(db) : null;
+  const fromLocationId = request.ui.moveFromLocationId || undefined;
+  const toLocationId = request.ui.moveToLocationId || undefined;
+
+  if (isTransfer) {
+    if (!fromLocationId) return { notice: "Pick where the stock is currently." };
+    if (!toLocationId) return { notice: "Pick where you want to move it." };
+    if (fromLocationId === toLocationId) {
+      return { notice: "Source and destination must be different." };
+    }
+  }
+
+  const locationId =
+    (isTransfer ? fromLocationId : undefined) ||
+    request.ui.focusLocationId ||
+    request.ui.moveLocationId ||
+    request.ui.moveToLocationId;
+  if (!locationId) return { notice: "Pick a storage location first." };
+
+  const wf = moveCode ? await getSearchMoveWorkflow(db, request.chatId) : null;
   const moveNode =
     wf && moveCode
       ? Object.values(wf.nodes).find((n) => n.kind === "movement" && n.movementCode === moveCode)
@@ -960,11 +1005,22 @@ async function commitLine(db: Db, request: ItemRequest, draft: string): Promise<
     movementCode: moveCode,
   });
 
+  const fromPath =
+    (fromLocationId &&
+      (hit.lines.find((l) => l.locationId === fromLocationId)?.locationPath ||
+        (await locationPathById(db, fromLocationId)))) ||
+    "";
+  const toPath = toLocationId ? (await locationPathById(db, toLocationId)) || "" : "";
+
   const stockLine = hit.lines.find((l) => l.locationId === locationId);
   const locationPath =
-    stockLine?.locationPath || (await locationPathById(db, locationId)) || "(unknown location)";
+    isTransfer && fromPath
+      ? fromPath
+      : stockLine?.locationPath || (await locationPathById(db, locationId)) || "(unknown location)";
   const unit = stockLine?.unit || hit.unit;
+  const totalRequested = qty * times;
 
+  // Transfer / outbound: validate source stock at cart time (existing architecture).
   if (!receiving) {
     const shortage = await findOutboundShortage(db, {
       productId: hit.productId,
@@ -973,7 +1029,7 @@ async function commitLine(db: Db, request: ItemRequest, draft: string): Promise<
       locationId,
       locationPath,
       unit,
-      qty,
+      qty: totalRequested,
       inbound: false,
     });
     if (shortage) {
@@ -984,7 +1040,9 @@ async function commitLine(db: Db, request: ItemRequest, draft: string): Promise<
       note(
         request,
         request.requesterName || "Requester",
-        `Out of stock: ${hit.name} — requested ${money(qty)} ${unit}, available ${money(shortage.available)} at ${locationPath}.`
+        `Out of stock: ${hit.name} — requested ${money(totalRequested)} ${unit}` +
+          (times > 1 ? ` (${money(qty)} × ${times} entries)` : "") +
+          `, available ${money(shortage.available)} at ${locationPath}.`
       );
       return {
         render: renderOutOfStock(request, shortage, moveType?.name),
@@ -1012,78 +1070,144 @@ async function commitLine(db: Db, request: ItemRequest, draft: string): Promise<
     movementDirection: direction,
     vendorId: request.ui.moveVendorId || undefined,
     vendorName: request.ui.moveVendorName || undefined,
+    plantId: request.ui.movePlantId || undefined,
+    plantName: request.ui.movePlantName || undefined,
     departmentId: request.ui.moveDepartmentId || undefined,
     departmentName: request.ui.moveDepartmentName || undefined,
     reference: request.ui.moveReference?.trim() || undefined,
     answers,
     purchaseStatus,
     stockEffect,
+    ...(isTransfer && fromLocationId && toLocationId
+      ? {
+          fromLocationId,
+          fromLocationPath: fromPath || locationPath,
+          toLocationId,
+          toLocationPath: toPath || "(unknown location)",
+        }
+      : {}),
   };
 
-  // Same product+location+movement snapshot merges qty; different movements stay separate lines.
-  const existing = request.lines.find(
-    (l) =>
-      l.productId === hit.productId &&
-      l.locationId === locationId &&
-      (l.movementCode || undefined) === (snapshot.movementCode || undefined) &&
-      (l.vendorId || undefined) === (snapshot.vendorId || undefined) &&
-      (l.departmentId || undefined) === (snapshot.departmentId || undefined) &&
-      (l.reference || undefined) === (snapshot.reference || undefined) &&
-      (l.purchaseStatus || undefined) === (snapshot.purchaseStatus || undefined) &&
-      (l.stockEffect || undefined) === (snapshot.stockEffect || undefined)
-  );
-  if (existing) {
-    if (!receiving) {
-      const shortage = await findOutboundShortage(db, {
+  // Single line (200): keep merge-with-existing behaviour.
+  // Multiple lines (200 × 5): always create independent cart lines — never merge.
+  if (times === 1) {
+    const existing = request.lines.find(
+      (l) =>
+        l.productId === hit.productId &&
+        l.locationId === locationId &&
+        (l.movementCode || undefined) === (snapshot.movementCode || undefined) &&
+        (l.vendorId || undefined) === (snapshot.vendorId || undefined) &&
+        (l.plantId || undefined) === (snapshot.plantId || undefined) &&
+        (l.departmentId || undefined) === (snapshot.departmentId || undefined) &&
+        (l.fromLocationId || undefined) === (snapshot.fromLocationId || undefined) &&
+        (l.toLocationId || undefined) === (snapshot.toLocationId || undefined) &&
+        (l.reference || undefined) === (snapshot.reference || undefined) &&
+        (l.purchaseStatus || undefined) === (snapshot.purchaseStatus || undefined) &&
+        (l.stockEffect || undefined) === (snapshot.stockEffect || undefined)
+    );
+    if (existing) {
+      if (!receiving) {
+        const shortage = await findOutboundShortage(db, {
+          productId: hit.productId,
+          productName: hit.name,
+          productNumber: hit.productNumber,
+          locationId,
+          locationPath,
+          unit,
+          qty: existing.qty + qty,
+          inbound: false,
+        });
+        if (shortage) {
+          await persistOutboundShortage(db, request, shortage, "cart", {
+            code: moveCode,
+            name: moveType?.name,
+          });
+          note(
+            request,
+            request.requesterName || "Requester",
+            `Out of stock (cart merge): ${hit.name} — need ${money(existing.qty + qty)} ${unit}, available ${money(shortage.available)}.`
+          );
+          return {
+            render: renderOutOfStock(request, shortage, moveType?.name),
+            notice: "Out of stock — not enough available at that location.",
+          };
+        }
+      }
+      existing.qty += qty;
+    } else {
+      request.lines.push({
+        lineId: nextLineId(request),
         productId: hit.productId,
         productName: hit.name,
         productNumber: hit.productNumber,
+        category: hit.category,
+        subcategory: hit.subcategory,
+        attributes: hit.attributes,
         locationId,
         locationPath,
+        qty,
         unit,
-        qty: existing.qty + qty,
-        inbound: false,
+        ...snapshot,
       });
-      if (shortage) {
-        await persistOutboundShortage(db, request, shortage, "cart", {
-          code: moveCode,
-          name: moveType?.name,
-        });
-        note(
-          request,
-          request.requesterName || "Requester",
-          `Out of stock (cart merge): ${hit.name} — need ${money(existing.qty + qty)} ${unit}, available ${money(shortage.available)}.`
-        );
-        return {
-          render: renderOutOfStock(request, shortage, moveType?.name),
-          notice: "Out of stock — not enough available at that location.",
-        };
-      }
     }
-    existing.qty += qty;
   } else {
-    request.lines.push({
-      lineId: nextLineId(request),
-      productId: hit.productId,
-      productName: hit.name,
-      productNumber: hit.productNumber,
-      category: hit.category,
-      subcategory: hit.subcategory,
-      attributes: hit.attributes,
-      locationId,
-      locationPath,
-      qty,
-      unit,
-      ...snapshot,
-    });
+    for (let i = 0; i < times; i++) {
+      request.lines.push({
+        lineId: nextLineId(request),
+        productId: hit.productId,
+        productName: hit.name,
+        productNumber: hit.productNumber,
+        category: hit.category,
+        subcategory: hit.subcategory,
+        attributes: hit.attributes,
+        locationId,
+        locationPath,
+        qty,
+        unit,
+        ...snapshot,
+      });
+    }
   }
 
-  // Back to the results the requester was searching, so adding a second item
-  // takes one tap rather than a fresh search.
+  const added = times;
+  const summary = formatItemQtySummary(hit.name, qty, unit, times);
+  const isPurchase = moveCode === "new-purchase";
+  const isReturn = moveCode === "return-from-plant";
+  const isMoveStock = isTransfer || moveCode === "warehouse-transfer";
+  const vendorName = request.ui.moveVendorName || "";
+  const plantName = request.ui.movePlantName || "";
+  const movePath =
+    isMoveStock && fromPath && toPath ? `\nFrom: ${esc(fromPath)}\nTo: ${esc(toPath)}` : "";
+  const addedLabel =
+    added === 1
+      ? `✅ <b>Added to Cart</b>\n\n${esc(summary)}${
+          isPurchase && vendorName ? `\nVendor: ${esc(vendorName)}` : ""
+        }${isReturn && plantName ? `\nFrom Plant: ${esc(plantName)}` : ""}${movePath}`
+      : isPurchase
+        ? `✅ <b>Added ${added} purchase entries to your cart</b>\n\n${esc(summary)}\n<i>Each entry is ${esc(formatQtyUnit(qty, unit))}.</i>`
+        : isReturn
+          ? `✅ <b>Added ${added} return entries to your cart</b>\n\n${esc(summary)}\n<i>Each entry is ${esc(formatQtyUnit(qty, unit))}.</i>`
+          : isMoveStock
+            ? `✅ <b>Added ${added} stock-move entries to your cart</b>\n\n${esc(summary)}${movePath}\n<i>Each entry is ${esc(formatQtyUnit(qty, unit))}.</i>`
+        : `✅ <b>Added ${added} entries to your cart</b>\n\n${esc(summary)}\n<i>Each entry is ${esc(formatQtyUnit(qty, unit))}.</i>`;
+
+  // Back to a clear post-add screen — Add to Cart was the confirmation.
   request.ui.focusProductId = null;
   request.ui.focusLocationId = null;
   request.ui.qtyDraft = "";
-  return { render: await renderRequest(db, request) };
+  clearCategoryPath(request.ui);
+  clearMoveUi(request.ui);
+
+  return {
+    render: {
+      text: `${addedLabel}\n\nCart now has <b>${request.lines.length}</b> line${request.lines.length === 1 ? "" : "s"}.`,
+      keyboard: [
+        [{ text: "➕ Add Another Item", callback_data: "rq:again" }],
+        [{ text: `🛒 View Cart (${request.lines.length})`, callback_data: "rq:cart" }],
+        [{ text: "✖ Cancel", callback_data: "rq:cancel" }],
+      ],
+    },
+  };
 }
 
 // Short, stable and never reused — it ends up inside callback data (which

@@ -65,6 +65,7 @@ const CACHED_COLLECTIONS = new Set([
   // history page, changed only when an admin edits the master.
   "movementTypes",
   "vendors",
+  "plants",
   "departments",
   "units",
   "locations",

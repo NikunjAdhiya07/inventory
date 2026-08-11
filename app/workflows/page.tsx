@@ -30,7 +30,7 @@ type StepLibEntry = { id: string; type: string; name: string; desc: string; icon
 type StepInstance = { instanceId: string; type: string; label: string; required: boolean; order: number; config: Record<string, unknown> };
 type Workflow = { id: string; name: string; desc: string; status: "Draft" | "Active"; version: number; isDefault: boolean; steps: StepInstance[] };
 type Assignment = { id: string; scope: "group" | "category"; chatId?: string; category?: string };
-type Group = { id: string; chatId: string; title: string; status: string };
+type Group = { id: string; chatId: string; title: string; status: string; mode?: "entry" | "request"; approved?: boolean };
 type Named = { id: string; name: string };
 type Version = { id: string; version: number; name: string; steps: StepInstance[]; createdAt: string; createdBy: string };
 
@@ -49,7 +49,10 @@ export default function WorkflowsPage() {
   const [groups, setGroups] = useState<Group[]>([]);
 
   const [createOpen, setCreateOpen] = useState(false);
-  const [newName, setNewName] = useState("");
+  const [newName, setNewName] = useState("Data Entry — Add to Stock");
+  const [assignGroupChatId, setAssignGroupChatId] = useState("");
+  const [creatingTemplate, setCreatingTemplate] = useState(false);
+  const [createError, setCreateError] = useState<string | null>(null);
 
   // Builder state.
   const [builder, setBuilder] = useState<Workflow | null>(null);
@@ -67,6 +70,7 @@ export default function WorkflowsPage() {
   const [loadError, setLoadError] = useState<string | null>(null);
   const [requestViewOpen, setRequestViewOpen] = useState(false);
   const [movementTypes, setMovementTypes] = useState<MovementTypeRow[]>([]);
+  const [flowchartChatId, setFlowchartChatId] = useState("");
 
   useEffect(() => {
     let cancelled = false;
@@ -88,7 +92,16 @@ export default function WorkflowsPage() {
     api.get<Named[]>("/api/roles").then((d) => !cancelled && setRoles(d), onError);
     api.get<Named[]>("/api/products").then((d) => !cancelled && setProducts(d), onError);
     api.get<Named[]>("/api/option-trees").then((d) => !cancelled && setTrees(d), onError);
-    api.get<Group[]>("/api/telegram-groups").then((d) => !cancelled && setGroups(d), onError);
+    api.get<Group[]>("/api/telegram-groups").then((d) => {
+      if (cancelled) return;
+      setGroups(d);
+      const active = d.filter((g) => g.status === "Active");
+      const preferred =
+        active.find((g) => (g.mode ?? "entry") === "entry") ??
+        active[0] ??
+        d[0];
+      if (preferred) setFlowchartChatId((prev) => prev || preferred.chatId);
+    }, onError);
     api.get<MovementTypeRow[]>("/api/movement-types").then((d) => !cancelled && setMovementTypes(d), onError);
     return () => {
       cancelled = true;
@@ -106,12 +119,44 @@ export default function WorkflowsPage() {
   }
 
   // ---------------- create ----------------
-  async function createWorkflow() {
-    if (!newName.trim()) return;
-    const created = await api.post<Workflow>("/api/workflows", { name: newName.trim() });
+  const entryGroups = groups.filter((g) => (g.mode ?? "entry") === "entry" && g.status === "Active");
+
+  function openCreateModal() {
+    setNewName("Data Entry — Add to Stock");
+    setAssignGroupChatId(entryGroups[0]?.chatId ?? "");
+    setCreateError(null);
+    setCreateOpen(true);
+  }
+
+  async function createAddToStockWorkflow() {
+    if (!assignGroupChatId) {
+      setCreateError("Select an Entries-mode Telegram group.");
+      return;
+    }
+    setCreatingTemplate(true);
+    setCreateError(null);
+    try {
+      const created = await api.post<Workflow & { assignedGroupTitle?: string }>("/api/workflows/from-template", {
+        name: newName.trim() || "Data Entry — Add to Stock",
+        chatId: assignGroupChatId,
+      });
+      setWorkflows((prev) => [created, ...prev]);
+      setCreateOpen(false);
+      setNewName("Data Entry — Add to Stock");
+      setAssignGroupChatId("");
+    } catch (e) {
+      setCreateError(e instanceof Error ? e.message : "Could not create workflow");
+    } finally {
+      setCreatingTemplate(false);
+    }
+  }
+
+  async function createBlankWorkflow() {
+    const name = newName.trim() || "Untitled workflow";
+    const created = await api.post<Workflow>("/api/workflows", { name });
     setWorkflows((prev) => [created, ...prev]);
     setCreateOpen(false);
-    setNewName("");
+    setNewName("Data Entry — Add to Stock");
     setBuilder({ ...created, steps: created.steps || [] });
   }
 
@@ -211,22 +256,71 @@ export default function WorkflowsPage() {
   }
 
   const activeCount = workflows.filter((w) => w.status === "Active").length;
+  const flowchartGroup = groups.find((g) => g.chatId === flowchartChatId) ?? null;
+  const flowchartMode = (flowchartGroup?.mode ?? "entry") as "entry" | "request";
 
   return (
     <PageShell section="Automation" page="Workflows" maxWidth={false}>
       <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", gap: 20, marginBottom: 22 }}>
         <PageIntro
           title="Workflows"
-          description="Search-group flowchart (drag movements & questions, edit Telegram messages), plus Entry workflows for Entries-mode groups."
+          description="Per-group flowcharts (same builder for Entries and Requests). Pick a Telegram group to edit that group’s live tree."
         />
-        <button onClick={() => setCreateOpen(true)} style={addBtnStyle}>
+        <button onClick={openCreateModal} style={addBtnStyle}>
           ＋ New Entry Workflow
         </button>
       </div>
 
       {loadError && <ErrorBanner message={loadError} />}
 
-      <MovementFlowTree types={movementTypes} />
+      <div
+        style={{
+          display: "flex",
+          flexWrap: "wrap",
+          alignItems: "flex-end",
+          gap: 14,
+          marginBottom: 14,
+          padding: "14px 16px",
+          background: "#fff",
+          border: "1px solid #e9edf3",
+          borderRadius: 14,
+          boxShadow: "0 1px 2px rgba(16,30,54,.04)",
+        }}
+      >
+        <div style={{ minWidth: 280, flex: "1 1 280px" }}>
+          <label style={labelStyle}>Telegram group</label>
+          <select
+            value={flowchartChatId}
+            onChange={(e) => setFlowchartChatId(e.target.value)}
+            style={inputStyle}
+          >
+            {!groups.length ? <option value="">No groups yet</option> : null}
+            {groups.map((g) => (
+              <option key={g.id} value={g.chatId}>
+                {g.title} · {(g.mode ?? "entry") === "request" ? "Requests" : "Entries"}
+                {g.status !== "Active" ? " (inactive)" : ""}
+              </option>
+            ))}
+          </select>
+        </div>
+        {flowchartGroup ? (
+          <div style={{ fontSize: 12.5, color: "#5a6a86", paddingBottom: 10, lineHeight: 1.45 }}>
+            Mode:{" "}
+            <b style={{ color: flowchartMode === "request" ? "#0d9488" : "#1560f0" }}>
+              {flowchartMode === "request" ? "Requests" : "Entries"}
+            </b>
+            {" — "}
+            change mode on Telegram Groups. Each group keeps its own saved flowchart.
+          </div>
+        ) : null}
+      </div>
+
+      <MovementFlowTree
+        types={movementTypes}
+        chatId={flowchartChatId || null}
+        groupTitle={flowchartGroup?.title}
+        groupMode={flowchartMode}
+      />
 
       <RequestWorkflowPreview variant="panel" />
 
@@ -331,22 +425,79 @@ export default function WorkflowsPage() {
         </Modal>
       ) : null}
 
-      {/* Create */}
+      {/* Create Add-to-Stock + assign */}
       {createOpen ? (
-        <Modal onClose={() => setCreateOpen(false)} maxWidth={460}>
-          <ModalHeader title="New Entry Workflow" subtitle="For Entries-mode groups only. The search-group bot (Requests mode) is fixed and previewed above." onClose={() => setCreateOpen(false)} />
+        <Modal onClose={() => !creatingTemplate && setCreateOpen(false)} maxWidth={480}>
+          <ModalHeader
+            title="New Entry Workflow"
+            subtitle="Creates the Add-to-Stock flow (product → qty → unit → location → Add to Cart), activates it, and assigns it to an Entries-mode group."
+            onClose={() => !creatingTemplate && setCreateOpen(false)}
+          />
           <div style={{ padding: "22px 24px" }}>
             <label style={labelStyle}>
               Workflow Name <span style={{ color: "#e0524f" }}>*</span>
             </label>
-            <input value={newName} onChange={(e) => setNewName(e.target.value)} placeholder="e.g. High-Value Item Entry" style={inputStyle} autoFocus />
+            <input
+              value={newName}
+              onChange={(e) => setNewName(e.target.value)}
+              placeholder="Data Entry — Add to Stock"
+              style={inputStyle}
+              autoFocus
+              disabled={creatingTemplate}
+            />
+
+            <label style={{ ...labelStyle, marginTop: 16 }}>
+              Telegram group <span style={{ color: "#e0524f" }}>*</span>
+            </label>
+            <select
+              value={assignGroupChatId}
+              onChange={(e) => setAssignGroupChatId(e.target.value)}
+              style={inputStyle}
+              disabled={creatingTemplate || entryGroups.length === 0}
+            >
+              {entryGroups.length === 0 ? (
+                <option value="">No Entries-mode groups — set mode on Telegram Groups</option>
+              ) : (
+                <>
+                  <option value="">Select group…</option>
+                  {entryGroups.map((g) => (
+                    <option key={g.id} value={g.chatId}>
+                      {g.title} ({g.chatId})
+                    </option>
+                  ))}
+                </>
+              )}
+            </select>
+            <div style={{ marginTop: 8, fontSize: 12, color: "#8a97b0", lineHeight: 1.45 }}>
+              Only Entries-mode groups are listed. Issue / Return / Transfer stay on the search-group flowchart for later.
+            </div>
+
+            {createError ? (
+              <div style={{ marginTop: 14, padding: "10px 12px", borderRadius: 9, background: "#fdecec", color: "#d63a3a", fontSize: 13 }}>
+                {createError}
+              </div>
+            ) : null}
           </div>
           <ModalFooter>
-            <button onClick={() => setCreateOpen(false)} style={secondaryBtnStyle}>
+            <button
+              type="button"
+              onClick={createBlankWorkflow}
+              style={secondaryBtnStyle}
+              disabled={creatingTemplate}
+              title="Empty draft — build steps yourself"
+            >
+              Blank & build
+            </button>
+            <button type="button" onClick={() => setCreateOpen(false)} style={secondaryBtnStyle} disabled={creatingTemplate}>
               Cancel
             </button>
-            <button onClick={createWorkflow} style={primaryBtnStyle}>
-              Create & Build
+            <button
+              type="button"
+              onClick={createAddToStockWorkflow}
+              style={{ ...primaryBtnStyle, opacity: creatingTemplate || !assignGroupChatId ? 0.7 : 1 }}
+              disabled={creatingTemplate || !assignGroupChatId}
+            >
+              {creatingTemplate ? "Creating…" : "Create, activate & assign"}
             </button>
           </ModalFooter>
         </Modal>
@@ -569,14 +720,16 @@ export default function WorkflowsPage() {
 
 function defaultLabel(entry: StepLibEntry): string {
   const map: Record<string, string> = {
-    item_capture: "Send the item name and/or a photo of the product.",
+    item_capture: "Send a photo or type the product name",
     product_select: "Select the product:",
-    category_select: "Select a category:",
-    subcategory_select: "Select a subcategory:",
+    stock_type: "What kind of stock entry is this?",
+    category_select: "Select the category:",
+    subcategory_select: "Select the subcategory:",
     category_tree: "Choose the category:",
     nested_select: "Tell me more about this item:",
-    location_tree: "Choose the storage location:",
+    location_tree: "Choose Location → Rack → Shelf:",
     quantity: "Enter the quantity:",
+    pack_quantity: "How is this packed?",
     unit_select: "Select a unit:",
     custom_text: "Enter a value:",
     custom_number: "Enter a number:",

@@ -87,6 +87,26 @@ export async function locationParentIds(db: Db): Promise<Set<string>> {
   return ids;
 }
 
+/**
+ * Stockable locations for a flat one-tap picker: prefer leaves (no active
+ * children). If the tree has only branches, fall back to every active node.
+ * Button labels use the full path so siblings with the same leaf name stay clear.
+ */
+export async function flatSelectableLocations(db: Db): Promise<{ id: string; label: string }[]> {
+  const all = await activeLocations(db);
+  const parents = new Set<string>();
+  for (const l of all) if (l.parent) parents.add(String(l.parent));
+  const byId = new Map(all.map((l) => [l._id.toString(), l]));
+  const leaves = all.filter((l) => !parents.has(l._id.toString()));
+  const pool = leaves.length ? leaves : all;
+  return pool.map((l) => {
+    const id = l._id.toString();
+    const path = locationPathFrom(byId, id);
+    const label = path.length > 42 ? `${path.slice(0, 41)}…` : path;
+    return { id, label: label || String(l.name) };
+  });
+}
+
 // Full path of a node, walked up through its parents. Independent of how the
 // caller arrived there, so it stays correct after a jump between branches.
 export async function locationPathById(db: Db, id: string): Promise<string> {

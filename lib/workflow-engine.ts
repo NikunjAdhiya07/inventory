@@ -12,6 +12,7 @@ import { cached, invalidateCollection } from "./cache";
 import { defer } from "./defer";
 import {
   activeLocations,
+  flatSelectableLocations,
   locationChildren,
   locationParentIds,
   locationPathById,
@@ -125,6 +126,31 @@ function categoryLevelLabel(children: Document[], fallback = "category"): string
     if (level) return level;
   }
   return fallback;
+}
+
+/** Prompt under the location step: "Pick a Rack:" / "Pick a Shelf:" from child levels. */
+function locationPickHint(children: Document[], parents: Set<string>): string {
+  if (!children.length) {
+    return "<i>Nothing under here — tap Back or Up and pick another branch.</i>";
+  }
+  const levels = [
+    ...new Set(
+      children
+        .map((c) => String(c.level ?? "").trim())
+        .filter(Boolean)
+    ),
+  ];
+  const hasDrill = children.some((c) => parents.has(c._id.toString()));
+  if (levels.length === 1) {
+    const level = levels[0];
+    const article = /^[aeiou]/i.test(level) ? "an" : "a";
+    return hasDrill
+      ? `<b>Pick ${article} ${level}</b> (keep going until you reach the shelf).`
+      : `<b>Pick ${article} ${level}</b> — this is where the stock will sit.`;
+  }
+  return hasDrill
+    ? "<b>Pick the next level</b> (Location → Rack → Shelf)."
+    : "<b>Pick the exact storage spot</b> — this is where the stock will sit.";
 }
 
 async function selectCategory(
@@ -583,6 +609,8 @@ function currentStep(session: BotSession): StepInstance {
 
 function canGoBack(session: BotSession): boolean {
   const step = currentStep(session);
+  if (step?.type === "item_capture" && session.itemSuggest?.phase === "confirm") return true;
+  if (step?.type === "pack_quantity" && session.packDraft && session.packDraft.phase !== "count") return true;
   if (step?.type === "location_tree" && session.locationCursor.currentParent !== null) return true;
   if (step?.type === "category_tree" && categoryCursorOf(session).currentParent !== null) return true;
   // Inside a nested step, Back undoes the last level answered — and the tree
@@ -692,6 +720,9 @@ function truncateLabel(s: string, n: number): string {
 
 function renderItemSuggest(session: BotSession, step: StepInstance): RenderResult {
   const suggest = session.itemSuggest!;
+  if (suggest.phase === "confirm") {
+    return renderItemConfirm(session, step);
+  }
   const top = suggest.candidates[0]?.name || suggest.labels[0] || "";
   const lines = [`<b>${escHtml(step.label || "Item")}</b>`, ""];
   if (suggest.imageFileId) lines.push("📷 Photo received");
@@ -700,7 +731,7 @@ function renderItemSuggest(session: BotSession, step: StepInstance): RenderResul
     lines.push(`Also: ${suggest.labels.slice(0, 6).map(escHtml).join(", ")}`);
   }
   if (suggest.typed) lines.push(`You typed: <i>${escHtml(suggest.typed)}</i>`);
-  lines.push("", "Tap a recommendation:");
+  lines.push("", "Tap a recommendation, then you’ll confirm the <b>exact product name</b>:");
 
   const btns = suggest.candidates.map((c, i) => ({
     text: i === 0 ? `✔ ${truncateLabel(c.name, 26)}` : truncateLabel(c.name, 28),
@@ -713,7 +744,54 @@ function renderItemSuggest(session: BotSession, step: StepInstance): RenderResul
   if (suggest.labels[0] && !suggest.candidates.some((c) => c.name.toLowerCase() === suggest.labels[0].toLowerCase())) {
     rows.push([{ text: `Use “${truncateLabel(suggest.labels[0], 22)}”`, callback_data: "ai:as:label" }]);
   }
+  rows.push([{ text: "✏ Type exact product name", callback_data: "ai:type" }]);
   return { text: lines.join("\n"), keyboard: [...rows, ...navRow(session)] };
+}
+
+function renderItemConfirm(session: BotSession, step: StepInstance): RenderResult {
+  const suggest = session.itemSuggest!;
+  const name = String(suggest.pendingName || "").trim() || "(not set)";
+  const lines = [
+    `<b>${escHtml(step.label || "Item")}</b>`,
+    "",
+    "Define the <b>exact product</b> to add:",
+    "",
+    `Product: <b>${escHtml(name)}</b>`,
+    "",
+    "<i>Type a different name to change it, or tap Confirm.</i>",
+  ];
+  return {
+    text: lines.join("\n"),
+    keyboard: [
+      [{ text: "✅ Confirm product", callback_data: "ai:confirm" }],
+      [{ text: "⬅ Back to recommendations", callback_data: "ai:repick" }],
+      ...navRow(session),
+    ],
+  };
+}
+
+function beginItemConfirm(
+  session: BotSession,
+  opts: {
+    name: string;
+    productId?: string;
+    imageFileId?: string;
+    labels?: string[];
+    typed?: string;
+    candidates?: NonNullable<BotSession["itemSuggest"]>["candidates"];
+  }
+): void {
+  const prev = session.itemSuggest;
+  session.itemSuggest = {
+    awaiting: true,
+    phase: "confirm",
+    typed: opts.typed ?? prev?.typed,
+    labels: opts.labels ?? prev?.labels ?? [],
+    imageFileId: opts.imageFileId || prev?.imageFileId,
+    pendingName: opts.name.trim().slice(0, 80),
+    pendingProductId: opts.productId,
+    candidates: opts.candidates ?? prev?.candidates ?? [],
+  };
 }
 
 async function presentItemSuggestions(
@@ -780,6 +858,7 @@ async function presentItemSuggestions(
 
   session.itemSuggest = {
     awaiting: true,
+    phase: "pick",
     typed: opts.typed,
     labels: opts.labels ?? [],
     imageFileId: opts.imageFileId || session.answers[step.instanceId]?.imageFileId,
@@ -815,6 +894,21 @@ async function handleItemCaptureInput(
   const image = input.imageFileId;
   const priorImage = session.answers[step.instanceId]?.imageFileId;
 
+  // Exact-product confirm: typing replaces the pending name (photo recommendations
+  // only suggest — the worker must define what is actually added).
+  if (session.itemSuggest?.awaiting && session.itemSuggest.phase === "confirm") {
+    if (image && !name) {
+      return { notice: "Type the exact product name, then tap Confirm." };
+    }
+    if (name) {
+      session.itemSuggest.pendingName = name;
+      session.itemSuggest.pendingProductId = undefined;
+      if (image) session.itemSuggest.imageFileId = image;
+      return { render: renderItemConfirm(session, step) };
+    }
+    return { render: renderItemConfirm(session, step) };
+  }
+
   if (step.config.requireImage && !image && !priorImage) {
     return { notice: "Please send a photo of the item." };
   }
@@ -827,6 +921,7 @@ async function handleItemCaptureInput(
     return presentItemSuggestions(db, session, step, {
       typed: name,
       imageFileId: image,
+      forceSuggest: true,
     });
   }
 
@@ -891,11 +986,12 @@ async function handleItemCaptureInput(
     });
   }
 
-  // Text-only: fuzzy / alias suggestions.
+  // Text-only: fuzzy / alias suggestions — then confirm exact product.
   if (name) {
     return presentItemSuggestions(db, session, step, {
       typed: name,
       imageFileId: priorImage,
+      forceSuggest: true,
     });
   }
 
@@ -987,41 +1083,231 @@ async function commitItemSuggestion(
   const suggest = session.itemSuggest;
   if (!suggest?.awaiting) return { notice: "Send a photo or type a name first." };
 
+  if (data === "ai:repick") {
+    suggest.phase = "pick";
+    suggest.pendingName = undefined;
+    suggest.pendingProductId = undefined;
+    return { render: renderItemSuggest(session, step) };
+  }
+
+  if (data === "ai:type") {
+    beginItemConfirm(session, {
+      name: suggest.typed || suggest.labels[0] || "",
+      imageFileId: suggest.imageFileId,
+      labels: suggest.labels,
+      typed: suggest.typed,
+    });
+    return {
+      render: {
+        text:
+          `${step.label || "Item"}\n\n` +
+          "Type the <b>exact product name</b> to add, then tap Confirm.",
+        keyboard: [
+          [{ text: "✅ Confirm product", callback_data: "ai:confirm" }],
+          [{ text: "⬅ Back to recommendations", callback_data: "ai:repick" }],
+          ...navRow(session),
+        ],
+      },
+    };
+  }
+
+  if (data === "ai:confirm") {
+    const name = String(suggest.pendingName || "").trim();
+    if (!name) return { notice: "Type the exact product name first." };
+    return commitItemName(db, session, step, {
+      name,
+      productId: suggest.pendingProductId,
+      imageFileId: suggest.imageFileId,
+      aliases: [...suggest.labels, suggest.typed ?? "", name],
+    });
+  }
+
   if (data === "ai:as:typed") {
     const typed = suggest.typed?.trim();
     if (!typed) return { notice: "Nothing typed to use." };
-    return commitItemName(db, session, step, {
+    beginItemConfirm(session, {
       name: typed,
       imageFileId: suggest.imageFileId,
-      aliases: suggest.labels,
+      labels: suggest.labels,
+      typed: suggest.typed,
     });
+    return { render: renderItemConfirm(session, step) };
   }
 
   if (data === "ai:as:label") {
     const label = suggest.labels[0]?.trim();
     if (!label) return { notice: "No AI label to use." };
     const hit = suggest.candidates.find((c) => c.name.toLowerCase() === label.toLowerCase());
-    return commitItemName(db, session, step, {
+    beginItemConfirm(session, {
       name: label,
       productId: hit?.productId,
       imageFileId: suggest.imageFileId,
-      aliases: [...suggest.labels, suggest.typed ?? ""],
+      labels: suggest.labels,
+      typed: suggest.typed,
     });
+    return { render: renderItemConfirm(session, step) };
   }
 
   if (data.startsWith("ai:pick:")) {
     const idx = Number(data.slice("ai:pick:".length));
     const chosen = suggest.candidates[idx];
     if (!chosen) return { notice: "That suggestion expired. Send again." };
-    return commitItemName(db, session, step, {
+    beginItemConfirm(session, {
       name: chosen.name,
       productId: chosen.productId,
       imageFileId: suggest.imageFileId,
-      aliases: [...suggest.labels, suggest.typed ?? "", ...suggest.candidates.map((c) => c.name)],
+      labels: [...suggest.labels, suggest.typed ?? "", ...suggest.candidates.map((c) => c.name)],
+      typed: suggest.typed,
     });
+    return { render: renderItemConfirm(session, step) };
   }
 
   return { notice: "Use the buttons above." };
+}
+
+// ---------------------------------------------------------------------------
+// Stock type + pack quantity (units × capacity)
+// ---------------------------------------------------------------------------
+const DEFAULT_STOCK_TYPES = [
+  { label: "Add Stock", value: "add-stock" },
+  { label: "Opening Stock", value: "opening-stock" },
+];
+
+const CAPACITY_UNITS = ["ml", "Liter", "Gram", "Kilogram", "Pieces", "Meter"];
+
+function stockTypeChoices(step: StepInstance): { label: string; value: string }[] {
+  const raw = step.config?.options;
+  let labels: string[] = [];
+  if (Array.isArray(raw)) {
+    labels = raw.map(String).map((s) => s.trim()).filter(Boolean);
+  } else if (typeof raw === "string" && raw.trim()) {
+    // Builder text field may store "Add Stock, Opening Stock" as one string.
+    labels = raw.split(",").map((s) => s.trim()).filter(Boolean);
+  }
+  const valuesRaw = step.config?.optionValues;
+  const values = Array.isArray(valuesRaw) ? valuesRaw.map(String) : [];
+  if (!labels.length) return DEFAULT_STOCK_TYPES.map((c) => ({ ...c }));
+  return labels.map((label, i) => ({
+    label,
+    value: values[i] || label.toLowerCase().replace(/\s+/g, "-"),
+  }));
+}
+
+function emptyPackDraft(): NonNullable<BotSession["packDraft"]> {
+  return { phase: "count" };
+}
+
+function packDraftOf(session: BotSession): NonNullable<BotSession["packDraft"]> {
+  return (session.packDraft ??= emptyPackDraft());
+}
+
+function formatPackDisplay(draft: NonNullable<BotSession["packDraft"]>): string {
+  const count = draft.count ?? 0;
+  const unit = draft.unit || "unit";
+  if (draft.skipCapacity || !draft.capacityValue) {
+    return `${count} ${unit}`;
+  }
+  const cap = `${draft.capacityValue} ${draft.capacityUnit || ""}`.trim();
+  const total = count * draft.capacityValue;
+  const totalUnit = draft.capacityUnit || "";
+  return `${count} ${unit} × ${cap} (= ${total}${totalUnit ? ` ${totalUnit}` : ""})`;
+}
+
+function packPath(draft: NonNullable<BotSession["packDraft"]>): { label: string; value: string }[] {
+  const count = draft.count ?? 0;
+  const unit = draft.unit || "";
+  const path = [
+    { label: "Quantity", value: String(count) },
+    { label: "Unit", value: unit },
+  ];
+  if (!draft.skipCapacity && draft.capacityValue) {
+    path.push({
+      label: "Size/Capacity",
+      value: `${draft.capacityValue} ${draft.capacityUnit || ""}`.trim(),
+    });
+    path.push({
+      label: "Total quantity",
+      value: `${count * draft.capacityValue} ${draft.capacityUnit || ""}`.trim(),
+    });
+  }
+  return path;
+}
+
+async function renderPackQuantity(
+  db: Db,
+  session: BotSession,
+  step: StepInstance
+): Promise<RenderResult> {
+  const draft = packDraftOf(session);
+  const label = step.label || "How is this packed?";
+
+  if (draft.phase === "count") {
+    session.numberDraft = session.numberDraft ?? (draft.count != null ? String(draft.count) : "");
+    return {
+      text:
+        `${label}\n\n<b>How many units</b> are you adding?\n` +
+        `<i>e.g. 6 bottles, 10 boxes — enter the number of packages</i>\n\n` +
+        numberPadText({ ...step, label: "Number of units:" }, session.numberDraft ?? ""),
+      keyboard: numberPad(session),
+    };
+  }
+
+  if (draft.phase === "unit") {
+    const units = await activeUnits(db);
+    const btns = units.map((u, i) => ({
+      text: `${u.name}${u.symbol ? ` (${u.symbol})` : ""}`,
+      callback_data: `packu:${i}`,
+    }));
+    return {
+      text:
+        `${label}\n\nQuantity: <b>${draft.count}</b>\n\n` +
+        `<b>What unit</b> is each one?\n` +
+        `<i>Bottle, Box, Packet, Pieces, Liter…</i>`,
+      keyboard: [...buttonRows(btns, 2), ...navRow(session)],
+    };
+  }
+
+  if (draft.phase === "capacity_value") {
+    session.numberDraft =
+      session.numberDraft ?? (draft.capacityValue != null ? String(draft.capacityValue) : "");
+    return {
+      text:
+        `${label}\n\n${draft.count} ${draft.unit}\n\n` +
+        `<b>Size / capacity per unit?</b>\n` +
+        `<i>e.g. 500 for a 500 ml bottle — or Skip if not applicable</i>\n\n` +
+        numberPadText({ ...step, label: "Capacity per unit:" }, session.numberDraft ?? ""),
+      keyboard: [
+        ...numberPad(session),
+        [{ text: "⏭ Skip capacity", callback_data: "pack:skipcap" }],
+      ],
+    };
+  }
+
+  // capacity_unit
+  const btns = CAPACITY_UNITS.map((u, i) => ({ text: u, callback_data: `packcu:${i}` }));
+  return {
+    text:
+      `${label}\n\n${draft.count} ${draft.unit} × <b>${draft.capacityValue}</b> ?\n\n` +
+      `<b>Unit for that capacity</b>\n` +
+      `<i>ml, Liter, Gram…</i>`,
+    keyboard: [...buttonRows(btns, 3), ...navRow(session)],
+  };
+}
+
+async function commitPackQuantity(db: Db, session: BotSession, step: StepInstance): Promise<EngineResult> {
+  const draft = packDraftOf(session);
+  if (!draft.count || !draft.unit) {
+    return { notice: "Enter quantity and unit first." };
+  }
+  session.answers[step.instanceId] = {
+    type: "pack_quantity",
+    value: draft.count,
+    display: formatPackDisplay(draft),
+    path: packPath(draft),
+  };
+  session.packDraft = undefined;
+  session.numberDraft = "";
+  return advance(db, session);
 }
 
 // ---------------------------------------------------------------------------
@@ -1035,11 +1321,11 @@ export async function renderCurrentStep(db: Db, session: BotSession): Promise<Re
   switch (step.type) {
     case "item_capture": {
       const suggest = session.itemSuggest;
-      if (suggest?.awaiting && suggest.candidates.length) {
+      if (suggest?.awaiting) {
         return renderItemSuggest(session, step);
       }
       return {
-        text: `${label}\n\nSend a <b>photo</b> or type the item name.`,
+        text: `${label}\n\nSend a <b>photo</b> or type the item name.\n<i>Recommendations help identify the product — you’ll confirm the exact name next.</i>`,
         keyboard: navRow(session),
       };
     }
@@ -1074,6 +1360,22 @@ export async function renderCurrentStep(db: Db, session: BotSession): Promise<Re
         lines.push(`<i>Showing ${start + 1}–${start + slice.length} of ${options.length}</i>`);
       }
       return { text: lines.join("\n"), keyboard: [...rows, ...navRow(session)] };
+    }
+
+    case "stock_type": {
+      const choices = stockTypeChoices(step);
+      // Always one button per row so Add Stock / Opening Stock are unmistakable.
+      const rows: InlineKeyboard = choices.map((c, i) => [
+        { text: c.label, callback_data: `stype:${i}` },
+      ]);
+      return {
+        text:
+          `${label}\n\n` +
+          `<b>Add Stock</b> — inbound / top-up\n` +
+          `<b>Opening Stock</b> — initial count on hand\n\n` +
+          `Tap one:`,
+        keyboard: [...rows, ...navRow(session)],
+      };
     }
 
     case "category_select": {
@@ -1122,6 +1424,17 @@ export async function renderCurrentStep(db: Db, session: BotSession): Promise<Re
       return renderNested(db, session, step);
 
     case "location_tree": {
+      if (step.config.flatSelect) {
+        const options = await flatSelectableLocations(db);
+        const btns = options.map((o, i) => ({
+          text: `📍 ${o.label}`,
+          callback_data: `loc:${i}`,
+        }));
+        return {
+          text: `${label}\n\n<i>Pick the exact shelf (or box) — Location → Rack → Shelf.</i>`,
+          keyboard: [...buttonRows(btns, 2), ...navRow(session)],
+        };
+      }
       const cursor = session.locationCursor.currentParent;
       const [options, parents, here] = await Promise.all([
         locationOptions(db, session, step),
@@ -1134,16 +1447,28 @@ export async function renderCurrentStep(db: Db, session: BotSession): Promise<Re
         callback_data: `loc:${i}`,
       }));
       const rows: InlineKeyboard = buttonRows(btns, 2);
-      if (cursor !== null) {
+      // Only allow stopping on a branch when the workflow opts in. Opening stock
+      // must reach a leaf (Shelf/Box) or Visual Rack cannot place the item.
+      if (cursor !== null && step.config.allowSelectBranch === true) {
         rows.push([{ text: "✔ Select this location", callback_data: "locsel" }]);
       }
-      const text = here ? `${label}\n<i>Current: ${here}</i>` : label;
+      const pickHint = locationPickHint(options, parents);
+      const text = [
+        label,
+        here ? `<i>Current: ${here}</i>` : "",
+        pickHint,
+      ]
+        .filter(Boolean)
+        .join("\n");
       return { text, keyboard: [...rows, ...navRow(session)] };
     }
 
     case "quantity":
     case "custom_number":
       return { text: numberPadText(step, session.numberDraft ?? ""), keyboard: numberPad(session) };
+
+    case "pack_quantity":
+      return renderPackQuantity(db, session, step);
 
     case "unit_select": {
       const units = await activeUnits(db);
@@ -1163,13 +1488,24 @@ export async function renderCurrentStep(db: Db, session: BotSession): Promise<Re
     case "review_confirm":
       return {
         text: `${label}\n\n${summaryText(session)}`,
-        keyboard: [[{ text: "✅ Confirm", callback_data: "confirm" }], ...navRow(session)],
+        keyboard: [[{ text: "🛒 Add to Cart", callback_data: "confirm" }], ...navRow(session)],
       };
 
-    default:
+    default: {
+      // New step types must never silently degrade to Back/Cancel only.
+      console.error("[engine] unhandled step type in renderCurrentStep:", step.type);
+      if (String(step.type) === "stock_type") {
+        const choices = stockTypeChoices(step);
+        const rows: InlineKeyboard = choices.map((c, i) => [
+          { text: c.label, callback_data: `stype:${i}` },
+        ]);
+        return {
+          text: `${label}\n\nTap Add Stock or Opening Stock:`,
+          keyboard: [...rows, ...navRow(session)],
+        };
+      }
       return { text: label, keyboard: navRow(session) };
-  }
-}
+    }
 
 // ---------------------------------------------------------------------------
 // Input handling
@@ -1270,6 +1606,74 @@ export async function applyCallback(db: Db, session: BotSession, data: string): 
       return { render: await renderCurrentStep(db, session) };
     }
 
+    case "pack_quantity": {
+      if (data === "pack:skipcap") {
+        const pack = packDraftOf(session);
+        pack.skipCapacity = true;
+        pack.capacityValue = undefined;
+        pack.capacityUnit = undefined;
+        return commitPackQuantity(db, session, step);
+      }
+      if (data.startsWith("packu:")) {
+        const units = await activeUnits(db);
+        const u = units[indexOf(data, "packu:")];
+        if (!u) return { notice: "That unit is no longer available." };
+        const pack = packDraftOf(session);
+        pack.unit = String(u.name);
+        pack.phase = "capacity_value";
+        session.numberDraft = "";
+        return { render: await renderPackQuantity(db, session, step) };
+      }
+      if (data.startsWith("packcu:")) {
+        const unit = CAPACITY_UNITS[indexOf(data, "packcu:")];
+        if (!unit) return { notice: "Pick a capacity unit." };
+        const pack = packDraftOf(session);
+        pack.capacityUnit = unit;
+        return commitPackQuantity(db, session, step);
+      }
+      if (!data.startsWith("num:")) return { notice: "Use the buttons above." };
+      const pressed = data.slice(4);
+      const pack = packDraftOf(session);
+      if (pressed === "ok") {
+        const check = checkNumber(
+          session.numberDraft ?? "",
+          Number(step.config.numberMin) || 0,
+          Number(step.config.numberMax) || 0
+        );
+        if (check.notice) return { notice: check.notice };
+        if (pack.phase === "count") {
+          pack.count = check.value as number;
+          pack.phase = "unit";
+          session.numberDraft = "";
+          return { render: await renderPackQuantity(db, session, step) };
+        }
+        if (pack.phase === "capacity_value") {
+          pack.capacityValue = check.value as number;
+          pack.skipCapacity = false;
+          pack.phase = "capacity_unit";
+          session.numberDraft = "";
+          return { render: await renderPackQuantity(db, session, step) };
+        }
+        return { notice: "Use the buttons above." };
+      }
+      const nextDraft = pressKeypad(session.numberDraft ?? "", pressed);
+      if (nextDraft.notice) return { notice: nextDraft.notice };
+      session.numberDraft = nextDraft.value;
+      return { render: await renderPackQuantity(db, session, step) };
+    }
+
+    case "stock_type": {
+      const choices = stockTypeChoices(step);
+      const chosen = choices[indexOf(data, "stype:")];
+      if (!chosen) return { notice: "Pick Add Stock or Opening Stock." };
+      session.answers[step.instanceId] = {
+        type: "stock_type",
+        value: chosen.value,
+        display: chosen.label,
+      };
+      return advance(db, session);
+    }
+
     case "nested_select":
       return applyNestedCallback(db, session, step, data);
 
@@ -1351,9 +1755,20 @@ export async function applyCallback(db: Db, session: BotSession, data: string): 
 
     case "location_tree": {
       if (data === "locsel") {
+        if (step.config.flatSelect) return { notice: "Pick a location from the list." };
+        if (step.config.allowSelectBranch !== true) {
+          return { notice: "Keep drilling — pick the Rack, then the Shelf." };
+        }
         const chosen = session.locationCursor.currentParent;
         if (!chosen) return { notice: "Drill into a location first." };
         return selectLocation(db, session, step, chosen);
+      }
+
+      if (step.config.flatSelect) {
+        const flat = await flatSelectableLocations(db);
+        const picked = flat[indexOf(data, "loc:")];
+        if (!picked) return { notice: "That location is no longer available." };
+        return selectLocation(db, session, step, picked.id);
       }
 
       const options = await locationOptions(db, session, step);
@@ -1364,6 +1779,7 @@ export async function applyCallback(db: Db, session: BotSession, data: string): 
       const parents = await locationParentIds(db);
       // A node with nothing under it can only ever be the answer, so tapping it
       // selects rather than opening an empty level the user has to confirm.
+      // Nodes with children always drill — stock belongs on the leaf (Shelf).
       if (!parents.has(chosenId)) return selectLocation(db, session, step, chosenId);
 
       const cursor = session.locationCursor;
@@ -1397,7 +1813,7 @@ export async function applyCallback(db: Db, session: BotSession, data: string): 
 
     case "review_confirm":
       if (data === "confirm") return finalize(db, session);
-      return { notice: "Tap Confirm to save." };
+      return { notice: "Tap Add to Cart to save." };
 
     default:
       return { notice: "Please use the buttons above." };
@@ -1446,9 +1862,40 @@ export async function primeStep(db: Db, session: BotSession) {
   // entered, so Back preserves it the same way it preserves every other answer.
   const prior = session.answers[step.instanceId]?.value;
   session.numberDraft =
-    (step.type === "quantity" || step.type === "custom_number") && (typeof prior === "number" || typeof prior === "string")
+    (step.type === "quantity" || step.type === "custom_number" || step.type === "pack_quantity") &&
+    (typeof prior === "number" || typeof prior === "string")
       ? String(prior)
       : "";
+
+  if (step.type === "pack_quantity") {
+    const prev = session.answers[step.instanceId];
+    if (prev?.type === "pack_quantity" && prev.path?.length) {
+      const qty = Number(prev.path.find((p) => p.label === "Quantity")?.value);
+      const unit = prev.path.find((p) => p.label === "Unit")?.value;
+      const capRaw = prev.path.find((p) => p.label === "Size/Capacity")?.value;
+      const draft = emptyPackDraft();
+      if (Number.isFinite(qty) && qty > 0) draft.count = qty;
+      if (unit) draft.unit = unit;
+      if (capRaw) {
+        const m = /^([\d.]+)\s*(.*)$/.exec(capRaw.trim());
+        if (m) {
+          draft.capacityValue = Number(m[1]);
+          draft.capacityUnit = m[2] || undefined;
+        }
+      } else {
+        draft.skipCapacity = true;
+      }
+      draft.phase = "count";
+      session.packDraft = draft;
+      session.numberDraft = draft.count != null ? String(draft.count) : "";
+    } else {
+      session.packDraft = emptyPackDraft();
+      session.numberDraft = "";
+    }
+    return;
+  }
+
+  session.packDraft = undefined;
 
   if (step.type === "location_tree") {
     const node = await defaultLocationNode(db, step);
@@ -1506,6 +1953,38 @@ async function advance(db: Db, session: BotSession): Promise<EngineResult> {
 
 async function goBack(db: Db, session: BotSession): Promise<EngineResult> {
   const step = currentStep(session);
+
+  // Exact-product confirm: Back returns to recommendations without leaving the step.
+  if (step?.type === "item_capture" && session.itemSuggest?.phase === "confirm") {
+    session.itemSuggest.phase = "pick";
+    session.itemSuggest.pendingName = undefined;
+    session.itemSuggest.pendingProductId = undefined;
+    return { render: renderItemSuggest(session, step) };
+  }
+
+  // Pack quantity: Back walks count ← unit ← capacity within the step.
+  if (step?.type === "pack_quantity" && session.packDraft) {
+    const pack = session.packDraft;
+    if (pack.phase === "capacity_unit") {
+      pack.phase = "capacity_value";
+      pack.capacityUnit = undefined;
+      session.numberDraft = pack.capacityValue != null ? String(pack.capacityValue) : "";
+      return { render: await renderPackQuantity(db, session, step) };
+    }
+    if (pack.phase === "capacity_value") {
+      pack.phase = "unit";
+      pack.capacityValue = undefined;
+      session.numberDraft = "";
+      return { render: await renderPackQuantity(db, session, step) };
+    }
+    if (pack.phase === "unit") {
+      pack.phase = "count";
+      pack.unit = undefined;
+      session.numberDraft = pack.count != null ? String(pack.count) : "";
+      return { render: await renderPackQuantity(db, session, step) };
+    }
+  }
+
   // Within the location tree, Back climbs one level before leaving the step.
   if (step?.type === "location_tree" && session.locationCursor.currentParent !== null) {
     session.locationCursor.currentParent = session.locationCursor.parentStack.pop() ?? null;
@@ -1623,15 +2102,19 @@ async function alreadyTicketed(db: Db, session: BotSession): Promise<EngineResul
   if (!existing?.ticketNumber) return { finished: true, notice: "This entry has already been submitted." };
   return {
     finished: true,
-    render: { text: confirmationText(session, String(existing.ticketNumber)), keyboard: [] },
+    render: { text: confirmationText(session, String(existing.ticketNumber)), keyboard: afterSubmitKeyboard() },
   };
 }
 
 function confirmationText(session: BotSession, ticketNumber: string): string {
   const header = ticketNumber
-    ? `✅ <b>Inventory Successfully Added</b>\n🎫 Ticket: <code>${ticketNumber}</code>`
-    : "✅ <b>Inventory Successfully Added</b>";
+    ? `✅ <b>Added to Cart</b>\n🎫 Ticket: <code>${ticketNumber}</code>`
+    : "✅ <b>Added to Cart</b>";
   return `${header}\n\n${summaryText(session)}`;
+}
+
+function afterSubmitKeyboard(): InlineKeyboard {
+  return [[{ text: "➕ Add Another Item", callback_data: "entry:again" }]];
 }
 
 // Custom step labels are free text, and two steps in one workflow can carry the
@@ -1700,7 +2183,7 @@ async function finalize(db: Db, session: BotSession): Promise<EngineResult> {
     // A nested step captured several named details, and each one is a field of
     // the entry in its own right: the ticket says "Colour: Red", not a single
     // opaque "Copper › Flexible › Red › 2.5 sq mm".
-    if (s.type === "nested_select" || s.type === "category_tree") {
+    if (s.type === "nested_select" || s.type === "category_tree" || s.type === "pack_quantity") {
       for (const level of a.path ?? []) custom[uniqueKey(custom, level.label)] = level.value;
     }
   }
@@ -1712,6 +2195,9 @@ async function finalize(db: Db, session: BotSession): Promise<EngineResult> {
   // twice. An explicit answer always wins; the product only fills what the
   // workflow never asked, so a captured entry is complete either way.
   const itemName = String(itemAnswer?.value || picked?.name || "");
+  const stockTypeAnswer = answerFor(session, "stock_type");
+  const stockTypeCode = String(stockTypeAnswer?.value || "add-stock");
+  const stockTypeLabel = String(stockTypeAnswer?.display || "Add Stock");
   const categoryTree = answerFor(session, "category_tree");
   const categoryPath = categoryTree?.path ?? [];
   // Prefer the full Categories drill-down; fall back to the legacy two-step
@@ -1729,10 +2215,16 @@ async function finalize(db: Db, session: BotSession): Promise<EngineResult> {
       picked?.subcategory ??
       ""
   );
+  const packAnswer = answerFor(session, "pack_quantity");
+  const packPathLevels = packAnswer?.path ?? [];
+  const packUnit = packPathLevels.find((p) => p.label === "Unit")?.value;
+  const capacityRaw = packPathLevels.find((p) => p.label === "Size/Capacity")?.value || "";
+  const totalRaw = packPathLevels.find((p) => p.label === "Total quantity")?.value || "";
   const unit = String(
-    answerValue(session, "unit_select") ??
-      (typeof categoryTree?.tree === "string" ? categoryTree.tree : "") ??
-      picked?.unit ??
+    packUnit ||
+      answerValue(session, "unit_select") ||
+      (typeof categoryTree?.tree === "string" ? categoryTree.tree : "") ||
+      picked?.unit ||
       ""
   );
 
@@ -1745,12 +2237,26 @@ async function finalize(db: Db, session: BotSession): Promise<EngineResult> {
   // existed and the entry behaves unchanged.
   const variant = await resolveVariantFor(db, session, { category, subcategory, unit });
   let product = variant ?? picked;
-  // One shape for a quantity: a number, or null when the workflow never asked.
-  // It used to land as "" on a workflow without a quantity step and as a number
-  // otherwise, so anything reading entries had to handle both.
-  const rawQuantity = answerValue(session, "quantity");
+  // Pack quantity stores the number of units (bottles/boxes) for Visual Rack.
+  // Legacy `quantity` step still works when pack_quantity is absent.
+  const rawQuantity =
+    packAnswer?.value !== undefined && packAnswer?.value !== ""
+      ? packAnswer.value
+      : answerValue(session, "quantity");
   const parsedQuantity = rawQuantity === undefined || rawQuantity === "" ? NaN : Number(rawQuantity);
   const quantity = Number.isFinite(parsedQuantity) ? parsedQuantity : null;
+
+  const capacityMatch = /^([\d.]+)\s*(.*)$/.exec(capacityRaw.trim());
+  const capacityPerUnit = capacityMatch ? Number(capacityMatch[1]) : null;
+  const capacityUnit = capacityMatch?.[2]?.trim() || "";
+  const totalMatch = /^([\d.]+)\s*(.*)$/.exec(totalRaw.trim());
+  const totalQuantity =
+    totalMatch && Number.isFinite(Number(totalMatch[1]))
+      ? Number(totalMatch[1])
+      : capacityPerUnit != null && quantity != null
+        ? quantity * capacityPerUnit
+        : null;
+  const totalQuantityUnit = totalMatch?.[2]?.trim() || capacityUnit;
 
   const now = new Date();
   const ticketNumber = await nextTicketNumber(db, now);
@@ -1810,11 +2316,23 @@ async function finalize(db: Db, session: BotSession): Promise<EngineResult> {
             productNumber: product.productNumber,
             // Snapshotted at the moment of choice: a later edit to the Product
             // Master must not change what this ticket says was received.
-            attributes: product.attributes,
+            attributes: [
+              ...(product.attributes ?? []),
+              ...(capacityPerUnit != null && Number.isFinite(capacityPerUnit)
+                ? [
+                    {
+                      name: "Size/Capacity",
+                      value: `${capacityPerUnit}${capacityUnit ? ` ${capacityUnit}` : ""}`.trim(),
+                    },
+                  ]
+                : []),
+            ],
           }
         : {}),
       category,
       subcategory,
+      stockType: stockTypeCode,
+      stockTypeLabel,
       ...(categoryTree && categoryTree.value
         ? {
             categoryId: String(categoryTree.value),
@@ -1825,6 +2343,16 @@ async function finalize(db: Db, session: BotSession): Promise<EngineResult> {
       locationPath: answerDisplay(session, "location_tree") ?? "",
       quantity,
       unit,
+      ...(capacityPerUnit != null && Number.isFinite(capacityPerUnit)
+        ? {
+            capacityPerUnit,
+            capacityUnit,
+            ...(totalQuantity != null
+              ? { totalQuantity, totalQuantityUnit }
+              : {}),
+          }
+        : {}),
+      packDisplay: packAnswer?.display || "",
       custom,
     },
     ...(session.approval?.decision
@@ -1870,6 +2398,7 @@ async function finalize(db: Db, session: BotSession): Promise<EngineResult> {
   // item_capture workflows; without location or qty there is nowhere / nothing
   // to add, and the entry stays a record without pretending to be a balance.
   if (product && entry.fields.locationId && quantity !== null && quantity > 0) {
+    const movementReason = stockTypeCode === "opening-stock" ? "opening-stock" : "receipt";
     await recordMovement(db, {
       movementKey: receiptKey(ticketNumber),
       productId: product.id,
@@ -1879,7 +2408,7 @@ async function finalize(db: Db, session: BotSession): Promise<EngineResult> {
       locationPath: entry.fields.locationPath,
       qty: quantity,
       unit: unit || product.unit || "",
-      reason: "receipt",
+      reason: movementReason,
       refType: "inventoryEntry",
       refId: ticketNumber,
       by: session.submittedByName,
@@ -1957,7 +2486,7 @@ async function finalize(db: Db, session: BotSession): Promise<EngineResult> {
     )
   );
 
-  return { finished: true, render: { text: confirmationText(session, ticketNumber), keyboard: [] } };
+  return { finished: true, render: { text: confirmationText(session, ticketNumber), keyboard: afterSubmitKeyboard() } };
 }
 
 /** After inventory is durable: fix name, expand reference names, assign category. */
@@ -2116,6 +2645,10 @@ function summaryText(session: BotSession): string {
       for (const level of a.path) lines.push(`• <b>${escHtml(level.label)}:</b> ${escHtml(level.value)}`);
       continue;
     }
+    if (s.type === "pack_quantity" && a.path?.length) {
+      for (const level of a.path) lines.push(`• <b>${escHtml(level.label)}:</b> ${escHtml(level.value)}`);
+      continue;
+    }
     const label = s.label.replace(/[:：]\s*$/, "");
     lines.push(`• <b>${shortLabel(label, s.type)}:</b> ${a.display}`);
     // A product's attributes ARE the product for a user checking their entry —
@@ -2131,14 +2664,16 @@ function summaryText(session: BotSession): string {
 // Friendlier field names in the summary than the raw prompts.
 function shortLabel(label: string, type: string): string {
   const defaults: Record<string, string> = {
-    item_capture: "Item",
+    item_capture: "Product",
     product_select: "Product",
+    stock_type: "Stock Type",
     category_select: "Category",
     subcategory_select: "Subcategory",
     category_tree: "Category",
     nested_select: "Details",
     location_tree: "Location",
     quantity: "Quantity",
+    pack_quantity: "Pack",
     unit_select: "Unit",
   };
   return defaults[type] || label;

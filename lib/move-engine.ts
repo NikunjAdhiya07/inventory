@@ -1,6 +1,7 @@
 import type { Db } from "mongodb";
-import { categoryChildNames } from "./categories";
-import { locationChildren, locationParentIds, locationPathById } from "./locations";
+import { categoryChildNames, resolveCategoryPathForItem, rootCategoryNames } from "./categories";
+import { locationChildren, locationParentIds, locationPathById, flatSelectableLocations } from "./locations";
+import { parseQuantityRepeat, pressQuantityKey, quantityRepeatHint, draftQtyParts, reviewQuantityLines, formatQtyUnit } from "./quantity-repeat";
 import { activeMovementTypes, toMovementType, type MovementType } from "./movements";
 import type { MoveQuestion } from "./movement-questions";
 import {
@@ -25,6 +26,8 @@ import { buttonRows, type InlineKeyboard } from "./telegram";
 import type { ItemRequest } from "./request-types";
 import { activeVendors } from "./vendors";
 import { activeDepartments } from "./departments";
+import { activePlants } from "./plants";
+import { groupConfig } from "./telegram-health";
 import { findOutboundShortage, isInboundMovement, persistOutboundShortage } from "./outbound-stock";
 import { note } from "./requests";
 
@@ -65,6 +68,10 @@ export function clearMoveUi(ui: ItemRequest["ui"]): void {
   ui.moveToLocationId = null;
   ui.moveVendorId = null;
   ui.moveVendorName = null;
+  ui.moveVendorQuery = "";
+  ui.movePlantId = null;
+  ui.movePlantName = null;
+  ui.movePlantQuery = "";
   ui.moveDepartmentId = null;
   ui.moveDepartmentName = null;
   ui.moveQtyDraft = "";
@@ -83,16 +90,22 @@ export async function focusedProduct(db: Db, request: ItemRequest): Promise<Stoc
   return hits.find((h) => h.productId === request.ui.focusProductId) ?? null;
 }
 
-async function loadWorkflow(db: Db): Promise<SearchMoveWorkflow> {
-  return getSearchMoveWorkflow(db);
+async function loadWorkflow(db: Db, chatId?: string): Promise<SearchMoveWorkflow> {
+  if (!chatId) return getSearchMoveWorkflow(db);
+  try {
+    const { mode } = await groupConfig(db, chatId);
+    return getSearchMoveWorkflow(db, chatId, { mode });
+  } catch {
+    return getSearchMoveWorkflow(db, chatId);
+  }
 }
 
-async function loadManualTypes(db: Db): Promise<MovementType[]> {
+async function loadManualTypes(db: Db, chatId?: string): Promise<MovementType[]> {
   const docs = await activeMovementTypes(db);
   const all = docs
     .map(toMovementType)
     .filter((t) => !t.isSystem && t.status === "Active");
-  const wf = await loadWorkflow(db);
+  const wf = await loadWorkflow(db, chatId);
   const codes = movementCodesInTree(wf);
   if (!codes.length) {
     return all.sort((a, b) => a.order - b.order || a.name.localeCompare(b.name));
@@ -125,15 +138,18 @@ async function promptVars(db: Db, request: ItemRequest, hit: StockHit | null, ty
   const path = categoryPathOf(request.ui);
   const tip = path[path.length - 1] || request.ui.focusCategory || "";
   const children = tip ? (await categoryChildNames(db, tip)).join(", ") : "";
+  const parsed = parseQuantityRepeat(request.ui.moveQtyDraft || "");
+  const qtyDisplay = parsed.ok ? formatQtyUnit(parsed.value.qty, hit?.unit ?? "") : request.ui.moveQtyDraft || "—";
   return {
     product: hit ? `${hit.name}${hit.category ? ` · ${hit.category}` : ""}` : request.ui.query || "",
     type: type?.name ?? "",
     unit: hit?.unit ?? "",
-    qty: request.ui.moveQtyDraft || "—",
+    qty: qtyDisplay,
     where: where || "—",
     stock_lines: stockLines,
     children,
     vendor: request.ui.moveVendorName || "",
+    plant: request.ui.movePlantName || "",
     department: request.ui.moveDepartmentName || "",
     question: "",
   };
@@ -143,10 +159,29 @@ function nodeText(node: FlowNode, vars: Record<string, string>): string {
   return applyMessageTemplate(node.message || node.label, vars).replace(/\n{3,}/g, "\n\n").trim();
 }
 
-function uniqueCategories(hits: StockHit[]): string[] {
-  const set = new Set<string>();
-  for (const h of hits) set.add(String(h.category ?? "").trim() || "Other");
-  return [...set].sort((a, b) => a.localeCompare(b));
+/**
+ * Categories offered on the pick_category step: Category Master only.
+ * When the query matches a master node (or Nemotron picks one), that path is
+ * auto-applied and this returns a single name so the UI can skip a noisy list.
+ */
+export async function categoryPickOptions(db: Db, query: string): Promise<string[]> {
+  const resolved = await resolveCategoryPathForItem(db, query);
+  if (resolved.path.length) return [resolved.path[resolved.path.length - 1]];
+  return rootCategoryNames(db);
+}
+
+/** Auto-fill categoryPath from Category Master (+ Nemotron) when still empty. */
+export async function ensureCategoryPathFromMaster(
+  db: Db,
+  ui: ItemRequest["ui"]
+): Promise<"matched" | "none"> {
+  if (categoryPathOf(ui).length) return "matched";
+  const query = String(ui.query ?? "").trim();
+  if (!query) return "none";
+  const resolved = await resolveCategoryPathForItem(db, query);
+  if (!resolved.path.length) return "none";
+  setCategoryPath(ui, resolved.path);
+  return "matched";
 }
 
 function subcategoryLabel(raw: unknown): string {
@@ -237,7 +272,7 @@ function filterSearchHits(raw: StockHit[], ui: ItemRequest["ui"]): StockHit[] {
 
 /** Start (or restart) the flowchart from its root when the user types a search. */
 export async function startSearchFlow(db: Db, request: ItemRequest, query: string): Promise<MoveRender> {
-  const wf = await loadWorkflow(db);
+  const wf = await loadWorkflow(db, request.chatId);
   request.ui.query = query.slice(0, 60);
   request.ui.page = 0;
   request.ui.focusProductId = null;
@@ -254,7 +289,7 @@ export async function startSearchFlow(db: Db, request: ItemRequest, query: strin
 
 /** After an item is chosen, jump to the first post-discovery lead-in node. */
 export async function continueAfterProductPick(db: Db, request: ItemRequest): Promise<MoveRender> {
-  const wf = await loadWorkflow(db);
+  const wf = await loadWorkflow(db, request.chatId);
   const next = nodeAfterDiscovery(wf) ?? wf.rootId;
   request.ui.flowNodeId = next;
   request.ui.intent = "move";
@@ -265,7 +300,7 @@ export async function continueAfterProductPick(db: Db, request: ItemRequest): Pr
 /** @deprecated — prefer startSearchFlow / continueAfterProductPick */
 export async function startConfiguredFlow(db: Db, request: ItemRequest): Promise<MoveRender> {
   if (request.ui.focusProductId) return continueAfterProductPick(db, request);
-  const wf = await loadWorkflow(db);
+  const wf = await loadWorkflow(db, request.chatId);
   request.ui.flowNodeId = wf.rootId;
   request.ui.intent = "move";
   request.ui.moveStage = "type";
@@ -278,7 +313,7 @@ export async function renderProductIntent(db: Db, request: ItemRequest): Promise
 }
 
 export async function renderMoveFlow(db: Db, request: ItemRequest): Promise<MoveRender> {
-  const wf = await loadWorkflow(db);
+  const wf = await loadWorkflow(db, request.chatId);
   if (!request.ui.flowNodeId) {
     request.ui.flowNodeId = wf.rootId;
   }
@@ -290,7 +325,7 @@ export async function renderMoveFlow(db: Db, request: ItemRequest): Promise<Move
 
   const hit = await focusedProduct(db, request);
   const type = request.ui.moveTypeCode
-    ? (await loadManualTypes(db)).find((t) => t.code === request.ui.moveTypeCode) ?? null
+    ? (await loadManualTypes(db, request.chatId)).find((t) => t.code === request.ui.moveTypeCode) ?? null
     : null;
   const vars = await promptVars(db, request, hit, type);
 
@@ -322,6 +357,8 @@ export async function renderMoveFlow(db: Db, request: ItemRequest): Promise<Move
       return renderLocationPick(db, request, node, hit, vars, "to");
     case "pick_vendor":
       return renderVendorPick(db, request, node, vars);
+    case "pick_plant":
+      return renderPlantPick(db, request, node, vars);
     case "pick_department":
       return renderDepartmentPick(db, request, node, vars);
     case "select_movement":
@@ -379,29 +416,34 @@ async function renderSearchNode(
     };
   }
 
-  // If the flowchart includes Pick category, walk the full Categories tree
-  // (category → child → … → leaf) before listing items.
+  // If the flowchart includes Pick category:
+  // - Existing products for the query → show them with their Product Master category (no re-ask).
+  // - No products → Category Master match / drill (new-product path).
   if (leadInHasKind(wf, "pick_category")) {
     const hits = await lookupProducts(db, ui.query);
-    const categories = uniqueCategories(hits);
     const path = categoryPathOf(ui);
 
-    if (categories.length > 1 && !path.length) {
-      const catNode = leadInNode(wf, "pick_category");
-      request.ui.flowNodeId = catNode?.id ?? request.ui.flowNodeId;
-      return renderCategoryNode(db, request, catNode ?? node, vars);
+    if (hits.length > 0 && !path.length) {
+      return renderProductResults(db, request, node, vars);
     }
 
-    if (!path.length && categories.length === 1) {
-      setCategoryPath(ui, [categories[0]]);
+    if (!path.length) {
+      const matched = await ensureCategoryPathFromMaster(db, ui);
+      if (!matched) {
+        const roots = await rootCategoryNames(db);
+        if (roots.length > 1) {
+          const catNode = leadInNode(wf, "pick_category");
+          request.ui.flowNodeId = catNode?.id ?? request.ui.flowNodeId;
+          return renderCategoryNode(db, request, catNode ?? node, vars);
+        }
+        if (roots.length === 1) setCategoryPath(ui, [roots[0]]);
+      }
     }
 
     const effectivePath = categoryPathOf(ui);
-    if (effectivePath.length) {
-      const rootHits = hits.filter((h) => (String(h.category ?? "").trim() || "Other") === effectivePath[0]);
-      const kids = await resolveCategoryChildren(db, effectivePath, rootHits);
+    if (effectivePath.length && hits.length === 0) {
+      const kids = await resolveCategoryChildren(db, effectivePath, []);
       if (kids.length > 0) {
-        // Auto-descend a single child so the user isn't stopped on a one-option level.
         if (kids.length === 1 && effectivePath.length < 20) {
           setCategoryPath(ui, [...effectivePath, kids[0]]);
           return renderSearchNode(db, request, wf, node, vars);
@@ -411,6 +453,20 @@ async function renderSearchNode(
           if (catNode) request.ui.flowNodeId = catNode.id;
           return renderCategoryDrillNode(request, catNode ?? node, vars, kids);
         }
+      }
+    }
+
+    if (effectivePath.length && hits.length > 0) {
+      const rootHits = hits.filter((h) => (String(h.category ?? "").trim() || "Other") === effectivePath[0]);
+      const kids = await resolveCategoryChildren(db, effectivePath, rootHits);
+      if (kids.length > 1) {
+        const catNode = leadInNode(wf, "pick_category");
+        if (catNode) request.ui.flowNodeId = catNode.id;
+        return renderCategoryDrillNode(request, catNode ?? node, vars, kids);
+      }
+      if (kids.length === 1 && effectivePath.length < 20) {
+        setCategoryPath(ui, [...effectivePath, kids[0]]);
+        return renderSearchNode(db, request, wf, node, vars);
       }
     }
   }
@@ -425,28 +481,34 @@ async function renderCategoryNode(
   vars: Record<string, string>
 ): Promise<MoveRender> {
   const hits = await lookupProducts(db, request.ui.query || "");
-  const categories = uniqueCategories(hits);
   const path = categoryPathOf(request.ui);
 
-  if (path.length) {
-    const rootHits = hits.filter((h) => (String(h.category ?? "").trim() || "Other") === path[0]);
-    const kids = await resolveCategoryChildren(db, path, rootHits);
+  if (!path.length) {
+    await ensureCategoryPathFromMaster(db, request.ui);
+  }
+  const effectivePath = categoryPathOf(request.ui);
+
+  if (effectivePath.length) {
+    const rootHits = hits.filter((h) => (String(h.category ?? "").trim() || "Other") === effectivePath[0]);
+    const kids = await resolveCategoryChildren(db, effectivePath, rootHits);
     if (kids.length > 1) {
       return renderCategoryDrillNode(request, node, vars, kids);
     }
-    if (kids.length === 1 && path.length < 20) {
-      setCategoryPath(request.ui, [...path, kids[0]]);
+    if (kids.length === 1 && effectivePath.length < 20) {
+      setCategoryPath(request.ui, [...effectivePath, kids[0]]);
       return renderCategoryNode(db, request, node, vars);
     }
     // Leaf reached — show items using search messaging.
-    const wf = await loadWorkflow(db);
+    const wf = await loadWorkflow(db, request.chatId);
     const search = leadInNode(wf, "search") ?? node;
     return renderProductResults(db, request, search, vars);
   }
 
+  // Unmatched query: Category Master roots only (never invent categories from products).
+  const categories = await rootCategoryNames(db);
   if (categories.length <= 1) {
     if (categories[0]) setCategoryPath(request.ui, [categories[0]]);
-    const wf = await loadWorkflow(db);
+    const wf = await loadWorkflow(db, request.chatId);
     const search = leadInNode(wf, "search") ?? node;
     return renderSearchNode(db, request, wf, search, vars);
   }
@@ -457,7 +519,7 @@ async function renderCategoryNode(
     callback_data: `rq:cat:${i}`,
   }));
   return {
-    text: `${prompt}\n\n<b>${categories.length} categories</b>`,
+    text: `${prompt}\n\n<b>${categories.length} categories</b> (from Category Master)`,
     keyboard: [...buttonRows(btns, 1), [{ text: "⬅ Back", callback_data: "rq:back" }], footer(request)],
   };
 }
@@ -531,6 +593,29 @@ async function renderProductResults(
     };
   }
 
+  // Single clear match — show Product Master category and confirm.
+  if (hits.length === 1) {
+    const hit = hits[0];
+    const cat = [hit.category, hit.subcategory].filter(Boolean).join(" → ");
+    return {
+      text: [
+        `<b>Product found</b>`,
+        "",
+        `<b>${esc(hit.name)}</b>${hit.unit ? ` — ${esc(hit.unit)}` : ""}`,
+        cat ? `\nCategory:\n${esc(cat)}` : "",
+        "",
+        "<i>Category comes from Product Master — no need to pick it again.</i>",
+      ]
+        .filter(Boolean)
+        .join("\n"),
+      keyboard: [
+        [{ text: "✔ Use this product", callback_data: "rq:s:0" }],
+        [{ text: "⬅ Back", callback_data: "rq:back" }],
+        footer(request),
+      ],
+    };
+  }
+
   const pageCount = Math.max(1, Math.ceil(hits.length / PAGE_SIZE));
   const page = Math.min(Math.max(ui.page ?? 0, 0), pageCount - 1);
   ui.page = page;
@@ -547,9 +632,12 @@ async function renderProductResults(
     "",
   ];
   for (const [i, hit] of slice.entries()) {
-    const sub = hit.subcategory ? ` · ${esc(hit.subcategory)}` : "";
-    const cat = !path.length && hit.category ? ` · ${esc(hit.category)}` : "";
-    lines.push(`<b>${start + i + 1}. ${esc(hit.name)}</b>${cat}${sub} — ${money(hit.total)} ${esc(hit.unit)}`);
+    const cat = [hit.category, hit.subcategory].filter(Boolean).join(" → ");
+    lines.push(
+      `<b>${start + i + 1}. ${esc(hit.name)}</b>${hit.unit ? ` — ${esc(hit.unit)}` : ""}` +
+        (cat ? `\n   ${esc(cat)}` : "") +
+        ` · ${money(hit.total)} on hand`
+    );
   }
 
   const btns = slice.map((_, i) => ({
@@ -573,17 +661,22 @@ async function renderSelectMovement(
   node: FlowNode,
   vars: Record<string, string>
 ): Promise<MoveRender> {
-  const wf = await loadWorkflow(db);
+  const wf = await loadWorkflow(db, request.chatId);
   const branches = movementBranches(wf);
-  const all = await loadManualTypes(db);
+  const all = await loadManualTypes(db, request.chatId);
   const byCode = new Map(all.map((t) => [t.code, t]));
 
-  const types: MovementType[] = branches.length
-    ? branches.map((b) => byCode.get(b.movementCode || "")).filter((t): t is MovementType => Boolean(t))
-    : all;
-
-  const btns = types.map((t, i) => ({
-    text: truncate(t.name, 32),
+  const btns = (branches.length
+    ? branches
+        .map((b) => {
+          const t = byCode.get(b.movementCode || "");
+          if (!t) return null;
+          return { type: t, label: b.label || t.name };
+        })
+        .filter((x): x is { type: MovementType; label: string } => Boolean(x))
+    : all.map((t) => ({ type: t, label: t.name }))
+  ).map((row, i) => ({
+    text: truncate(row.label, 34),
     callback_data: `rq:mv:t:${i}`,
   }));
 
@@ -602,12 +695,15 @@ async function renderLocationPick(
   mode: "location" | "from" | "to"
 ): Promise<MoveRender> {
   const type = request.ui.moveTypeCode
-    ? (await loadManualTypes(db)).find((t) => t.code === request.ui.moveTypeCode) ?? null
+    ? (await loadManualTypes(db, request.chatId)).find((t) => t.code === request.ui.moveTypeCode) ?? null
     : null;
   // Stock-out: offer shelves that already hold the item. Stock-in (return): browse
   // the full location tree so material can land anywhere, including empty bins.
+  // Move Stock "from" uses stock lines when available; "to" always browses destinations.
   const receiving = type?.direction === "in" || mode === "to";
-  if (hit && hit.lines.length && !receiving) {
+  const isMoveStock = request.ui.moveTypeCode === "warehouse-transfer";
+
+  if (hit && hit.lines.length && !receiving && mode === "from") {
     const btns = hit.lines.slice(0, LOCATIONS_SHOWN).map((l, i) => ({
       text: `📍 ${truncate(l.locationPath, 28)} (${money(l.qty)})`,
       callback_data: `rq:mv:sl:${i}`,
@@ -618,13 +714,58 @@ async function renderLocationPick(
     };
   }
 
+  if (hit && hit.lines.length && !receiving && mode === "location" && !isMoveStock) {
+    const btns = hit.lines.slice(0, LOCATIONS_SHOWN).map((l, i) => ({
+      text: `📍 ${truncate(l.locationPath, 28)} (${money(l.qty)})`,
+      callback_data: `rq:mv:sl:${i}`,
+    }));
+    return {
+      text: nodeText(node, vars),
+      keyboard: [...buttonRows(btns, 1), [{ text: "⬅ Back", callback_data: "rq:mv:back" }], footer(request)],
+    };
+  }
+
+  // New Purchase / Return from Plant / Move Stock: flat location list (no deep hierarchy).
+  if (
+    isMoveStock ||
+    (receiving &&
+      (request.ui.moveTypeCode === "new-purchase" || request.ui.moveTypeCode === "return-from-plant"))
+  ) {
+    let options = await flatSelectableLocations(db);
+    if (mode === "to" && request.ui.moveFromLocationId) {
+      options = options.filter((o) => o.id !== request.ui.moveFromLocationId);
+    }
+    if (!options.length) {
+      return {
+        text: `${nodeText(node, vars)}\n\n<i>${
+          mode === "to" && request.ui.moveFromLocationId
+            ? "No other storage locations available as destination."
+            : "No storage locations configured."
+        }</i>`,
+        keyboard: [[{ text: "⬅ Back", callback_data: "rq:mv:back" }], footer(request)],
+      };
+    }
+    const btns = options.slice(0, 20).map((o, i) => ({
+      text: `📍 ${truncate(o.label, 30)}`,
+      callback_data: `rq:mv:flat:${i}`,
+    }));
+    return {
+      text: nodeText(node, vars),
+      keyboard: [...buttonRows(btns, 1), [{ text: "⬅ Back", callback_data: "rq:mv:back" }], footer(request)],
+    };
+  }
+
   const parentIds = await locationParentIds(db);
   const cursor = request.ui.locCursor ?? null;
-  const kids = await locationChildren(db, cursor);
+  let kids = await locationChildren(db, cursor);
+  if (mode === "to" && request.ui.moveFromLocationId) {
+    kids = kids.filter((l) => l._id.toString() !== request.ui.moveFromLocationId);
+  }
   const btns = kids.slice(0, LOCATIONS_SHOWN).map((l, i) => {
-    const hasKids = parentIds.has(l.id);
+    const id = l._id.toString();
+    const hasKids = parentIds.has(id);
     return {
-      text: `${hasKids ? "▸ " : "📍 "}${truncate(l.name, 28)}`,
+      text: `${hasKids ? "▸ " : "📍 "}${truncate(String(l.name ?? ""), 28)}`,
       callback_data: hasKids ? `rq:mv:loc:${i}` : `rq:mv:sel:${i}`,
     };
   });
@@ -632,8 +773,21 @@ async function renderLocationPick(
   if (cursor) nav.push([{ text: "⬆ Up", callback_data: "rq:mv:up" }]);
   nav.push([{ text: "⬅ Back", callback_data: "rq:mv:back" }], footer(request));
 
+  const levels = [
+    ...new Set(kids.map((l) => String(l.level ?? "").trim()).filter(Boolean)),
+  ];
+  const levelHint =
+    levels.length === 1
+      ? `\n\n<b>Pick a ${levels[0]}</b>${kids.some((l) => parentIds.has(l._id.toString())) ? " (then keep going to the shelf)." : " — stock will sit here."}`
+      : kids.length
+        ? "\n\n<i>Location → Rack → Shelf</i>"
+        : "\n\n<i>Nothing under here — tap Up.</i>";
+  const here = cursor ? await locationPathById(db, cursor) : "";
+  const head = nodeText(node, vars);
+  const text = `${head}${here ? `\n<i>Current: ${here}</i>` : ""}${levelHint}`;
+
   return {
-    text: nodeText(node, vars),
+    text,
     keyboard: [...buttonRows(btns, 1), ...nav],
   };
 }
@@ -651,27 +805,103 @@ async function renderVendorPick(
       keyboard: [[{ text: "⬅ Back", callback_data: "rq:mv:back" }], footer(request)],
     };
   }
-  const listing = vendors
+
+  const q = String(request.ui.moveVendorQuery ?? "")
+    .trim()
+    .toLowerCase();
+  const filtered = q
+    ? vendors.filter((v) => {
+        const hay = [v.name, v.code, v.contact, v.phone, v.email]
+          .map((x) => String(x ?? "").toLowerCase())
+          .join(" ");
+        return hay.includes(q);
+      })
+    : vendors;
+
+  const listing = filtered
     .slice(0, 12)
     .map((v, i) => {
       const name = String(v.name ?? "Vendor");
       const code = v.code ? String(v.code) : "";
-      const contact = [v.contact, v.phone, v.email].map((x) => String(x ?? "").trim()).filter(Boolean).join(" · ");
-      const bits = [code && `(${code})`, contact].filter(Boolean).join(" ");
-      return `<b>${i + 1}. ${esc(name)}</b>${bits ? ` — ${esc(bits)}` : ""}`;
+      return `<b>${i + 1}. ${esc(name)}</b>${code ? ` (${esc(code)})` : ""}`;
     })
     .join("\n");
-  const btns = vendors.slice(0, 12).map((v, i) => {
+
+  const btns = filtered.slice(0, 12).map((v, i) => {
     const name = String(v.name ?? "Vendor");
-    const code = v.code ? ` (${String(v.code)})` : "";
     return {
-      text: truncate(`${name}${code}`, 32),
+      text: truncate(name, 32),
       callback_data: `rq:mv:vendor:${i}`,
     };
   });
+
+  const searchHint = q
+    ? `\n\n🔍 Search: <b>${esc(request.ui.moveVendorQuery)}</b> — ${filtered.length} match${filtered.length === 1 ? "" : "es"}`
+    : `\n\n<i>Type a vendor name to search Vendor Master.</i>`;
+
   return {
-    text: `${nodeText(node, vars)}\n\n${listing}`,
-    keyboard: [...buttonRows(btns, 1), [{ text: "⬅ Back", callback_data: "rq:mv:back" }], footer(request)],
+    text: `${nodeText(node, vars)}${searchHint}\n\n${listing || "<i>No vendors match that search.</i>"}`,
+    keyboard: [
+      ...buttonRows(btns, 1),
+      ...(q ? [[{ text: "✖ Clear search", callback_data: "rq:mv:vendorclear" }]] : []),
+      [{ text: "⬅ Back", callback_data: "rq:mv:back" }],
+      footer(request),
+    ],
+  };
+}
+
+async function renderPlantPick(
+  db: Db,
+  request: ItemRequest,
+  node: FlowNode,
+  vars: Record<string, string>
+): Promise<MoveRender> {
+  const plants = await activePlants(db);
+  if (!plants.length) {
+    return {
+      text: `${nodeText(node, vars)}\n\n<i>No Active plants in Plant Master. Add plants in the console (or run npm run seed:plants), then try again.</i>`,
+      keyboard: [[{ text: "⬅ Back", callback_data: "rq:mv:back" }], footer(request)],
+    };
+  }
+
+  const q = String(request.ui.movePlantQuery ?? "")
+    .trim()
+    .toLowerCase();
+  const filtered = q
+    ? plants.filter((p) => {
+        const hay = [p.name, p.code, p.contact]
+          .map((x) => String(x ?? "").toLowerCase())
+          .join(" ");
+        return hay.includes(q);
+      })
+    : plants;
+
+  const listing = filtered
+    .slice(0, 12)
+    .map((p, i) => {
+      const name = String(p.name ?? "Plant");
+      const code = p.code ? String(p.code) : "";
+      return `<b>${i + 1}. 🏭 ${esc(name)}</b>${code ? ` (${esc(code)})` : ""}`;
+    })
+    .join("\n");
+
+  const btns = filtered.slice(0, 12).map((p, i) => ({
+    text: truncate(`🏭 ${String(p.name ?? "Plant")}`, 32),
+    callback_data: `rq:mv:plant:${i}`,
+  }));
+
+  const searchHint = q
+    ? `\n\n🔍 Search: <b>${esc(request.ui.movePlantQuery)}</b> — ${filtered.length} match${filtered.length === 1 ? "" : "es"}`
+    : `\n\n<i>Type a plant name to search Plant Master.</i>`;
+
+  return {
+    text: `${nodeText(node, vars)}${searchHint}\n\n${listing || "<i>No plants match that search.</i>"}`,
+    keyboard: [
+      ...buttonRows(btns, 1),
+      ...(q ? [[{ text: "✖ Clear search", callback_data: "rq:mv:plantclear" }]] : []),
+      [{ text: "⬅ Back", callback_data: "rq:mv:back" }],
+      footer(request),
+    ],
   };
 }
 
@@ -700,7 +930,13 @@ async function renderDepartmentPick(
 
 function renderQty(request: ItemRequest, node: FlowNode, vars: Record<string, string>): MoveRender {
   const draft = request.ui.moveQtyDraft ?? "";
-  const text = nodeText(node, { ...vars, qty: `<b>${draft || "—"}</b>` });
+  const parts = draftQtyParts(draft);
+  const unit = vars.unit || "";
+  const qtyLine = `Qty: <b>${esc(parts.qtyLabel)}</b>${unit ? ` ${esc(unit)}` : ""}`;
+  const entriesLine = parts.hasTimes ? `\nEntries: <b>${esc(parts.entriesLabel || "—")}</b>` : "";
+  // Prefer a clear how-many prompt; avoid templates that paste "12 × 5" into {{qty}} {{unit}}.
+  const head = [vars.product, vars.type].filter(Boolean).join(" — ") || nodeText(node, { ...vars, qty: parts.qtyLabel });
+  const text = `${head}\n\nHow many?\n\n${qtyLine}${entriesLine}\n\n${quantityRepeatHint()}`;
   const key = (d: string) => ({ text: d, callback_data: `rq:mv:q:${d}` });
   return {
     text,
@@ -709,7 +945,10 @@ function renderQty(request: ItemRequest, node: FlowNode, vars: Record<string, st
       ["4", "5", "6"].map(key),
       ["7", "8", "9"].map(key),
       [key("."), key("0"), { text: "⌫", callback_data: "rq:mv:q:del" }],
-      [{ text: "✔ Next", callback_data: "rq:mv:q:ok" }],
+      [
+        { text: "×", callback_data: "rq:mv:q:x" },
+        { text: "✔ Next", callback_data: "rq:mv:q:ok" },
+      ],
       [{ text: "⬅ Back", callback_data: "rq:mv:back" }],
       footer(request),
     ],
@@ -797,49 +1036,79 @@ async function movementSummaryLines(
   hit: StockHit | null,
   type: MovementType | null
 ): Promise<string[]> {
-  const qty = request.ui.moveQtyDraft || "—";
+  const isTransfer = type?.direction === "transfer" || type?.code === "warehouse-transfer";
+  const fromId = request.ui.moveFromLocationId || "";
+  const toId = request.ui.moveToLocationId || "";
   const loc =
     (request.ui.moveLocationId || request.ui.focusLocationId
       ? await locationPathById(db, (request.ui.moveLocationId || request.ui.focusLocationId)!)
       : "") || "—";
-  const wf = await loadWorkflow(db);
+  const fromPath = fromId ? (await locationPathById(db, fromId)) || "—" : "—";
+  const toPath = toId ? (await locationPathById(db, toId)) || "—" : "—";
+  const wf = await loadWorkflow(db, request.chatId);
   const receiving = type?.direction === "in";
   const locLabel =
-    type?.code === "new-purchase" ? "Receive at" : receiving ? "Return to" : "From";
-  const out: string[] = [
-    type ? `<b>${esc(type.name)}</b>` : "",
-    "",
-    hit ? `Item: ${esc(hit.name)}` : "",
-    `Quantity: ${esc(qty)} ${esc(hit?.unit ?? "")}`,
-    `${locLabel}: ${esc(loc)}`,
+    type?.code === "new-purchase"
+      ? "Location"
+      : type?.code === "return-from-plant"
+        ? "Return To"
+        : receiving
+          ? "Location"
+          : "From";
+
+  const parsed = parseQuantityRepeat(request.ui.moveQtyDraft || "");
+  const unit = hit?.unit ?? "";
+  const qtyLines = parsed.ok
+    ? reviewQuantityLines(parsed.value.qty, unit, parsed.value.times)
+    : [`Quantity: ${request.ui.moveQtyDraft || "—"}${unit ? ` ${unit}` : ""}`];
+
+  const categoryPath = categoryPathOf(request.ui);
+  const categoryLabel =
+    categoryPath.length > 0
+      ? categoryPath.join(" → ")
+      : [hit?.category, hit?.subcategory].filter(Boolean).join(" → ");
+
+  const rebuilt: string[] = [
+    hit ? `Item: ${esc(hit.name)}` : request.ui.query ? `Item: ${esc(request.ui.query)}` : "",
+    categoryLabel ? `Category: ${esc(categoryLabel)}` : "",
+    type ? `Action: ${esc(type.name)}` : "",
   ];
-  if (request.ui.moveVendorName) out.push(`Vendor: ${esc(request.ui.moveVendorName)}`);
-  if (request.ui.moveDepartmentName) out.push(`Department: ${esc(request.ui.moveDepartmentName)}`);
+  for (const line of qtyLines) rebuilt.push(esc(line));
+  if (isTransfer) {
+    rebuilt.push(`From: ${esc(fromPath)}`);
+    rebuilt.push(`To: ${esc(toPath)}`);
+  } else {
+    if (request.ui.movePlantName) rebuilt.push(`From Plant: ${esc(request.ui.movePlantName)}`);
+    if (request.ui.moveVendorName) rebuilt.push(`Vendor: ${esc(request.ui.moveVendorName)}`);
+    rebuilt.push(`${locLabel}: ${esc(loc)}`);
+  }
+
+  if (request.ui.moveDepartmentName) rebuilt.push(`Department: ${esc(request.ui.moveDepartmentName)}`);
   for (const [qid, a] of Object.entries(request.ui.moveAnswers ?? {})) {
     const qNode = Object.values(wf.nodes).find((n) => n.question?.id === qid);
     const label = qNode?.question?.label || qNode?.label || "Answer";
-    out.push(`${esc(label)}: ${esc(a.display)}`);
+    rebuilt.push(`${esc(label)}: ${esc(a.display)}`);
   }
-  if (request.ui.moveReference) out.push(`Reference: ${esc(request.ui.moveReference)}`);
-  if (request.ui.moveRemarks) out.push(`Remarks: ${esc(request.ui.moveRemarks)}`);
-  return out.filter(Boolean);
+  if (request.ui.moveReference) rebuilt.push(`Reference: ${esc(request.ui.moveReference)}`);
+  if (request.ui.moveRemarks) rebuilt.push(`Remarks: ${esc(request.ui.moveRemarks)}`);
+  return rebuilt.filter(Boolean);
 }
 
 async function renderReview(
   db: Db,
   request: ItemRequest,
-  node: FlowNode,
+  _node: FlowNode,
   hit: StockHit | null,
   type: MovementType | null,
-  vars: Record<string, string>
+  _vars: Record<string, string>
 ): Promise<MoveRender> {
   const summary = await movementSummaryLines(db, request, hit, type);
-  const text = [nodeText(node, vars), "", ...summary].filter(Boolean).join("\n");
+  const text = ["📋 <b>Review</b>", "", ...summary].filter(Boolean).join("\n");
 
   return {
     text,
     keyboard: [
-      [{ text: "✔ Continue", callback_data: "rq:mv:next" }],
+      [{ text: "🛒 Add to Cart", callback_data: "rq:mv:cart" }],
       [{ text: "⬅ Back", callback_data: "rq:mv:back" }],
       footer(request),
     ],
@@ -854,21 +1123,12 @@ async function renderAddToCart(
   type: MovementType | null,
   vars: Record<string, string>
 ): Promise<MoveRender> {
-  const summary = await movementSummaryLines(db, request, hit, type);
-  const text = [nodeText(node, vars), "", ...summary, "", "Add this movement to your cart?"].filter(Boolean).join("\n");
-
-  return {
-    text,
-    keyboard: [
-      [{ text: "✔ Add to cart", callback_data: "rq:mv:cart" }],
-      [{ text: "⬅ Back", callback_data: "rq:mv:back" }],
-      footer(request),
-    ],
-  };
+  // Same screen as Review — no second "Add this line?" confirmation.
+  return renderReview(db, request, node, hit, type, vars);
 }
 
 async function advance(db: Db, request: ItemRequest): Promise<MoveRender> {
-  const wf = await loadWorkflow(db);
+  const wf = await loadWorkflow(db, request.chatId);
   const id = request.ui.flowNodeId;
   if (!id) return startConfiguredFlow(db, request);
   const next = nextNodeId(wf, id);
@@ -882,7 +1142,7 @@ async function advance(db: Db, request: ItemRequest): Promise<MoveRender> {
 }
 
 async function goBack(db: Db, request: ItemRequest): Promise<MoveRender> {
-  const wf = await loadWorkflow(db);
+  const wf = await loadWorkflow(db, request.chatId);
   const id = request.ui.flowNodeId;
   if (!id) return startSearchFlow(db, request, request.ui.query || "");
   const prev = prevNodeId(wf, id);
@@ -941,21 +1201,30 @@ export async function applyMoveCallback(
     }
   }
 
-  const wf = await loadWorkflow(db);
+  const wf = await loadWorkflow(db, request.chatId);
   const node = currentNode(wf, request);
   const hit = await focusedProduct(db, request);
 
   if (data === "rq:mv:back") return { render: await goBack(db, request) };
+
+  // Legacy Review "Continue" → same as Add to Cart (no extra confirm step).
+  if (data === "rq:mv:next" && node?.kind === "review") {
+    data = "rq:mv:cart";
+  }
+
   if (data === "rq:mv:next" || data === "rq:mv:skip") {
     if (data === "rq:mv:next" && node?.kind === "pick_vendor" && !request.ui.moveVendorId) {
       return { notice: "Pick a vendor first." };
+    }
+    if (data === "rq:mv:next" && node?.kind === "pick_plant" && !request.ui.movePlantId) {
+      return { notice: "Pick a plant first." };
     }
     if (data === "rq:mv:next" && node?.kind === "pick_department" && !request.ui.moveDepartmentId) {
       return { notice: "Pick a department first." };
     }
     if (data === "rq:mv:next" && node?.kind === "reference") {
       const type = request.ui.moveTypeCode
-        ? (await loadManualTypes(db)).find((t) => t.code === request.ui.moveTypeCode)
+        ? (await loadManualTypes(db, request.chatId)).find((t) => t.code === request.ui.moveTypeCode)
         : null;
       if (type?.requireReference && !String(request.ui.moveReference ?? "").trim()) {
         return { notice: "A reference is required for this movement." };
@@ -963,7 +1232,7 @@ export async function applyMoveCallback(
     }
     if (data === "rq:mv:skip" && node?.kind === "reference") {
       const type = request.ui.moveTypeCode
-        ? (await loadManualTypes(db)).find((t) => t.code === request.ui.moveTypeCode)
+        ? (await loadManualTypes(db, request.chatId)).find((t) => t.code === request.ui.moveTypeCode)
         : null;
       if (type?.requireReference) {
         return { notice: "A reference is required for this movement." };
@@ -972,10 +1241,19 @@ export async function applyMoveCallback(
     return { render: await advance(db, request) };
   }
   if (data === "rq:mv:cart") {
-    if (!request.ui.moveLocationId && !request.ui.focusLocationId) {
+    const isTransfer = request.ui.moveTypeCode === "warehouse-transfer";
+    if (isTransfer) {
+      if (!request.ui.moveFromLocationId) return { notice: "Pick where the stock is currently." };
+      if (!request.ui.moveToLocationId) return { notice: "Pick where you want to move it." };
+      if (request.ui.moveFromLocationId === request.ui.moveToLocationId) {
+        return { notice: "Source and destination must be different." };
+      }
+    } else if (!request.ui.moveLocationId && !request.ui.focusLocationId) {
       return { notice: "Pick a storage location first." };
     }
     if (!request.ui.moveQtyDraft) return { notice: "Enter a quantity first." };
+    const qtyCheck = parseQuantityRepeat(request.ui.moveQtyDraft);
+    if (!qtyCheck.ok) return { notice: qtyCheck.notice };
     // Vendor required when the branch includes pick_vendor (any saved vendor pick or type).
     const hasVendorStep = Object.values(wf.nodes).some(
       (n) =>
@@ -986,6 +1264,16 @@ export async function applyMoveCallback(
     );
     if (hasVendorStep && !request.ui.moveVendorId) {
       return { notice: "Pick a vendor first." };
+    }
+    const hasPlantStep = Object.values(wf.nodes).some(
+      (n) =>
+        n.kind === "pick_plant" &&
+        movementBranches(wf).some(
+          (m) => m.movementCode === request.ui.moveTypeCode && branchContains(wf, m.id, n.id)
+        )
+    );
+    if (hasPlantStep && !request.ui.movePlantId) {
+      return { notice: "Pick a plant first." };
     }
     const hasDeptStep = Object.values(wf.nodes).some(
       (n) =>
@@ -998,18 +1286,21 @@ export async function applyMoveCallback(
       return { notice: "Pick a department first." };
     }
     const typeForCart = request.ui.moveTypeCode
-      ? (await loadManualTypes(db)).find((t) => t.code === request.ui.moveTypeCode)
+      ? (await loadManualTypes(db, request.chatId)).find((t) => t.code === request.ui.moveTypeCode)
       : null;
-    if (typeForCart?.requireReference && !String(request.ui.moveReference ?? "").trim()) {
+    const branchHasReference = Object.values(wf.nodes).some(
+      (n) =>
+        n.kind === "reference" &&
+        movementBranches(wf).some(
+          (m) => m.movementCode === request.ui.moveTypeCode && branchContains(wf, m.id, n.id)
+        )
+    );
+    if (
+      branchHasReference &&
+      typeForCart?.requireReference &&
+      !String(request.ui.moveReference ?? "").trim()
+    ) {
       return { notice: "A reference is required for this movement." };
-    }
-    if (request.ui.moveTypeCode === "new-purchase") {
-      const hasStatus = Object.values(request.ui.moveAnswers ?? {}).some((a) =>
-        /received|expected|ordered/i.test(String(a.display ?? ""))
-      );
-      if (!hasStatus) {
-        return { notice: "Pick Expected or Received status first." };
-      }
     }
     return { addToCart: true };
   }
@@ -1019,7 +1310,7 @@ export async function applyMoveCallback(
   if (data.startsWith("rq:mv:t:")) {
     const idx = Number(data.slice("rq:mv:t:".length));
     const branches = movementBranches(wf);
-    const types = await loadManualTypes(db);
+    const types = await loadManualTypes(db, request.chatId);
     const byCode = new Map(types.map((t) => [t.code, t]));
     const ordered = branches.length
       ? branches.map((b) => byCode.get(b.movementCode || "")).filter((t): t is MovementType => Boolean(t))
@@ -1027,6 +1318,11 @@ export async function applyMoveCallback(
     const picked = ordered[idx];
     if (!picked) return { notice: "That movement is no longer available." };
     request.ui.moveTypeCode = picked.code;
+    request.ui.moveVendorQuery = "";
+    request.ui.movePlantQuery = "";
+    request.ui.moveFromLocationId = null;
+    request.ui.moveToLocationId = null;
+    request.ui.moveLocationId = null;
     const entered = enterMovementBranch(wf, picked.code);
     if (entered) {
       request.ui.flowNodeId = entered;
@@ -1035,14 +1331,85 @@ export async function applyMoveCallback(
     return { render: await advance(db, request) };
   }
 
-  // Vendor Master pick
+  // Vendor Master pick (indices match the filtered Vendor Master list on screen)
   if (data.startsWith("rq:mv:vendor:")) {
     const idx = Number(data.slice("rq:mv:vendor:".length));
     const vendors = await activeVendors(db);
-    const v = vendors[idx];
+    const q = String(request.ui.moveVendorQuery ?? "")
+      .trim()
+      .toLowerCase();
+    const filtered = q
+      ? vendors.filter((v) => {
+          const hay = [v.name, v.code, v.contact, v.phone, v.email]
+            .map((x) => String(x ?? "").toLowerCase())
+            .join(" ");
+          return hay.includes(q);
+        })
+      : vendors;
+    const v = filtered[idx];
     if (!v) return { notice: "That vendor is no longer available." };
     request.ui.moveVendorId = v._id.toString();
     request.ui.moveVendorName = String(v.name ?? "");
+    request.ui.moveVendorQuery = "";
+    return { render: await advance(db, request) };
+  }
+
+  if (data === "rq:mv:vendorclear") {
+    request.ui.moveVendorQuery = "";
+    return { render: await renderMoveFlow(db, request) };
+  }
+
+  // Plant Master pick
+  if (data.startsWith("rq:mv:plant:")) {
+    const idx = Number(data.slice("rq:mv:plant:".length));
+    const plants = await activePlants(db);
+    const q = String(request.ui.movePlantQuery ?? "")
+      .trim()
+      .toLowerCase();
+    const filtered = q
+      ? plants.filter((p) => {
+          const hay = [p.name, p.code, p.contact].map((x) => String(x ?? "").toLowerCase()).join(" ");
+          return hay.includes(q);
+        })
+      : plants;
+    const p = filtered[idx];
+    if (!p) return { notice: "That plant is no longer available." };
+    request.ui.movePlantId = p._id.toString();
+    request.ui.movePlantName = String(p.name ?? "");
+    request.ui.movePlantQuery = "";
+    return { render: await advance(db, request) };
+  }
+
+  if (data === "rq:mv:plantclear") {
+    request.ui.movePlantQuery = "";
+    return { render: await renderMoveFlow(db, request) };
+  }
+
+  // Flat location pick (New Purchase / Return from Plant / Move Stock)
+  if (data.startsWith("rq:mv:flat:")) {
+    const idx = Number(data.slice("rq:mv:flat:".length));
+    let options = await flatSelectableLocations(db);
+    if (node?.kind === "to" && request.ui.moveFromLocationId) {
+      options = options.filter((o) => o.id !== request.ui.moveFromLocationId);
+    }
+    const opt = options[idx];
+    if (!opt) return { notice: "That location is no longer available." };
+    if (node?.kind === "from") {
+      request.ui.moveFromLocationId = opt.id;
+      request.ui.moveLocationId = opt.id;
+      request.ui.focusLocationId = opt.id;
+    } else if (node?.kind === "to") {
+      if (request.ui.moveFromLocationId && opt.id === request.ui.moveFromLocationId) {
+        return { notice: "Source and destination must be different." };
+      }
+      request.ui.moveToLocationId = opt.id;
+    } else {
+      request.ui.moveLocationId = opt.id;
+      request.ui.focusLocationId = opt.id;
+      request.ui.intentLocationPicked = true;
+    }
+    request.ui.locCursor = null;
+    request.ui.locStack = [];
     return { render: await advance(db, request) };
   }
 
@@ -1062,9 +1429,20 @@ export async function applyMoveCallback(
     const idx = Number(data.slice("rq:mv:sl:".length));
     const line = hit?.lines[idx];
     if (!line) return { notice: "That location is gone." };
-    request.ui.moveLocationId = line.locationId;
-    request.ui.focusLocationId = line.locationId;
-    request.ui.intentLocationPicked = true;
+    if (node?.kind === "from") {
+      request.ui.moveFromLocationId = line.locationId;
+      request.ui.moveLocationId = line.locationId;
+      request.ui.focusLocationId = line.locationId;
+    } else if (node?.kind === "to") {
+      if (request.ui.moveFromLocationId && line.locationId === request.ui.moveFromLocationId) {
+        return { notice: "Source and destination must be different." };
+      }
+      request.ui.moveToLocationId = line.locationId;
+    } else {
+      request.ui.moveLocationId = line.locationId;
+      request.ui.focusLocationId = line.locationId;
+      request.ui.intentLocationPicked = true;
+    }
     return { render: await advance(db, request) };
   }
 
@@ -1079,23 +1457,31 @@ export async function applyMoveCallback(
   if (data.startsWith("rq:mv:loc:") || data.startsWith("rq:mv:sel:")) {
     const drill = data.startsWith("rq:mv:loc:");
     const idx = Number(data.slice(drill ? "rq:mv:loc:".length : "rq:mv:sel:".length));
-    const kids = await locationChildren(db, request.ui.locCursor ?? null);
+    let kids = await locationChildren(db, request.ui.locCursor ?? null);
+    if (node?.kind === "to" && request.ui.moveFromLocationId) {
+      kids = kids.filter((l) => l._id.toString() !== request.ui.moveFromLocationId);
+    }
     const loc = kids[idx];
     if (!loc) return { notice: "That location is gone." };
+    const locId = loc._id.toString();
     if (drill) {
       request.ui.locStack = [...(request.ui.locStack ?? []), request.ui.locCursor ?? ""].filter((x) => x !== undefined);
       // store previous cursor
       const stack = [...(request.ui.locStack ?? [])];
       if (request.ui.locCursor) stack.push(request.ui.locCursor);
       request.ui.locStack = stack;
-      request.ui.locCursor = loc.id;
+      request.ui.locCursor = locId;
       return { render: await renderMoveFlow(db, request) };
     }
-    if (node?.kind === "from") request.ui.moveFromLocationId = loc.id;
-    else if (node?.kind === "to") request.ui.moveToLocationId = loc.id;
-    else {
-      request.ui.moveLocationId = loc.id;
-      request.ui.focusLocationId = loc.id;
+    if (node?.kind === "from") request.ui.moveFromLocationId = locId;
+    else if (node?.kind === "to") {
+      if (request.ui.moveFromLocationId && locId === request.ui.moveFromLocationId) {
+        return { notice: "Source and destination must be different." };
+      }
+      request.ui.moveToLocationId = locId;
+    } else {
+      request.ui.moveLocationId = locId;
+      request.ui.focusLocationId = locId;
       request.ui.intentLocationPicked = true;
     }
     request.ui.locCursor = null;
@@ -1103,20 +1489,20 @@ export async function applyMoveCallback(
     return { render: await advance(db, request) };
   }
 
-  // Qty pad
+  // Qty pad — supports optional × times on the same draft (200 × 5).
   if (data.startsWith("rq:mv:q:")) {
     const pressed = data.slice("rq:mv:q:".length);
     let draft = request.ui.moveQtyDraft ?? "";
     if (pressed === "ok") {
-      if (!draft) return { notice: "Enter a quantity first." };
-      const qty = Number(draft);
-      if (!Number.isFinite(qty) || qty <= 0) return { notice: "Enter a valid quantity." };
+      const parsed = parseQuantityRepeat(draft);
+      if (!parsed.ok) return { notice: parsed.notice };
+      request.ui.moveQtyDraft = parsed.value.display;
 
       const locationId = request.ui.moveLocationId || request.ui.focusLocationId || request.ui.moveFromLocationId;
       const hit = await focusedProduct(db, request);
       const moveCode = request.ui.moveTypeCode || undefined;
       const type = moveCode
-        ? (await loadManualTypes(db)).find((t) => t.code === moveCode) ?? null
+        ? (await loadManualTypes(db, request.chatId)).find((t) => t.code === moveCode) ?? null
         : null;
       const moveNode =
         moveCode
@@ -1132,6 +1518,10 @@ export async function applyMoveCallback(
         movementCode: moveCode,
       });
 
+      const qty = parsed.value.qty;
+      const times = parsed.value.times;
+      const totalRequested = qty * times;
+
       if (!inbound && hit && locationId) {
         const locationPath = await locationPathById(db, locationId);
         const shortage = await findOutboundShortage(db, {
@@ -1141,7 +1531,7 @@ export async function applyMoveCallback(
           locationId,
           locationPath: locationPath || "(unknown location)",
           unit: hit.unit,
-          qty,
+          qty: totalRequested,
           inbound: false,
         });
         if (shortage) {
@@ -1152,7 +1542,9 @@ export async function applyMoveCallback(
           note(
             request,
             request.requesterName || "Requester",
-            `Out of stock at qty: ${hit.name} — requested ${money(qty)} ${hit.unit}, available ${money(shortage.available)}.`
+            `Out of stock at qty: ${hit.name} — requested ${money(totalRequested)} ${hit.unit}` +
+              (times > 1 ? ` (${money(qty)} × ${times} entries)` : "") +
+              `, available ${money(shortage.available)}.`
           );
           return {
             render: {
@@ -1162,7 +1554,8 @@ export async function applyMoveCallback(
                 type ? `<b>${esc(type.name)}</b>` : "",
                 `Item: ${esc(shortage.productName)}`,
                 `Location: ${esc(shortage.locationPath)}`,
-                `Requested: ${money(shortage.qtyRequested)} ${esc(shortage.unit)}`,
+                `Requested: ${money(shortage.qtyRequested)} ${esc(shortage.unit)}` +
+                  (times > 1 ? ` (${money(qty)} × ${times} entries)` : ""),
                 `Available: ${money(shortage.available)} ${esc(shortage.unit)}`,
                 "",
                 "<i>This shortage was recorded. Enter a lower quantity or pick another location.</i>",
@@ -1181,14 +1574,10 @@ export async function applyMoveCallback(
 
       return { render: await advance(db, request) };
     }
-    if (pressed === "del") draft = draft.slice(0, -1);
-    else if (pressed === ".") {
-      if (draft.includes(".")) return { notice: "Only one decimal point." };
-      draft = draft === "" ? "0." : `${draft}.`;
-    } else {
-      draft = draft === "0" ? pressed : draft + pressed;
-    }
-    request.ui.moveQtyDraft = draft;
+
+    const next = pressQuantityKey(draft, pressed);
+    if (next.notice) return { notice: next.notice };
+    request.ui.moveQtyDraft = next.value;
     return { render: await renderMoveFlow(db, request) };
   }
 
@@ -1248,10 +1637,24 @@ export async function applyMoveCallback(
 
 export async function applyMoveMessage(db: Db, request: ItemRequest, text: string): Promise<MoveResult | null> {
   if (!request.ui.flowNodeId) return null;
-  const wf = await loadWorkflow(db);
+  const wf = await loadWorkflow(db, request.chatId);
   const node = currentNode(wf, request);
   if (!node) return null;
 
+  if (node.kind === "pick_vendor") {
+    request.ui.moveVendorQuery = text.slice(0, 60);
+    return { render: await renderMoveFlow(db, request) };
+  }
+  if (node.kind === "pick_plant") {
+    request.ui.movePlantQuery = text.slice(0, 60);
+    return { render: await renderMoveFlow(db, request) };
+  }
+  if (node.kind === "qty") {
+    const parsed = parseQuantityRepeat(text);
+    if (!parsed.ok) return { notice: parsed.notice };
+    request.ui.moveQtyDraft = parsed.value.display;
+    return { render: await advance(db, request) };
+  }
   if (node.kind === "question" && node.question?.type === "string") {
     const q = node.question;
     request.ui.moveAnswers = {
@@ -1263,7 +1666,7 @@ export async function applyMoveMessage(db: Db, request: ItemRequest, text: strin
   if (node.kind === "reference") {
     const trimmed = text.trim();
     const type = request.ui.moveTypeCode
-      ? (await loadManualTypes(db)).find((t) => t.code === request.ui.moveTypeCode)
+      ? (await loadManualTypes(db, request.chatId)).find((t) => t.code === request.ui.moveTypeCode)
       : null;
     if (type?.requireReference && !trimmed) {
       return { notice: "A reference is required for this movement." };

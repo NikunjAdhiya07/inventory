@@ -5,12 +5,14 @@ import type { ProductAttribute } from "./products";
 export type StepType =
   | "item_capture"
   | "product_select"
+  | "stock_type"
   | "category_select"
   | "subcategory_select"
   | "category_tree"
   | "nested_select"
   | "location_tree"
   | "quantity"
+  | "pack_quantity"
   | "unit_select"
   | "custom_text"
   | "custom_number"
@@ -24,6 +26,16 @@ export type StepConfig = {
   // location_tree: name of the node the step opens inside, so the common case is
   // reachable in one tap. The other top-level nodes stay one tap away too.
   defaultLocation?: string;
+  // location_tree: list every stockable location as a direct button (no drill-down).
+  flatSelect?: boolean;
+  // location_tree: allow “Select this location” on a branch (Area/Rack) that still
+  // has children. Default false — stock must land on a leaf (typically Shelf) so
+  // Visual Rack / Storage Map can show the item at its exact physical spot.
+  allowSelectBranch?: boolean;
+  // stock_type / choice buttons: display labels. Values are derived (slug) unless
+  // `optionValues` is set in parallel.
+  options?: string[];
+  optionValues?: string[];
   // nested_select: the option tree to walk. Blank means "work it out from the
   // item the user already named", which is what lets ONE workflow ask wire
   // questions for wire and pipe questions for pipe.
@@ -161,12 +173,16 @@ export type BotSession = {
   productQuery?: string;
   productPage?: number;
   // AI / fuzzy suggestions on item_capture. While set with awaiting=true the
-  // step shows pick buttons instead of advancing.
+  // step shows pick buttons instead of advancing. After a pick, phase becomes
+  // "confirm" so the worker defines the exact product name before continuing.
   itemSuggest?: {
     awaiting: boolean;
+    phase?: "pick" | "confirm";
     typed?: string;
     labels: string[];
     imageFileId?: string;
+    pendingName?: string;
+    pendingProductId?: string;
     candidates: {
       name: string;
       productId?: string;
@@ -174,6 +190,15 @@ export type BotSession = {
       score: number;
       source: string;
     }[];
+  };
+  // Scratch for pack_quantity: units count × capacity per unit.
+  packDraft?: {
+    phase: "count" | "unit" | "capacity_value" | "capacity_unit";
+    count?: number;
+    unit?: string;
+    capacityValue?: number;
+    capacityUnit?: string;
+    skipCapacity?: boolean;
   };
   approval?: { stepInstanceId: string; awaitingRole: string; decidedBy?: string; decision?: "ok" | "no" };
   status: "active" | "awaiting_approval" | "completed" | "cancelled";

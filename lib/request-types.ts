@@ -62,6 +62,12 @@ export type RequestLine = {
   attributes: ProductAttribute[];
   locationId: string;
   locationPath: string;
+  /** Transfer source (Move Stock). When set, `locationId` mirrors the source for outbound checks. */
+  fromLocationId?: string;
+  fromLocationPath?: string;
+  /** Transfer destination (Move Stock). */
+  toLocationId?: string;
+  toLocationPath?: string;
   qty: number;
   unit: string;
   // Movement snapshot when the line came from a search-group flowchart (e.g. Vendor Replacement).
@@ -69,6 +75,9 @@ export type RequestLine = {
   movementName?: string;
   vendorId?: string;
   vendorName?: string;
+  /** Plant Master snapshot for Return from Plant / Issue to Plant. */
+  plantId?: string;
+  plantName?: string;
   departmentId?: string;
   departmentName?: string;
   reference?: string;
@@ -160,6 +169,12 @@ export type RequestUi = {
   moveToLocationId?: string | null;
   moveVendorId?: string | null;
   moveVendorName?: string | null;
+  /** Typed filter while picking a vendor from Vendor Master. */
+  moveVendorQuery?: string;
+  movePlantId?: string | null;
+  movePlantName?: string | null;
+  /** Typed filter while picking a plant from Plant Master. */
+  movePlantQuery?: string;
   moveDepartmentId?: string | null;
   moveDepartmentName?: string | null;
   moveQtyDraft?: string;

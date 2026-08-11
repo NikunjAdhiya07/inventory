@@ -5,14 +5,22 @@
 import type { Db } from "mongodb";
 import { cached, invalidate } from "./cache";
 import { newQuestionId, normalizeQuestions, type MoveQuestion, type MoveQuestionKind } from "./movement-questions";
+import { pressQuantityKey } from "./quantity-repeat";
+import { groupConfig } from "./telegram-health";
 
 export const SEARCH_MOVE_WORKFLOW_KEY = "search-move";
+
+/** Per-Telegram-group document key. Legacy singleton remains `search-move`. */
+export function workflowKeyForChat(chatId: string): string {
+  return `${SEARCH_MOVE_WORKFLOW_KEY}:${chatId}`;
+}
 
 export type FlowNodeKind =
   | "search"
   | "pick_category"
   | "pick_location"
   | "pick_vendor"
+  | "pick_plant"
   | "pick_department"
   | "select_movement"
   | "movement"
@@ -49,7 +57,9 @@ export type FlowNode = {
 };
 
 export type SearchMoveWorkflow = {
-  key: typeof SEARCH_MOVE_WORKFLOW_KEY;
+  key: string;
+  /** Telegram group this tree belongs to (per-group workflows). */
+  chatId?: string;
   name: string;
   rootId: string;
   nodes: Record<string, FlowNode>;
@@ -72,27 +82,29 @@ export function defaultMessage(kind: FlowNodeKind, label?: string): string {
     case "search":
       return "Type an item name to search stock (e.g. pipe).";
     case "pick_category":
-      return "“{{product}}” matches several categories.\n\nPick a category, then a subcategory:";
+      return "“{{product}}” — category from Category Master.\n\nIf several match, pick one:";
     case "pick_product":
       // Legacy — products come from search results, not a workflow node
       return "Pick an item:";
     case "pick_location":
     case "location":
       return "{{product}}\n\nPick a storage location:";
+    case "select_movement":
+      return "{{product}}\n\nWhat do you want to do?";
     case "pick_vendor":
-      return "{{product}} — {{type}}\n\nPick the vendor:";
+      return "{{product}} — {{type}}\n\nWho are you purchasing this from?\n\n<i>Type a name to search Vendor Master, or pick below.</i>";
+    case "pick_plant":
+      return "{{product}} — {{type}}\n\n📍 Which plant is returning this item?\n\n<i>Type a name to search Plant Master, or pick below.</i>";
     case "pick_department":
       return "{{product}} — {{type}}\n\nWhich department is returning this item?";
-    case "select_movement":
-      return "{{product}}\n\nPick a movement:";
     case "movement":
       return "{{product}} — {{type}}";
     case "from":
-      return "{{product}} — {{type}}\nWhere is it moving from?";
+      return "{{product}} — {{type}}\n\n📍 Where is the stock currently?";
     case "to":
-      return "{{product}} — {{type}}\nWhere is it moving to?";
+      return "{{product}} — {{type}}\n\n📍 Where do you want to move it?";
     case "qty":
-      return "{{product}} — {{type}}\n{{where}}\n\nQty: {{qty}} {{unit}}";
+      return "{{product}} — {{type}}\n{{where}}\n\nHow many?\n\nQty: {{qty}} {{unit}}\n\nOptional: qty × entries (e.g. 200 × 5 = five entries of 200).";
     case "stock_in":
       return "{{product}}\n\nConfirm: increase stock by {{qty}} {{unit}} at {{where}}?";
     case "stock_out":
@@ -102,10 +114,10 @@ export function defaultMessage(kind: FlowNodeKind, label?: string): string {
     case "remarks":
       return "Type the remarks.";
     case "review":
-      return "Review, then add to cart.";
+      return "📋 Review";
     case "add_to_cart":
     case "done":
-      return "{{product}} × {{qty}} {{unit}}\n{{where}}\n{{type}}\n\nAdd this line to your cart?";
+      return "📋 Review";
     case "question":
       return "{{type}}\n\n{{question}}";
     default:
@@ -149,12 +161,7 @@ export function buildExampleWorkflow(): SearchMoveWorkflow {
   for (const n of lead) nodes[n.id] = n;
 
   const examples: BranchExample[] = [
-    {
-      code: "return-from-plant",
-      name: "Return from Plant",
-      direction: "in",
-      questions: [{ type: "select", label: "Which plant?", options: ["Plant A", "Plant B", "Plant C"] }],
-    },
+    returnFromPlantBranchExample(),
     {
       code: "issue-to-plant",
       name: "Issue to Plant",
@@ -164,12 +171,7 @@ export function buildExampleWorkflow(): SearchMoveWorkflow {
         { type: "boolean", label: "Urgent issue?" },
       ],
     },
-    {
-      code: "warehouse-transfer",
-      name: "Warehouse to Warehouse",
-      direction: "transfer",
-      questions: [{ type: "string", label: "Why are you transferring?" }],
-    },
+    moveStockBranchExample(),
     {
       code: "vendor-replacement",
       name: "Vendor Replacement",
@@ -241,6 +243,68 @@ export function buildExampleWorkflow(): SearchMoveWorkflow {
   };
 }
 
+/**
+ * Entries-mode / data-entry group default: search → category →
+ * Add to Stock + New Purchase (qty → vendor → location → stock in → review → cart).
+ */
+export function buildAddToStockWorkflow(chatId?: string): SearchMoveWorkflow {
+  const lead = chain([
+    {
+      kind: "search",
+      label: "Type product name",
+      message: "Type a product name to search (e.g. PVC Pipe Medium).",
+    },
+    {
+      kind: "pick_category",
+      label: "Category",
+      message: "“{{product}}” — pick a category path if needed:",
+    },
+    {
+      kind: "select_movement",
+      label: "What do you want to do?",
+      message: "{{product}}\n\nWhat do you want to do?",
+      movementCodes: ["opening-stock", "new-purchase"],
+    },
+  ]);
+  const hubs = lead[lead.length - 1];
+  hubs.movementCodes = ["opening-stock", "new-purchase"];
+  const nodes: Record<string, FlowNode> = {};
+  for (const n of lead) nodes[n.id] = n;
+
+  attachMovementBranch(nodes, hubs, {
+    code: "opening-stock",
+    name: "Add to Stock",
+    direction: "in",
+    locationLabel: "📍 Where is this stock? (Location → Rack → Shelf)",
+    locationMessage:
+      "{{product}} — {{type}}\n\n📍 Where is this stock?\n<i>Pick Location → Rack → Shelf</i>",
+    qtyMessage: "{{product}} — {{type}}\n\nHow many?\n\nQty: {{qty}} {{unit}}",
+    questions: [],
+  });
+
+  // Prefer location before quantity for data-entry: Location → Rack → Shelf → qty.
+  const move = Object.values(nodes).find((n) => n.kind === "movement" && n.movementCode === "opening-stock");
+  if (move) {
+    const stepIds = branchSteps({ key: SEARCH_MOVE_WORKFLOW_KEY, name: "", rootId: lead[0].id, nodes, updatedAt: "" }, move.id);
+    const byKind = Object.fromEntries(stepIds.map((id) => [nodes[id]?.kind, id]));
+    const order = ["location", "qty", "stock_in", "review", "add_to_cart"]
+      .map((k) => byKind[k])
+      .filter((id): id is string => Boolean(id));
+    if (order.length) rewireBranch(nodes, move.id, order);
+  }
+
+  attachMovementBranch(nodes, hubs, newPurchaseBranchExample());
+
+  return {
+    key: chatId ? workflowKeyForChat(chatId) : SEARCH_MOVE_WORKFLOW_KEY,
+    ...(chatId ? { chatId } : {}),
+    name: "Data Entry — Add to Stock + New Purchase",
+    rootId: lead[0].id,
+    nodes,
+    updatedAt: new Date().toISOString(),
+  };
+}
+
 type BranchExample = {
   code: string;
   name: string;
@@ -257,12 +321,21 @@ type BranchExample = {
   includeVendor?: boolean;
   /** When true, vendor is asked before location (New Purchase). Default: after location. */
   vendorBeforeLocation?: boolean;
+  /** Quantity → Vendor/Plant → Location (simple purchase / return flows). */
+  qtyFirst?: boolean;
   includeDepartment?: boolean;
+  includePlant?: boolean;
   includeReference?: boolean;
   locationLabel?: string;
   locationMessage?: string;
   vendorLabel?: string;
   vendorMessage?: string;
+  plantLabel?: string;
+  plantMessage?: string;
+  fromLabel?: string;
+  fromMessage?: string;
+  toLabel?: string;
+  toMessage?: string;
   qtyMessage?: string;
   referenceLabel?: string;
   referenceMessage?: string;
@@ -283,6 +356,41 @@ function questionStep(
   return { kind: "question", label: q.label, question };
 }
 
+function returnFromPlantBranchExample(): BranchExample {
+  return {
+    code: "return-from-plant",
+    name: "Return from Plant",
+    direction: "in",
+    includePlant: true,
+    qtyFirst: true,
+    includeReference: false,
+    plantLabel: "Which plant?",
+    plantMessage:
+      "{{product}} — {{type}}\n\n📍 Which plant is returning this item?\n\n<i>Type a name to search Plant Master, or pick below.</i>",
+    locationLabel: "Where is this stock being returned to?",
+    locationMessage: "{{product}} — {{type}}\n\n📍 Where is this stock being returned to?",
+    qtyMessage: "{{product}} — {{type}}\n\nHow many?\n\nQty: {{qty}} {{unit}}",
+    questions: [],
+  };
+}
+
+/** Request-group (second Telegram bot): Move Stock between two locations. */
+function moveStockBranchExample(): BranchExample {
+  return {
+    code: "warehouse-transfer",
+    name: "📦 Move Stock",
+    direction: "transfer",
+    qtyFirst: true,
+    includeReference: false,
+    fromLabel: "Where is the stock currently?",
+    fromMessage: "{{product}} — {{type}}\n\n📍 Where is the stock currently?",
+    toLabel: "Where do you want to move it?",
+    toMessage: "{{product}} — {{type}}\n\n📍 Where do you want to move it?",
+    qtyMessage: "{{product}} — {{type}}\n\nHow many?\n\nQty: {{qty}} {{unit}}",
+    questions: [],
+  };
+}
+
 function newPurchaseBranchExample(): BranchExample {
   return {
     code: "new-purchase",
@@ -290,29 +398,14 @@ function newPurchaseBranchExample(): BranchExample {
     direction: "in",
     includeVendor: true,
     vendorBeforeLocation: true,
-    includeReference: true,
+    qtyFirst: true,
+    includeReference: false,
     vendorLabel: "Select vendor",
-    vendorMessage: "{{product}} — {{type}}\n\nWhich vendor are you purchasing this item from?",
-    locationLabel: "Receiving location",
-    locationMessage: "{{product}} — {{type}}\n\nWhere will this item be received?",
-    qtyMessage: "{{product}} — {{type}}\n{{where}}\n\nHow much are you purchasing?\n\nQty: {{qty}} {{unit}}",
-    referenceLabel: "Purchase Reference",
-    referenceMessage: "Type the PO number, invoice, or vendor reference.",
-    questions: [
-      {
-        type: "number",
-        label: "Unit Price",
-        required: false,
-        placeholder: "Unit cost (optional)",
-      },
-    ],
-    questionsAfterReference: [
-      {
-        type: "select",
-        label: "Expected / Received Status",
-        options: ["Purchase Ordered / Expected", "Received"],
-      },
-    ],
+    vendorMessage: "{{product}} — {{type}}\n\nWho are you purchasing this from?\n\n<i>Type a name to search Vendor Master, or pick below.</i>",
+    locationLabel: "Where will this stock be stored?",
+    locationMessage: "{{product}} — {{type}}\n\nWhere will this stock be stored?",
+    qtyMessage: "{{product}} — {{type}}\n\nHow many?\n\nQty: {{qty}} {{unit}}",
+    questions: [],
   };
 }
 
@@ -334,6 +427,76 @@ function attachMovementBranch(
   hub.children.push(move.id);
 
   const stepDefs: { kind: FlowNodeKind; label: string; message?: string; question?: MoveQuestion }[] = [];
+
+  const pushVendor = () => {
+    if (!ex.includeVendor) return;
+    stepDefs.push({
+      kind: "pick_vendor",
+      label: ex.vendorLabel || "Select vendor",
+      message: ex.vendorMessage || defaultMessage("pick_vendor"),
+    });
+  };
+
+  const pushPlant = () => {
+    if (!ex.includePlant) return;
+    stepDefs.push({
+      kind: "pick_plant",
+      label: ex.plantLabel || "Which plant?",
+      message: ex.plantMessage || defaultMessage("pick_plant"),
+    });
+  };
+
+  const pushLocation = () => {
+    if (ex.direction === "transfer") {
+      stepDefs.push(
+        {
+          kind: "from",
+          label: ex.fromLabel || "Where is the stock currently?",
+          message: ex.fromMessage || defaultMessage("from"),
+        },
+        {
+          kind: "to",
+          label: ex.toLabel || "Where do you want to move it?",
+          message: ex.toMessage || defaultMessage("to"),
+        }
+      );
+      return;
+    }
+    const defaultInLabel =
+      ex.code === "new-purchase"
+        ? "Where will this stock be stored?"
+        : ex.code === "return-from-plant"
+          ? "Where is this stock being returned to?"
+          : "Return location";
+    const defaultInMsg =
+      ex.code === "new-purchase"
+        ? "{{product}} — {{type}}\n\nWhere will this stock be stored?"
+        : ex.code === "return-from-plant"
+          ? "{{product}} — {{type}}\n\n📍 Where is this stock being returned to?"
+          : "{{product}} — {{type}}\n\nWhere should the material be returned?";
+    stepDefs.push({
+      kind: "location",
+      label: ex.locationLabel || (ex.direction === "out" ? "From location" : defaultInLabel),
+      message:
+        ex.locationMessage ||
+        (ex.direction === "in" ? defaultInMsg : defaultMessage("location")),
+    });
+  };
+
+  const pushQty = () => {
+    if (ex.qtyMessage) {
+      stepDefs.push({ kind: "qty", label: "Quantity", message: ex.qtyMessage });
+    } else if (ex.code === "department-return") {
+      stepDefs.push({
+        kind: "qty",
+        label: "Quantity",
+        message: "{{product}} — {{type}}\n{{where}}\n\nHow much are you returning?\n\nQty: {{qty}} {{unit}}",
+      });
+    } else {
+      stepDefs.push({ kind: "qty", label: "Quantity", message: defaultMessage("qty") });
+    }
+  };
+
   // Department Return starts with department (item already selected in lead-in).
   if (ex.includeDepartment) {
     stepDefs.push({
@@ -342,47 +505,21 @@ function attachMovementBranch(
       message: defaultMessage("pick_department"),
     });
   }
-  if (ex.includeVendor && ex.vendorBeforeLocation) {
-    stepDefs.push({
-      kind: "pick_vendor",
-      label: ex.vendorLabel || "Select vendor",
-      message: ex.vendorMessage || defaultMessage("pick_vendor"),
-    });
-  }
-  if (ex.direction === "transfer") {
-    stepDefs.push({ kind: "from", label: "From location" }, { kind: "to", label: "To location" });
+
+  if (ex.qtyFirst) {
+    // New Purchase / Return from Plant / Move Stock: qty first, then parties/locations
+    pushQty();
+    pushVendor();
+    pushPlant();
+    pushLocation();
   } else {
-    const defaultInLabel = ex.code === "new-purchase" ? "Receiving location" : "Return location";
-    const defaultInMsg =
-      ex.code === "new-purchase"
-        ? "{{product}} — {{type}}\n\nWhere will this item be received?"
-        : "{{product}} — {{type}}\n\nWhere should the material be returned?";
-    stepDefs.push({
-      kind: "location",
-      label: ex.locationLabel || (ex.direction === "out" ? "From location" : defaultInLabel),
-      message:
-        ex.locationMessage ||
-        (ex.direction === "in" ? defaultInMsg : defaultMessage("location")),
-    });
+    if (ex.includeVendor && ex.vendorBeforeLocation) pushVendor();
+    if (ex.includePlant) pushPlant();
+    pushLocation();
+    if (ex.includeVendor && !ex.vendorBeforeLocation) pushVendor();
+    pushQty();
   }
-  if (ex.includeVendor && !ex.vendorBeforeLocation) {
-    stepDefs.push({
-      kind: "pick_vendor",
-      label: ex.vendorLabel || "Select vendor",
-      message: ex.vendorMessage || defaultMessage("pick_vendor"),
-    });
-  }
-  if (ex.qtyMessage) {
-    stepDefs.push({ kind: "qty", label: "Quantity", message: ex.qtyMessage });
-  } else if (ex.code === "department-return") {
-    stepDefs.push({
-      kind: "qty",
-      label: "Quantity",
-      message: "{{product}} — {{type}}\n{{where}}\n\nHow much are you returning?\n\nQty: {{qty}} {{unit}}",
-    });
-  } else {
-    stepDefs.push({ kind: "qty", label: "Quantity", message: defaultMessage("qty") });
-  }
+
   const effectKind = stockEffectKindForDirection(ex.direction);
   if (effectKind) {
     stepDefs.push({
@@ -410,7 +547,7 @@ function attachMovementBranch(
   for (const q of ex.questionsAfterReference ?? []) {
     stepDefs.push(questionStep(q));
   }
-  stepDefs.push({ kind: "review", label: "Review" }, { kind: "add_to_cart", label: "Add to cart" });
+  stepDefs.push({ kind: "review", label: "📋 Review" }, { kind: "add_to_cart", label: "🛒 Add to Cart" });
 
   const chained = chain(stepDefs);
   for (const n of chained) nodes[n.id] = n;
@@ -500,19 +637,161 @@ export function ensureDepartmentReturnBranch(workflow: SearchMoveWorkflow): Sear
   return { ...workflow, nodes, updatedAt: new Date().toISOString() };
 }
 
-/** Idempotently add the New Purchase branch to a saved workflow. */
-export function ensureNewPurchaseBranch(workflow: SearchMoveWorkflow): SearchMoveWorkflow {
-  if (movementBranches(workflow).some((n) => n.movementCode === "new-purchase")) {
-    return workflow;
+/** True when the saved New Purchase branch still has the old long form. */
+function newPurchaseBranchNeedsSimplify(workflow: SearchMoveWorkflow, moveId: string): boolean {
+  const steps = branchSteps(workflow, moveId);
+  const kinds = steps.map((id) => workflow.nodes[id]?.kind);
+  if (kinds[0] !== "qty") return true;
+  if (!kinds.includes("pick_vendor")) return true;
+  if (kinds.includes("reference")) return true;
+  const vi = kinds.indexOf("pick_vendor");
+  const li = kinds.indexOf("location");
+  if (vi >= 0 && li >= 0 && vi > li) return true;
+  for (const id of steps) {
+    const label = workflow.nodes[id]?.question?.label || workflow.nodes[id]?.label || "";
+    if (/expected|received status|unit price/i.test(label)) return true;
   }
-  const hub = findSelectMovement(workflow);
+  return false;
+}
+
+/**
+ * Ensure New Purchase exists in the simple form:
+ * Quantity → Vendor → Location → stock in → Review → Add to Cart.
+ * Rebuilds an existing complex New Purchase branch in place.
+ */
+export function ensureNewPurchaseBranch(workflow: SearchMoveWorkflow): SearchMoveWorkflow {
+  const existing = movementBranches(workflow).find((n) => n.movementCode === "new-purchase");
+  if (existing && !newPurchaseBranchNeedsSimplify(workflow, existing.id)) {
+    // Keep hub.movementCodes in sync even when structure is already correct.
+    return syncHubMovementCodes(workflow);
+  }
+
+  let base = workflow;
+  if (existing) {
+    base = removeNode(workflow, existing.id);
+  }
+  const hub = findSelectMovement(base);
   if (!hub) return workflow;
-  const nodes = cloneNodes(workflow);
+  const nodes = cloneNodes(base);
   const hubNode = nodes[hub.id];
   if (!hubNode) return workflow;
   attachMovementBranch(nodes, hubNode, newPurchaseBranchExample());
+  const codes = new Set([...(hubNode.movementCodes ?? []), "new-purchase"]);
+  for (const id of hubNode.children) {
+    const code = nodes[id]?.movementCode;
+    if (code) codes.add(code);
+  }
+  hubNode.movementCodes = [...codes];
   nodes[hub.id] = hubNode;
+  return { ...base, nodes, updatedAt: new Date().toISOString() };
+}
+
+/** Keep select_movement.movementCodes aligned with actual branch children. */
+function syncHubMovementCodes(workflow: SearchMoveWorkflow): SearchMoveWorkflow {
+  const hub = findSelectMovement(workflow);
+  if (!hub) return workflow;
+  const fromChildren = hub.children
+    .map((id) => workflow.nodes[id]?.movementCode)
+    .filter((c): c is string => Boolean(c));
+  if (!fromChildren.length) return workflow;
+  const prev = hub.movementCodes ?? [];
+  const same = prev.length === fromChildren.length && prev.every((c, i) => c === fromChildren[i]);
+  if (same) return workflow;
+  const nodes = cloneNodes(workflow);
+  nodes[hub.id] = { ...nodes[hub.id], movementCodes: fromChildren };
   return { ...workflow, nodes, updatedAt: new Date().toISOString() };
+}
+
+/**
+ * Ensure Return from Plant exists in the simple form:
+ * Quantity → Plant → Location → stock in → Review → Add to Cart.
+ */
+export function ensureReturnFromPlantBranch(workflow: SearchMoveWorkflow): SearchMoveWorkflow {
+  const existing = movementBranches(workflow).find((n) => n.movementCode === "return-from-plant");
+  if (existing && !returnFromPlantBranchNeedsSimplify(workflow, existing.id)) {
+    return workflow;
+  }
+
+  let base = workflow;
+  if (existing) {
+    base = removeNode(workflow, existing.id);
+  }
+  const hub = findSelectMovement(base);
+  if (!hub) return workflow;
+  const nodes = cloneNodes(base);
+  const hubNode = nodes[hub.id];
+  if (!hubNode) return workflow;
+  attachMovementBranch(nodes, hubNode, returnFromPlantBranchExample());
+  nodes[hub.id] = hubNode;
+  return { ...base, nodes, updatedAt: new Date().toISOString() };
+}
+
+function returnFromPlantBranchNeedsSimplify(workflow: SearchMoveWorkflow, moveId: string): boolean {
+  const steps = branchSteps(workflow, moveId);
+  const kinds = steps.map((id) => workflow.nodes[id]?.kind);
+  if (kinds[0] !== "qty") return true;
+  if (!kinds.includes("pick_plant")) return true;
+  const pi = kinds.indexOf("pick_plant");
+  const li = kinds.indexOf("location");
+  if (pi >= 0 && li >= 0 && pi > li) return true;
+  for (const id of steps) {
+    const n = workflow.nodes[id];
+    // Old hardcoded "Which plant?" select question instead of Plant Master.
+    if (n?.kind === "question" && /which plant/i.test(n.question?.label || n.label || "")) return true;
+  }
+  return false;
+}
+
+/**
+ * Ensure Move Stock (warehouse-transfer) exists in the simple form for the
+ * request-group (second Telegram bot):
+ * Quantity → From → To → Review → Add to Cart.
+ * Does not touch entry-group (Add to Stock) workflows.
+ */
+export function ensureMoveStockBranch(workflow: SearchMoveWorkflow): SearchMoveWorkflow {
+  const existing = movementBranches(workflow).find((n) => n.movementCode === "warehouse-transfer");
+  if (existing && !moveStockBranchNeedsSimplify(workflow, existing.id)) {
+    // Keep display name current even when structure is already simple.
+    if (existing.label === "Warehouse to Warehouse" || existing.label === "Move Stock") {
+      const nodes = cloneNodes(workflow);
+      const n = nodes[existing.id];
+      if (n) {
+        n.label = "📦 Move Stock";
+        return { ...workflow, nodes, updatedAt: new Date().toISOString() };
+      }
+    }
+    return workflow;
+  }
+
+  let base = workflow;
+  if (existing) {
+    base = removeNode(workflow, existing.id);
+  }
+  const hub = findSelectMovement(base);
+  if (!hub) return workflow;
+  const nodes = cloneNodes(base);
+  const hubNode = nodes[hub.id];
+  if (!hubNode) return workflow;
+  attachMovementBranch(nodes, hubNode, moveStockBranchExample());
+  nodes[hub.id] = hubNode;
+  return { ...base, nodes, updatedAt: new Date().toISOString() };
+}
+
+function moveStockBranchNeedsSimplify(workflow: SearchMoveWorkflow, moveId: string): boolean {
+  const steps = branchSteps(workflow, moveId);
+  const kinds = steps.map((id) => workflow.nodes[id]?.kind);
+  if (kinds[0] !== "qty") return true;
+  if (!kinds.includes("from") || !kinds.includes("to")) return true;
+  const fi = kinds.indexOf("from");
+  const ti = kinds.indexOf("to");
+  if (fi >= 0 && ti >= 0 && fi > ti) return true;
+  for (const id of steps) {
+    const n = workflow.nodes[id];
+    if (n?.kind === "question" && /transferr|why are you/i.test(n.question?.label || n.label || "")) {
+      return true;
+    }
+  }
+  return false;
 }
 
 /** Ensure known Movement Master example branches exist on a saved tree. */
@@ -520,6 +799,8 @@ export function ensureConfiguredMovementBranches(workflow: SearchMoveWorkflow): 
   let next = ensureVendorReplacementBranch(workflow);
   next = ensureDepartmentReturnBranch(next);
   next = ensureNewPurchaseBranch(next);
+  next = ensureReturnFromPlantBranch(next);
+  next = ensureMoveStockBranch(next);
   next = ensureStockEffectStepsOnBranches(next);
   return next;
 }
@@ -578,7 +859,11 @@ export function needsLegacyMigration(workflow: SearchMoveWorkflow): boolean {
   return Object.values(workflow.nodes).some((n) => LEGACY_KINDS.has(n.kind));
 }
 
-/** Flat select_movement with no movement children — needs branch roots restored. */
+/**
+ * Flat select_movement with no movement children.
+ * Used only for one-time load migration of pre-branch docs — not on save.
+ * An empty hub after the user deletes every root is a valid saved tree.
+ */
 export function needsBranchMigration(workflow: SearchMoveWorkflow): boolean {
   const hub = findSelectMovement(workflow);
   if (!hub) return true;
@@ -616,28 +901,121 @@ export function normalizeWorkflow(raw: unknown): SearchMoveWorkflow {
       const qs = normalizeQuestions([v.question]);
       if (qs[0]) node.question = qs[0];
     }
+    // Opening Stock and Add to Stock are the same movement type (code opening-stock).
+    if (node.movementCode === "opening-stock" && node.label === "Opening Stock") {
+      node.label = "Add to Stock";
+    }
+    // Warehouse to Warehouse → Move Stock (code warehouse-transfer).
+    if (
+      node.movementCode === "warehouse-transfer" &&
+      (node.label === "Warehouse to Warehouse" || node.label === "Move Stock")
+    ) {
+      node.label = "📦 Move Stock";
+    }
     nodes[node.id] = node;
   }
   const rootId = String(r.rootId ?? "");
   if (!rootId || !nodes[rootId]) return buildExampleWorkflow();
 
   const workflow: SearchMoveWorkflow = {
-    key: SEARCH_MOVE_WORKFLOW_KEY,
+    key: String(r.key ?? SEARCH_MOVE_WORKFLOW_KEY),
     name: String(r.name ?? "Search group · stock movements"),
     rootId,
     nodes,
     updatedAt: String(r.updatedAt ?? new Date().toISOString()),
   };
+  if (r.chatId) workflow.chatId = String(r.chatId);
 
-  if (needsLegacyMigration(workflow) || needsBranchMigration(workflow)) {
+  // Only legacy spine shapes are replaced. Empty movement hubs stay empty so
+  // deleting roots (e.g. Return from Plant) survives save.
+  if (needsLegacyMigration(workflow)) {
     return buildExampleWorkflow();
   }
   return workflow;
 }
 
-export async function getSearchMoveWorkflow(db: Db): Promise<SearchMoveWorkflow> {
-  // Cache key bumped when stock_in/stock_out steps are ensured on all in/out branches.
-  return cached("searchMoveWorkflow:v5", async () => {
+export type WorkflowGroupMode = "entry" | "request";
+
+/**
+ * Load the flowchart for a Telegram group. Each chatId has its own document.
+ * Legacy singleton `search-move` is copied onto the first request-mode group that needs it.
+ */
+export async function getSearchMoveWorkflow(
+  db: Db,
+  chatId?: string,
+  opts?: { mode?: WorkflowGroupMode }
+): Promise<SearchMoveWorkflow> {
+  let mode: WorkflowGroupMode = opts?.mode ?? "request";
+  if (chatId && !opts?.mode) {
+    try {
+      mode = (await groupConfig(db, chatId)).mode;
+    } catch {
+      mode = "request";
+    }
+  }
+  const cacheKey = chatId ? `searchMoveWorkflow:v10:${chatId}` : "searchMoveWorkflow:v10:legacy";
+
+  return cached(cacheKey, async () => {
+    if (chatId) {
+      const key = workflowKeyForChat(chatId);
+      const doc = await db.collection(COLLECTION).findOne({ key });
+      if (doc) {
+        let wf = stampChat(normalizeWorkflow(doc), chatId);
+        if (mode === "request") {
+          let next = ensureNewPurchaseBranch(wf);
+          next = ensureReturnFromPlantBranch(next);
+          next = ensureMoveStockBranch(next);
+          if (next.updatedAt !== wf.updatedAt) {
+            await db.collection(COLLECTION).updateOne({ key }, { $set: next }, { upsert: true });
+            await syncQuestionsToMovementTypes(db, next);
+            invalidate(`searchMoveWorkflow:v10:${chatId}`);
+            return next;
+          }
+        } else if (mode === "entry") {
+          // Entries groups: always ensure New Purchase lands on the live tree.
+          let next = ensureNewPurchaseBranch(wf);
+          if (!movementCodesInTree(next).includes("new-purchase")) {
+            // No select_movement hub (or corrupt tree) — rebuild Entries template.
+            next = stampChat(buildAddToStockWorkflow(chatId), chatId);
+          }
+          if (next.updatedAt !== wf.updatedAt || !movementCodesInTree(wf).includes("new-purchase")) {
+            next = { ...next, updatedAt: new Date().toISOString() };
+            await db.collection(COLLECTION).updateOne({ key }, { $set: next }, { upsert: true });
+            await syncQuestionsToMovementTypes(db, next);
+            invalidate(`searchMoveWorkflow:v10:${chatId}`);
+            return next;
+          }
+        }
+        return wf;
+      }
+
+      // Migrate legacy singleton onto this chat the first time a request group loads.
+      if (mode === "request") {
+        const legacy = await db.collection(COLLECTION).findOne({ key: SEARCH_MOVE_WORKFLOW_KEY });
+        if (legacy) {
+          const migrated = ensureMoveStockBranch(
+            ensureReturnFromPlantBranch(
+              ensureNewPurchaseBranch(stampChat(normalizeWorkflow(legacy), chatId))
+            )
+          );
+          await db.collection(COLLECTION).updateOne({ key }, { $set: migrated }, { upsert: true });
+          await syncQuestionsToMovementTypes(db, migrated);
+          return migrated;
+        }
+        const example = stampChat(buildExampleWorkflow(), chatId);
+        await db.collection(COLLECTION).updateOne({ key }, { $set: example }, { upsert: true });
+        await syncQuestionsToMovementTypes(db, example);
+        return example;
+      }
+
+      // Entries-mode group: Add-to-Stock tree.
+      const entry = stampChat(buildAddToStockWorkflow(chatId), chatId);
+      await db.collection(COLLECTION).updateOne({ key }, { $set: entry }, { upsert: true });
+      await syncQuestionsToMovementTypes(db, entry);
+      return entry;
+    }
+
+    // No chatId — legacy singleton (scripts / old callers).
     const doc = await db.collection(COLLECTION).findOne({ key: SEARCH_MOVE_WORKFLOW_KEY });
     if (!doc) {
       const example = buildExampleWorkflow();
@@ -650,44 +1028,58 @@ export async function getSearchMoveWorkflow(db: Db): Promise<SearchMoveWorkflow>
       return example;
     }
 
-    const rawNodes = doc.nodes && typeof doc.nodes === "object" ? (doc.nodes as Record<string, { kind?: string; children?: string[] }>) : {};
+    const rawNodes =
+      doc.nodes && typeof doc.nodes === "object"
+        ? (doc.nodes as Record<string, { kind?: string }>)
+        : {};
     const rawHadLegacy = Object.values(rawNodes).some((n) =>
       ["intent", "record_hub", "request_branch"].includes(String(n?.kind ?? ""))
     );
-    const rawHub = Object.values(rawNodes).find((n) => n?.kind === "select_movement" || n?.kind === "record_hub");
-    const rawHadNoBranches =
-      !Object.values(rawNodes).some((n) => n?.kind === "movement") ||
-      (rawHub && !(rawHub.children ?? []).some((cid) => rawNodes[cid]?.kind === "movement"));
-
-    let workflow = normalizeWorkflow(doc);
-    if (rawHadLegacy || rawHadNoBranches) {
+    if (rawHadLegacy) {
+      const example = buildExampleWorkflow();
       await db.collection(COLLECTION).updateOne(
         { key: SEARCH_MOVE_WORKFLOW_KEY },
-        { $set: workflow },
+        { $set: example },
         { upsert: true }
       );
-      await syncQuestionsToMovementTypes(db, workflow);
+      await syncQuestionsToMovementTypes(db, example);
+      return example;
     }
-    const withConfigured = ensureConfiguredMovementBranches(workflow);
-    if (withConfigured !== workflow) {
-      workflow = withConfigured;
-      await db.collection(COLLECTION).updateOne(
-        { key: SEARCH_MOVE_WORKFLOW_KEY },
-        { $set: workflow },
-        { upsert: true }
-      );
-      await syncQuestionsToMovementTypes(db, workflow);
-    }
-    return workflow;
+    return normalizeWorkflow(doc);
   });
 }
 
-export async function saveSearchMoveWorkflow(db: Db, workflow: SearchMoveWorkflow): Promise<SearchMoveWorkflow> {
-  const next = ensureConfiguredMovementBranches(
-    normalizeWorkflow({ ...workflow, updatedAt: new Date().toISOString() })
-  );
-  await db.collection(COLLECTION).updateOne({ key: SEARCH_MOVE_WORKFLOW_KEY }, { $set: next }, { upsert: true });
+function stampChat(workflow: SearchMoveWorkflow, chatId: string): SearchMoveWorkflow {
+  return {
+    ...workflow,
+    key: workflowKeyForChat(chatId),
+    chatId,
+  };
+}
+
+export async function saveSearchMoveWorkflow(
+  db: Db,
+  workflow: SearchMoveWorkflow,
+  chatId?: string
+): Promise<SearchMoveWorkflow> {
+  const id = chatId || workflow.chatId;
+  const next = normalizeWorkflow({
+    ...workflow,
+    updatedAt: new Date().toISOString(),
+    ...(id ? { key: workflowKeyForChat(id), chatId: id } : {}),
+  });
+  if (id) {
+    next.key = workflowKeyForChat(id);
+    next.chatId = id;
+  }
+  const key = id ? workflowKeyForChat(id) : SEARCH_MOVE_WORKFLOW_KEY;
+  await db.collection(COLLECTION).updateOne({ key }, { $set: next }, { upsert: true });
   await syncQuestionsToMovementTypes(db, next);
+  if (id) invalidate(`searchMoveWorkflow:v10:${id}`);
+  invalidate("searchMoveWorkflow:v10:legacy");
+  invalidate("searchMoveWorkflow:v7:legacy");
+  invalidate("searchMoveWorkflow:v7");
+  invalidate("searchMoveWorkflow:v6");
   invalidate("searchMoveWorkflow:v5");
   invalidate("searchMoveWorkflow:v4");
   invalidate("searchMoveWorkflow:v3");
@@ -935,6 +1327,7 @@ export function makeStepNode(kind: FlowNodeKind): FlowNode {
     pick_category: "Pick category",
     pick_location: "Select location",
     pick_vendor: "Select vendor",
+    pick_plant: "Which plant?",
     pick_department: "Select department",
     select_movement: "Select movement",
     location: "Location",
@@ -978,6 +1371,18 @@ export function createMovementBranch(
   if (!hub) return workflow;
   if (movementBranches(workflow).some((n) => n.movementCode === input.code)) return workflow;
 
+  // Known Movement Master shapes — keep Entries/Requests branches consistent.
+  if (input.code === "new-purchase") {
+    const nodes = cloneNodes(workflow);
+    const hubNode = nodes[hub.id];
+    if (!hubNode) return workflow;
+    attachMovementBranch(nodes, hubNode, newPurchaseBranchExample());
+    const codes = new Set([...(hubNode.movementCodes ?? []), "new-purchase"]);
+    hubNode.movementCodes = [...codes];
+    nodes[hub.id] = hubNode;
+    return { ...workflow, nodes, updatedAt: new Date().toISOString() };
+  }
+
   const nodes = cloneNodes(workflow);
   const move: FlowNode = {
     id: nid("movement"),
@@ -992,15 +1397,15 @@ export function createMovementBranch(
 
   const route: FlowNodeKind[] =
     input.direction === "transfer"
-      ? ["from", "to", "qty", "review", "add_to_cart"]
+      ? ["qty", "from", "to", "review", "add_to_cart"]
       : input.direction === "in"
         ? ["location", "qty", "stock_in", "review", "add_to_cart"]
         : ["location", "qty", "stock_out", "review", "add_to_cart"];
   const steps = route.map((k) => {
     const labels: Record<string, string> = {
       location: input.direction === "out" ? "From location" : "To location",
-      from: "From location",
-      to: "To location",
+      from: "Where is the stock currently?",
+      to: "Where do you want to move it?",
       qty: "Quantity",
       stock_in: "Increase stock (+)",
       stock_out: "Decrease stock (−)",
@@ -1012,7 +1417,12 @@ export function createMovementBranch(
   for (let i = 0; i < steps.length - 1; i++) steps[i].children = [steps[i + 1].id];
   for (const s of steps) nodes[s.id] = s;
   if (steps[0]) move.children = [steps[0].id];
-  nodes[hub.id] = { ...nodes[hub.id], children: [...nodes[hub.id].children, move.id] };
+  const hubCodes = new Set([...(nodes[hub.id].movementCodes ?? []), input.code]);
+  nodes[hub.id] = {
+    ...nodes[hub.id],
+    children: [...nodes[hub.id].children, move.id],
+    movementCodes: [...hubCodes],
+  };
   return { ...workflow, nodes };
 }
 
@@ -1282,6 +1692,7 @@ export type PreviewButton = {
     | "pick_move"
     | "pick_loc"
     | "pick_vendor"
+    | "pick_plant"
     | "pick_department"
     | "qty_digit"
     | "qty_del"
@@ -1312,7 +1723,10 @@ export type PreviewSimState = {
   /** @deprecated tip of categoryPath — kept for older preview callers */
   category: string;
   location: string;
+  fromLocation: string;
+  toLocation: string;
   vendor: string;
+  plant: string;
   department: string;
   done: boolean;
 };
@@ -1320,9 +1734,10 @@ export type PreviewSimState = {
 const SAMPLE_UNIT = "Meter";
 const SAMPLE_STOCK = "📍 Main warehouse — 120\n📍 Plant shelf — 40\n📍 Store room — 25";
 const SAMPLE_WHERE = "Main warehouse";
-const SAMPLE_CATEGORIES = ["MS Pipe", "PVC Pipe", "GI Pipe", "UPVC Pipe"];
+const SAMPLE_CATEGORIES = ["Pipe", "Electrical", "Hardware"];
 /** Nested sample tree — mirrors Categories master children at every depth. */
 const SAMPLE_CHILDREN: Record<string, string[]> = {
+  Pipe: ["MS Pipe", "PVC Pipe", "GI Pipe", "UPVC Pipe"],
   "MS Pipe": ["Round", "Square"],
   Round: ["Light", "Medium", "Heavy"],
   Square: ["40mm", "50mm"],
@@ -1331,14 +1746,32 @@ const SAMPLE_CHILDREN: Record<string, string[]> = {
   Conduit: ["20mm", "25mm"],
   "GI Pipe": ["Light", "Medium", "Heavy"],
   "UPVC Pipe": ["Class B", "Class C"],
+  Electrical: ["Cable", "Switch"],
+  Hardware: ["Fastener", "Fitting"],
 };
+
+function sampleMatchCategory(product: string): string | null {
+  const q = String(product ?? "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, " ")
+    .trim();
+  if (!q) return null;
+  // Mirror master match: "pipe" / "pipes" → Pipe only.
+  for (const root of SAMPLE_CATEGORIES) {
+    const name = root.toLowerCase();
+    if (q === name || q.includes(name) || name.includes(q)) return root;
+  }
+  return null;
+}
 const SAMPLE_LOCS = ["Main warehouse", "Plant shelf", "Store room"];
 const SAMPLE_VENDORS = ["ABC Vendor", "Precision Pipes Ltd", "Metro Plumbing Supply", "SafeFit Industrial"];
+const SAMPLE_PLANTS = ["Asian Paints Plant", "Ahmedabad Plant", "Mumbai Plant"];
 const SAMPLE_DEPARTMENTS = ["Production", "Maintenance", "Electrical", "Quality", "Stores", "Packaging"];
 const SAMPLE_MOVES: Record<string, string> = {
+  "opening-stock": "Add to Stock",
   "return-from-plant": "Return from Plant",
   "issue-to-plant": "Issue to Plant",
-  "warehouse-transfer": "Warehouse to Warehouse",
+  "warehouse-transfer": "📦 Move Stock",
   "vendor-replacement": "Vendor Replacement",
   "department-return": "Department Return",
   "new-purchase": "New Purchase",
@@ -1354,7 +1787,10 @@ export function initialPreviewState(_movementCode?: string | null): PreviewSimSt
     categoryPath: [],
     category: "",
     location: "",
+    fromLocation: "",
+    toLocation: "",
     vendor: "",
+    plant: "",
     department: "",
     done: false,
   };
@@ -1384,6 +1820,7 @@ function screenVars(state: PreviewSimState, typeLabel = ""): Record<string, stri
     stock_lines: state.location ? `📍 ${state.location} — stock available` : SAMPLE_STOCK,
     children,
     vendor: state.vendor || "ABC Vendor",
+    plant: state.plant || "Asian Paints Plant",
     department: state.department || "Production",
     question: "",
   };
@@ -1441,11 +1878,15 @@ export function previewScreen(workflow: SearchMoveWorkflow, state: PreviewSimSta
   const node = workflow.nodes[nodeId];
 
   if (state.done || !node) {
+    const qty = state.qtyDraft || "12";
     return {
       id: "cart",
       title: "In cart",
-      text: `Added to cart.\n\n${state.product} × ${state.qtyDraft || "12"} ${SAMPLE_UNIT}\n${state.location || SAMPLE_WHERE}\n${typeLabel(state)}`,
-      buttons: [{ label: "Search again", action: "restart" }],
+      text: `✅ Added to Cart\n\n${state.product} — ${qty} ${SAMPLE_UNIT}\n${state.location || SAMPLE_WHERE}\n${typeLabel(state)}\n\n➕ Add Another Item`,
+      buttons: [
+        { label: "➕ Add Another Item", action: "restart" },
+        { label: "🛒 View Cart", action: "restart" },
+      ],
     };
   }
 
@@ -1454,7 +1895,22 @@ export function previewScreen(workflow: SearchMoveWorkflow, state: PreviewSimSta
     question: node.kind === "question" ? node.label : "",
   };
   let text = textFor(node, vars);
-  if (node.kind === "qty") text = textFor(node, { ...vars, qty: `<b>${state.qtyDraft || "—"}</b>` });
+  if (node.kind === "qty") {
+    const draft = state.qtyDraft || "";
+    const hasTimes = /[×xX*]/.test(draft);
+    const parts = draft.split(/\s*[×xX*]\s*/);
+    const qtyPart = (parts[0] || "").trim();
+    const entriesPart = hasTimes ? (parts[1] || "").trim() : "";
+    const unit = SAMPLE_UNIT;
+    const qtyLine = qtyPart
+      ? `Qty: ${qtyPart} ${unit}`
+      : `Qty: —`;
+    const entriesLine = hasTimes ? `\nEntries: ${entriesPart || "—"}` : "";
+    text =
+      `${state.product || "pipe"} — ${typeLabel(state) || "Add to Stock"}\n\nHow many?\n\n` +
+      `${qtyLine}${entriesLine}\n\n` +
+      `Optional: qty × entries — e.g. 200 × 5 adds five separate entries of 200.`;
+  }
 
   const buttons: PreviewButton[] = [];
 
@@ -1469,8 +1925,14 @@ export function previewScreen(workflow: SearchMoveWorkflow, state: PreviewSimSta
   }
 
   if (node.kind === "pick_category") {
-    const path = previewPath(state);
+    let path = previewPath(state);
+    // Auto-match typed product to Category Master sample (e.g. pipe → Pipe).
     if (!path.length) {
+      const matched = sampleMatchCategory(state.product || "pipe");
+      if (matched) path = [matched];
+    }
+    if (!path.length) {
+      text = `${state.product || "pipe"}\n\n<b>${SAMPLE_CATEGORIES.length} categories</b> (from Category Master)`;
       buttons.push(...SAMPLE_CATEGORIES.map((c) => ({ label: c, action: "pick_category" as const, value: c })));
     } else {
       const uniqueSubs = sampleChildrenOf(path);
@@ -1487,9 +1949,15 @@ export function previewScreen(workflow: SearchMoveWorkflow, state: PreviewSimSta
       buttons.push(...uniqueSubs.map((s) => ({ label: s, action: "pick_category" as const, value: `sub:${s}` })));
     }
   } else if (node.kind === "pick_location" || node.kind === "location" || node.kind === "from" || node.kind === "to") {
-    buttons.push(...SAMPLE_LOCS.map((l) => ({ label: `📍 ${l}`, action: "pick_loc" as const, value: l })));
+    const locs =
+      node.kind === "to" && state.fromLocation
+        ? SAMPLE_LOCS.filter((l) => l !== state.fromLocation)
+        : SAMPLE_LOCS;
+    buttons.push(...locs.map((l) => ({ label: `📍 ${l}`, action: "pick_loc" as const, value: l })));
   } else if (node.kind === "pick_vendor") {
     buttons.push(...SAMPLE_VENDORS.map((v) => ({ label: v, action: "pick_vendor" as const, value: v })));
+  } else if (node.kind === "pick_plant") {
+    buttons.push(...SAMPLE_PLANTS.map((p) => ({ label: `🏭 ${p}`, action: "pick_plant" as const, value: p })));
   } else if (node.kind === "pick_department") {
     buttons.push(
       ...SAMPLE_DEPARTMENTS.map((d) => ({ label: d, action: "pick_department" as const, value: d }))
@@ -1518,7 +1986,11 @@ export function previewScreen(workflow: SearchMoveWorkflow, state: PreviewSimSta
     for (const d of ["1", "2", "3", "4", "5", "6", "7", "8", "9", ".", "0"]) {
       buttons.push({ label: d, action: "qty_digit", value: d });
     }
-    buttons.push({ label: "⌫", action: "qty_del" }, { label: "✔ Next", action: "qty_ok" });
+    buttons.push(
+      { label: "⌫", action: "qty_del" },
+      { label: "×", action: "qty_digit", value: "×" },
+      { label: "✔ Next", action: "qty_ok" }
+    );
   } else if (node.kind === "question" && node.question?.type === "boolean") {
     buttons.push({ label: "Yes", action: "answer", value: "Yes" }, { label: "No", action: "answer", value: "No" });
   } else if (node.kind === "question" && node.question?.type === "select") {
@@ -1532,20 +2004,39 @@ export function previewScreen(workflow: SearchMoveWorkflow, state: PreviewSimSta
     buttons.push({ label: "⌫", action: "qty_del" }, { label: "✔ Next", action: "qty_ok" });
   } else if (node.kind === "question" && node.question?.type === "string") {
     if (!node.question.required) buttons.push({ label: "Skip ⤵", action: "skip" });
-  } else if (node.kind === "review") {
+  } else if (node.kind === "review" || node.kind === "add_to_cart") {
     const answerLines = Object.entries(state.answers)
       .map(([k, v]) => `· ${k}: ${v}`)
       .join("\n");
     const dept = state.department ? `\nDepartment: ${state.department}` : "";
-    const vendor = state.vendor && state.movementCode === "vendor-replacement" ? `\nVendor: ${state.vendor}` : "";
-    text = `${text}\n\n${state.product} × ${state.qtyDraft || "12"} ${SAMPLE_UNIT}\n${state.location || SAMPLE_WHERE}${dept}${vendor}${
-      answerLines ? `\n${answerLines}` : ""
-    }`;
-    buttons.push({ label: "✔ Continue", action: "confirm" });
-  } else if (node.kind === "add_to_cart") {
-    const dept = state.department ? `\nDepartment: ${state.department}` : "";
-    text = `${text}\n\n${state.product} × ${state.qtyDraft || "12"} ${SAMPLE_UNIT}\n${state.location || SAMPLE_WHERE}${dept}\n${typeLabel(state)}`;
-    buttons.push({ label: "✔ Add to cart", action: "add_cart" });
+    const vendor =
+      state.vendor && (state.movementCode === "vendor-replacement" || state.movementCode === "new-purchase")
+        ? `\nVendor: ${state.vendor}`
+        : "";
+    const plant = state.plant && state.movementCode === "return-from-plant" ? `\nFrom Plant: ${state.plant}` : "";
+    const draft = state.qtyDraft || "12";
+    const hasTimes = /[×xX*]/.test(draft);
+    const parts = draft.split(/\s*[×xX*]\s*/);
+    const qtyPart = (parts[0] || "12").trim() || "12";
+    const times = hasTimes ? Number(parts[1]) || 1 : 1;
+    const qtyBlock =
+      times > 1
+        ? `Quantity: ${qtyPart} ${SAMPLE_UNIT} × ${times} entries\nTotal: ${Number(qtyPart) * times} ${SAMPLE_UNIT}`
+        : `Quantity: ${qtyPart} ${SAMPLE_UNIT}`;
+    if (state.movementCode === "warehouse-transfer") {
+      text =
+        `📋 Review\n\nItem: ${state.product}\nAction: ${typeLabel(state) || "📦 Move Stock"}\n${qtyBlock}` +
+        `\nFrom: ${state.fromLocation || SAMPLE_WHERE}` +
+        `\nTo: ${state.toLocation || "Plant shelf"}` +
+        (answerLines ? `\n${answerLines}` : "");
+    } else {
+      const locLabel = state.movementCode === "return-from-plant" ? "Return To" : "Location";
+      text =
+        `📋 Review\n\nItem: ${state.product}\nAction: ${typeLabel(state) || "Add to Stock"}\n${qtyBlock}${plant}${vendor}\n${locLabel}: ${
+          state.location || SAMPLE_WHERE
+        }${dept}${answerLines ? `\n${answerLines}` : ""}`;
+    }
+    buttons.push({ label: "🛒 Add to Cart", action: "add_cart" });
   } else if (node.kind === "reference" || node.kind === "remarks") {
     // typed in real bot; preview advances
     buttons.push({ label: "✔ Next", action: "next" });
@@ -1594,7 +2085,11 @@ export function applyPreviewAction(
   }
 
   if (action === "pick_category") {
-    const path = previewPath(state);
+    let path = previewPath(state);
+    if (!path.length) {
+      const matched = sampleMatchCategory(state.product || "pipe");
+      if (matched) path = [matched];
+    }
     if (value?.startsWith("sub:")) {
       const name = value.slice(4);
       const nextPath = [...path, name];
@@ -1614,7 +2109,7 @@ export function applyPreviewAction(
       ...state,
       categoryPath: nextPath,
       category: nextPath[0] || "",
-      product: "pipe",
+      product: state.product || "pipe",
     };
   }
   if (action === "pick_product") {
@@ -1622,10 +2117,24 @@ export function applyPreviewAction(
     return advance(workflow, { ...state, product: value || state.product });
   }
   if (action === "pick_loc") {
+    const nodeId = state.nodeId ?? workflow.rootId;
+    const node = workflow.nodes[nodeId];
+    if (node?.kind === "from") {
+      return advance(workflow, { ...state, fromLocation: value || state.fromLocation, location: value || state.location });
+    }
+    if (node?.kind === "to") {
+      if (value && state.fromLocation && value === state.fromLocation) {
+        return state; // same location not allowed
+      }
+      return advance(workflow, { ...state, toLocation: value || state.toLocation, location: value || state.location });
+    }
     return advance(workflow, { ...state, location: value || state.location });
   }
   if (action === "pick_vendor") {
     return advance(workflow, { ...state, vendor: value || state.vendor });
+  }
+  if (action === "pick_plant") {
+    return advance(workflow, { ...state, plant: value || state.plant });
   }
   if (action === "pick_department") {
     return advance(workflow, { ...state, department: value || state.department });
@@ -1642,9 +2151,13 @@ export function applyPreviewAction(
     };
   }
   if (action === "qty_digit") {
-    return { ...state, qtyDraft: (state.qtyDraft + (value ?? "")).slice(0, 12) };
+    const next = pressQuantityKey(state.qtyDraft, value ?? "");
+    return { ...state, qtyDraft: next.value };
   }
-  if (action === "qty_del") return { ...state, qtyDraft: state.qtyDraft.slice(0, -1) };
+  if (action === "qty_del") {
+    const next = pressQuantityKey(state.qtyDraft, "del");
+    return { ...state, qtyDraft: next.value };
+  }
   if (action === "qty_ok") {
     if (node?.kind === "question" && node.question?.type === "number") {
       return advance(workflow, {
@@ -1662,7 +2175,15 @@ export function applyPreviewAction(
   }
   if (action === "confirm" || action === "next") {
     if (node?.kind === "search") {
-      return advance(workflow, { ...state, product: value?.trim() || "pipe", nodeId: workflow.rootId });
+      const product = value?.trim() || "pipe";
+      const matched = sampleMatchCategory(product);
+      return advance(workflow, {
+        ...state,
+        product,
+        categoryPath: matched ? [matched] : [],
+        category: matched || "",
+        nodeId: workflow.rootId,
+      });
     }
     return advance(workflow, state);
   }
@@ -1692,6 +2213,7 @@ export function previewFrames(
       (b) =>
         b.action === "pick_loc" ||
         b.action === "pick_vendor" ||
+        b.action === "pick_plant" ||
         b.action === "pick_department" ||
         b.action === "pick_move" ||
         b.action === "qty_ok" ||

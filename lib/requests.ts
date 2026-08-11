@@ -274,6 +274,8 @@ export async function acceptInventoryRequest(
   const movements: StockMovement[] = [];
   const lines: RequestLine[] = [];
   for (const line of claimed.lines) {
+    const isTransfer =
+      line.movementDirection === "transfer" || line.movementCode === "warehouse-transfer";
     const inbound =
       line.stockEffect === "stock_in"
         ? true
@@ -287,6 +289,82 @@ export async function acceptInventoryRequest(
 
     if (inbound && expectedOnly) {
       lines.push({ ...line, outcome: "recorded" });
+      continue;
+    }
+
+    if (isTransfer) {
+      const fromId = line.fromLocationId || line.locationId;
+      const toId = line.toLocationId;
+      const fromPath = line.fromLocationPath || line.locationPath;
+      const toPath = line.toLocationPath || "";
+      if (!fromId || !toId || fromId === toId) {
+        lines.push({ ...line, outcome: "unavailable" });
+        continue;
+      }
+      const available = await onHandLive(db, line.productId, fromId);
+      if (available < line.qty) {
+        lines.push({ ...line, outcome: "unavailable" });
+        await persistOutboundShortage(
+          db,
+          claimed,
+          {
+            available,
+            productId: line.productId,
+            productName: line.productName,
+            productNumber: line.productNumber,
+            locationId: fromId,
+            locationPath: fromPath,
+            unit: line.unit,
+            qtyRequested: line.qty,
+          },
+          "accept",
+          { code: line.movementCode, name: line.movementName }
+        );
+        continue;
+      }
+      lines.push({ ...line, outcome: "issued" });
+      const reason = (line.movementCode as StockMovement["reason"] | undefined) || "warehouse-transfer";
+      const baseKey = issueKey(String(claimed.ticketNumber), line.lineId);
+      movements.push(
+        {
+          movementKey: `${baseKey}:out`,
+          productId: line.productId,
+          productName: line.productName,
+          productNumber: line.productNumber,
+          locationId: fromId,
+          locationPath: fromPath,
+          counterpartLocationPath: toPath || undefined,
+          qty: -line.qty,
+          unit: line.unit,
+          reason,
+          movementName: line.movementName,
+          reference: line.reference,
+          refType: "request",
+          refId: String(claimed.ticketNumber),
+          requestId: String(claimed._id),
+          by,
+          createdAt: at,
+        },
+        {
+          movementKey: `${baseKey}:in`,
+          productId: line.productId,
+          productName: line.productName,
+          productNumber: line.productNumber,
+          locationId: toId,
+          locationPath: toPath || "(unknown location)",
+          counterpartLocationPath: fromPath || undefined,
+          qty: line.qty,
+          unit: line.unit,
+          reason,
+          movementName: line.movementName,
+          reference: line.reference,
+          refType: "request",
+          refId: String(claimed.ticketNumber),
+          requestId: String(claimed._id),
+          by,
+          createdAt: at,
+        }
+      );
       continue;
     }
 
