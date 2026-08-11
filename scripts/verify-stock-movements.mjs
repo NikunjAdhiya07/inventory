@@ -81,7 +81,7 @@ async function main() {
   // ---- the story's test-case table -----------------------------------------
   let expectedA = 0;
   const stockIn = [
-    ["opening-stock", "Record Opening Stock", 100, {}],
+    ["opening-stock", "Record Add to Stock", 100, {}],
     ["new-purchase", "Record New Purchase", 50, { reference: "PO-1099" }],
     ["return-from-plant", "Record Return from Plant", 10, {}],
     ["department-return", "Record Department Return", 7, {}],
@@ -169,7 +169,7 @@ async function main() {
   const confirmed = await record("opening-stock", 9, { locationId: B.id });
   check(
     "AC-09 · confirmation names the movement and the resulting balance",
-    confirmed.status === 201 && confirmed.body.movement === "Opening Stock" && confirmed.body.balances?.[0]?.qty === (await onHand(productId, B.id)),
+    confirmed.status === 201 && confirmed.body.movement === "Add to Stock" && confirmed.body.balances?.[0]?.qty === (await onHand(productId, B.id)),
     JSON.stringify(confirmed.body.balances)
   );
 

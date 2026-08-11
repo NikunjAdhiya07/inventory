@@ -44,13 +44,30 @@ const stepLibrary = [
     status: "Active",
   },
   {
+    type: "stock_type",
+    name: "Stock Type",
+    desc: "Ask whether this is Add Stock or Opening Stock.",
+    icon: "⇄",
+    category: "select",
+    configSchema: [
+      {
+        key: "options",
+        label: "Choices (comma-separated labels)",
+        type: "text",
+        default: "Add Stock, Opening Stock",
+      },
+    ],
+    order: 3,
+    status: "Active",
+  },
+  {
     type: "category_select",
     name: "Category Select",
     desc: "Pick a top-level category from an inline keyboard.",
     icon: "▦",
     category: "select",
     configSchema: [{ key: "dataSource", label: "Category source", type: "dataSource", default: "categories", appliesToDataSource: "categories" }],
-    order: 3,
+    order: 4,
     status: "Active",
   },
   {
@@ -60,7 +77,7 @@ const stepLibrary = [
     icon: "▩",
     category: "select",
     configSchema: [{ key: "filterByCategory", label: "Filter by chosen category", type: "toggle", default: true }],
-    order: 4,
+    order: 5,
     status: "Active",
   },
   {
@@ -94,10 +111,20 @@ const stepLibrary = [
   {
     type: "location_tree",
     name: "Storage Location",
-    desc: "Drill down a Warehouse → Floor → Rack tree to a storage location.",
+    desc: "Drill Location → Rack → Shelf (or flat one-tap list of shelves).",
     icon: "▧",
     category: "select",
-    configSchema: [{ key: "dataSource", label: "Location source", type: "dataSource", default: "locations", appliesToDataSource: "locations" }],
+    configSchema: [
+      { key: "dataSource", label: "Location source", type: "dataSource", default: "locations", appliesToDataSource: "locations" },
+      { key: "flatSelect", label: "Flat list (no drill-down)", type: "toggle", default: false },
+      {
+        key: "allowSelectBranch",
+        label: "Allow selecting Area/Rack before Shelf",
+        type: "toggle",
+        default: false,
+      },
+      { key: "defaultLocation", label: "Open inside location (drill mode)", type: "text", default: "" },
+    ],
     order: 7,
     status: "Active",
   },
@@ -111,7 +138,21 @@ const stepLibrary = [
       { key: "numberMin", label: "Minimum", type: "number", default: 1 },
       { key: "numberMax", label: "Maximum (0 = no limit)", type: "number", default: 0 },
     ],
-    order: 8,
+    order: 9,
+    status: "Active",
+  },
+  {
+    type: "pack_quantity",
+    name: "Pack Quantity",
+    desc: "Number of units × packing unit × optional size/capacity per unit (e.g. 6 Bottle × 500 ml).",
+    icon: "📦",
+    category: "capture",
+    configSchema: [
+      { key: "numberMin", label: "Minimum units", type: "number", default: 1 },
+      { key: "numberMax", label: "Maximum units (0 = no limit)", type: "number", default: 0 },
+      { key: "dataSource", label: "Unit source", type: "dataSource", default: "units", appliesToDataSource: "units" },
+    ],
+    order: 10,
     status: "Active",
   },
   {
@@ -121,7 +162,7 @@ const stepLibrary = [
     icon: "⚖",
     category: "select",
     configSchema: [{ key: "dataSource", label: "Unit source", type: "dataSource", default: "units", appliesToDataSource: "units" }],
-    order: 9,
+    order: 11,
     status: "Active",
   },
   {
@@ -162,8 +203,8 @@ const stepLibrary = [
   },
   {
     type: "review_confirm",
-    name: "Review & Confirm",
-    desc: "Shows a summary and asks the user to confirm or cancel.",
+    name: "Review & Add to Cart",
+    desc: "Shows a summary; the user taps Add to Cart to save (no extra confirmation).",
     icon: "☑",
     category: "control",
     configSchema: [],
@@ -177,21 +218,35 @@ function step(type, label, config = {}, required = true, order = 0) {
   return { instanceId: randomUUID(), type, label, required, order, config };
 }
 
-// The default workflow: item → category tree (matched from the name) → location → qty → unit → review.
+// The default workflow: photo/name → stock type → category → subcategory →
+// Location→Rack→Shelf → pack quantity → review.
 function defaultSteps() {
   return [
-    step("item_capture", "Send the item name and/or a photo of the product.", { requireImage: false }, true, 1),
+    step("item_capture", "Send a photo or type the product name", { requireImage: false }, true, 1),
     step(
-      "category_tree",
-      "Choose the category:",
-      { dataSource: "categories", matchItem: true, whenUnmatched: "ask" },
+      "stock_type",
+      "What kind of stock entry is this?",
+      { options: ["Add Stock", "Opening Stock"], optionValues: ["add-stock", "opening-stock"] },
       true,
       2
     ),
-    step("location_tree", "Choose the storage location:", { dataSource: "locations" }, true, 3),
-    step("quantity", "Enter the quantity:", { numberMin: 1, numberMax: 0 }, true, 4),
-    step("unit_select", "Select a unit:", { dataSource: "units" }, true, 5),
-    step("review_confirm", "Please review your entry:", {}, true, 6),
+    step("category_select", "Select the category:", { dataSource: "categories" }, true, 3),
+    step(
+      "subcategory_select",
+      "Select the subcategory:",
+      { dataSource: "categories", filterByCategory: true },
+      true,
+      4
+    ),
+    step(
+      "location_tree",
+      "📍 Choose Location → Rack → Shelf:",
+      { dataSource: "locations", flatSelect: false, allowSelectBranch: false },
+      true,
+      5
+    ),
+    step("pack_quantity", "How is this packed?", { numberMin: 1, numberMax: 0, dataSource: "units" }, true, 6),
+    step("review_confirm", "📋 Review", {}, true, 7),
   ];
 }
 
@@ -225,59 +280,10 @@ async function syncStepLibrary(db) {
   console.log(`stepLibrary: ${stepLibrary.length} step types synced (${added} new)`);
 }
 
-// Replace legacy category_select + subcategory_select with category_tree so
-// existing installs get the Pipe → Material → Type → … drill-down without a
-// manual rebuild. Only rewrites workflows that still use that exact pair and
-// do not already include category_tree.
+// Older installs may still use category_select + subcategory_select; leave them
+// alone — the stock-entry redesign prefers that pair over category_tree.
 async function migrateCategoryTreeSteps(db) {
-  const workflows = await db.collection("workflows").find({}).toArray();
-  let updated = 0;
-  for (const wf of workflows) {
-    const steps = Array.isArray(wf.steps) ? [...wf.steps] : [];
-    if (steps.some((s) => s.type === "category_tree")) continue;
-    const catIdx = steps.findIndex((s) => s.type === "category_select");
-    const subIdx = steps.findIndex((s) => s.type === "subcategory_select");
-    if (catIdx < 0) continue;
-
-    const treeStep = step(
-      "category_tree",
-      "Choose the category:",
-      { dataSource: "categories", matchItem: true, whenUnmatched: "ask" },
-      true,
-      steps[catIdx].order ?? catIdx + 1
-    );
-    const remove = new Set([catIdx, subIdx].filter((i) => i >= 0));
-    const next = steps.filter((_, i) => !remove.has(i));
-    next.splice(Math.min(catIdx, next.length), 0, treeStep);
-    next.forEach((s, i) => {
-      s.order = i + 1;
-    });
-
-    const now = new Date().toISOString();
-    const version = Number(wf.version || 1) + 1;
-    await db.collection("workflows").updateOne(
-      { _id: wf._id },
-      {
-        $set: {
-          steps: next,
-          version,
-          updatedAt: now,
-          desc: wf.desc || "Guided flow with category tree drill-down from the item name.",
-        },
-      }
-    );
-    await db.collection("workflowVersions").insertOne({
-      workflowId: wf._id.toString(),
-      version,
-      name: wf.name,
-      steps: next,
-      createdAt: now,
-      createdBy: "seed:category_tree",
-    });
-    updated++;
-    console.log(`migrated workflow "${wf.name}" → category_tree (v${version})`);
-  }
-  if (!updated) console.log("skip category_tree migration (nothing to rewrite)");
+  console.log("skip category_tree migration (stock-entry uses category + subcategory)");
 }
 
 async function main() {
@@ -295,8 +301,8 @@ async function main() {
     const now = new Date().toISOString();
     const steps = defaultSteps();
     const wf = await db.collection("workflows").insertOne({
-      name: "Standard Inventory Entry",
-      desc: "The default guided flow: item → category tree → location → quantity → unit → review.",
+      name: "Data Entry — Add to Stock",
+      desc: "Entries-mode stock-in: type product → category if needed → Location → Rack → Shelf → quantity → unit → Review → Add to Cart.",
       status: "Active",
       version: 1,
       isDefault: true,
@@ -308,7 +314,7 @@ async function main() {
     await db.collection("workflowVersions").insertOne({
       workflowId,
       version: 1,
-      name: "Standard Inventory Entry",
+      name: "Data Entry — Add to Stock",
       steps,
       createdAt: now,
       createdBy: "seed",

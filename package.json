@@ -14,6 +14,7 @@
     "seed:option-trees": "node scripts/seed-option-trees.mjs",
     "seed:movement-types": "node scripts/seed-movement-types.mjs",
     "seed:vendors": "node scripts/seed-vendors.mjs",
+    "seed:plants": "node scripts/seed-plants.mjs",
     "seed:departments": "node scripts/seed-departments.mjs",
     "ensure-indexes": "node scripts/ensure-indexes.mjs",
     "backfill:stock": "node scripts/backfill-stock.mjs",

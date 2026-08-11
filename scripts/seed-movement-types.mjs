@@ -29,13 +29,21 @@ const dbName = process.env.MONGODB_DB || "inventory";
 // take out more than is on hand.
 const movementTypes = [
   // ---- Stock In ----------------------------------------------------------
-  { code: "opening-stock", name: "Opening Stock", direction: "in", desc: "One-time go-live: what was already on the shelf. Day-to-day stock-in is the Entries bot (receipt).", requireReference: false, requireRemarks: false, order: 10 },
+  {
+    code: "opening-stock",
+    name: "Add to Stock",
+    direction: "in",
+    desc: "Stock received into a storage location (go-live counts and day-to-day adds). Same movement — formerly labeled Opening Stock.",
+    requireReference: false,
+    requireRemarks: false,
+    order: 10,
+  },
   {
     code: "new-purchase",
     name: "New Purchase",
     direction: "in",
-    desc: "Purchase from a Vendor Master vendor into a storage location. Inventory increases on ticket Accept only when status is Received (Expected / Ordered does not move stock).",
-    requireReference: true,
+    desc: "Purchase from a Vendor Master vendor into a storage location. Simple flow: qty → vendor → location → cart. Inventory increases on ticket Accept.",
+    requireReference: false,
     requireRemarks: false,
     order: 11,
   },
@@ -66,7 +74,15 @@ const movementTypes = [
   { code: "other-stock-out", name: "Other Stock Out", direction: "out", desc: "Anything outward the other types do not cover.", requireReference: false, requireRemarks: true, order: 37 },
 
   // ---- Stock Transfer ----------------------------------------------------
-  { code: "warehouse-transfer", name: "Warehouse to Warehouse", direction: "transfer", desc: "Between two sites both held in this system.", requireReference: false, requireRemarks: false, order: 50 },
+  {
+    code: "warehouse-transfer",
+    name: "Move Stock",
+    direction: "transfer",
+    desc: "Move stock from one storage location to another (same system). Formerly labeled Warehouse to Warehouse.",
+    requireReference: false,
+    requireRemarks: false,
+    order: 50,
+  },
   { code: "bin-transfer", name: "Location/Bin Transfer", direction: "transfer", desc: "Between two bins, shelves or racks.", requireReference: false, requireRemarks: false, order: 51 },
 
   // ---- System types (written by the software, never offered on the form) --
@@ -175,6 +191,52 @@ async function main() {
       }
     );
     console.log("movementTypes: new-purchase forced direction=in + desc");
+  }
+
+  // Opening Stock and Add to Stock are the same type — force the display name.
+  const addStock = movementTypes.find((t) => t.code === "opening-stock");
+  if (addStock) {
+    const now = new Date().toISOString();
+    const { isSystem: _s, ...doc } = full(addStock);
+    await db.collection("movementTypes").updateOne(
+      { code: "opening-stock" },
+      {
+        $set: {
+          name: doc.name,
+          direction: doc.direction,
+          desc: doc.desc,
+          requireReference: doc.requireReference,
+          requireRemarks: doc.requireRemarks,
+          order: doc.order,
+          status: "Active",
+          updatedAt: now,
+        },
+      }
+    );
+    console.log('movementTypes: opening-stock renamed to "Add to Stock"');
+  }
+
+  // Warehouse to Warehouse → Move Stock (same type code warehouse-transfer).
+  const moveStock = movementTypes.find((t) => t.code === "warehouse-transfer");
+  if (moveStock) {
+    const now = new Date().toISOString();
+    const { isSystem: _s, ...doc } = full(moveStock);
+    await db.collection("movementTypes").updateOne(
+      { code: "warehouse-transfer" },
+      {
+        $set: {
+          name: doc.name,
+          direction: doc.direction,
+          desc: doc.desc,
+          requireReference: doc.requireReference,
+          requireRemarks: doc.requireRemarks,
+          order: doc.order,
+          status: "Active",
+          updatedAt: now,
+        },
+      }
+    );
+    console.log('movementTypes: warehouse-transfer renamed to "Move Stock"');
   }
 
   const total = await db.collection("movementTypes").countDocuments();

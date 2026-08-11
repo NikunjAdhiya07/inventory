@@ -34,6 +34,12 @@ export type ProductAttributeDef = {
 // same string.
 export type ProductAttribute = { name: string; value: string };
 
+// One answered identity level of a nested drill-down, in the order it was asked.
+// "Type of Wire: Copper", then "Subcategory: Flexible (FR)", then "Size: 2.5 sq
+// mm" — the labels come from the tree's levels, so they stay meaningful next to
+// a value that would be ambiguous alone.
+export type VariantPathSegment = { label: string; value: string };
+
 export type Product = {
   id: string;
   name: string;
@@ -44,6 +50,18 @@ export type Product = {
   desc: string;
   attributes: ProductAttribute[];
   status: "Active" | "Inactive";
+  // Set only on a product that a nested drill-down resolved to. A product typed
+  // straight into the console carries none of these and is unaffected by any of
+  // it — variants are an additional way to arrive at a product row, not a
+  // different kind of row. See `lib/variants.ts`.
+  //
+  // `pathKey` is the normalised join of `treePath`'s values and is what the
+  // unique index is built on, exactly as `productNumberKey` is for the visible
+  // number: it must never be set independently of the path it summarises.
+  treeId?: string;
+  treeName?: string;
+  treePath?: VariantPathSegment[];
+  pathKey?: string;
   createdAt: string;
   updatedAt: string;
 };
@@ -113,7 +131,13 @@ export function productLabel(p: Record<string, unknown>): string {
 // search: name, number and every attribute value are all searchable, because
 // "12mm" is how a user thinks of the product they want.
 export function productMatches(
-  p: { name?: unknown; productNumber?: unknown; category?: unknown; attributes?: ProductAttribute[] },
+  p: {
+    name?: unknown;
+    productNumber?: unknown;
+    category?: unknown;
+    attributes?: ProductAttribute[];
+    treePath?: VariantPathSegment[];
+  },
   query: string
 ): boolean {
   const q = query.trim().toLowerCase();
@@ -123,6 +147,9 @@ export function productMatches(
     trimmed(p.productNumber),
     trimmed(p.category),
     ...(Array.isArray(p.attributes) ? p.attributes.map((a) => `${a.name} ${a.value}`) : []),
+    // A variant is most naturally searched by the answers that define it —
+    // "copper 2.5" has to find the wire it names.
+    ...(Array.isArray(p.treePath) ? p.treePath.map((s) => `${s.label} ${s.value}`) : []),
   ]
     .join(" ")
     .toLowerCase();

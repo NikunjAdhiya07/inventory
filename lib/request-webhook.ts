@@ -64,6 +64,8 @@ export type RequestContext = {
   handle: string;
   dbUserId: string;
   perms: string[];
+  /** Entries-mode groups use the same flowchart engine; Add Inventory may search. */
+  entryMode?: boolean;
   message?: { text?: string };
   callback?: { id: string; data: string; messageId?: number };
 };
@@ -126,10 +128,12 @@ async function handleMessage(db: Db, ctx: RequestContext): Promise<void> {
     return;
   }
 
-  if (!ctx.perms.includes(PERM_REQUEST)) {
+  if (!ctx.perms.includes(PERM_REQUEST) && !(ctx.entryMode && ctx.perms.includes(PERM_ADD))) {
     await sendMessage(
       ctx.chatId,
-      `⛔ Your role can't raise requests. Ask an admin to grant it the "${PERM_REQUEST}" permission.`
+      ctx.entryMode
+        ? `⛔ Your role can't add inventory. Ask an admin to grant it the "${PERM_ADD}" permission.`
+        : `⛔ Your role can't raise requests. Ask an admin to grant it the "${PERM_REQUEST}" permission.`
     );
     return;
   }

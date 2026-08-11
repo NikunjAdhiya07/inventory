@@ -374,11 +374,12 @@ export async function fixProductName(raw: string): Promise<string | null> {
   }
 }
 
-export type CategorySuggestion = { category: string; subcategory: string };
+export type CategorySuggestion = { category: string; subcategory: string; path: string[] };
 
 /**
- * Pick the best existing category / subcategory for a product name.
+ * Pick the best existing category path for a product name (Nemotron).
  * `categoryPaths` are display trails like "Electronics" or "Electronics › Cables".
+ * Returns the full path segments from Category Master when a list entry matches.
  */
 export async function suggestCategoryForProduct(
   productName: string,
@@ -387,12 +388,32 @@ export async function suggestCategoryForProduct(
   const name = productName.trim();
   if (!name || !categoryPaths.length) return null;
 
+  const toSuggestion = (hit: string): CategorySuggestion | null => {
+    const parts = hit.split(/\s*›\s*/).map((s) => s.trim()).filter(Boolean);
+    if (!parts.length) return null;
+    return {
+      category: parts[0],
+      subcategory: parts.length > 1 ? parts[parts.length - 1] : "",
+      path: parts,
+    };
+  };
+
   if (MOCK) {
-    const first = categoryPaths[0] || "";
-    const parts = first.split(/\s*›\s*/).map((s) => s.trim()).filter(Boolean);
-    return parts.length
-      ? { category: parts[0], subcategory: parts[1] || "" }
-      : null;
+    // Prefer a path whose leaf/name appears in the typed product (e.g. pipe → Pipe).
+    const norm = (s: string) => s.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+    const q = norm(name);
+    const scored = categoryPaths
+      .map((p) => {
+        const leaf = norm(p.split(/\s*›\s*/).pop() || p);
+        const whole = norm(p);
+        let score = 0;
+        if (leaf === q || whole === q) score = 100;
+        else if (q.includes(leaf) || leaf.includes(q)) score = 70 + leaf.length;
+        return { p, score };
+      })
+      .filter((x) => x.score > 0)
+      .sort((a, b) => b.score - a.score);
+    return toSuggestion(scored[0]?.p || categoryPaths[0] || "");
   }
   if (!API_KEY) return null;
 
@@ -405,7 +426,7 @@ export async function suggestCategoryForProduct(
           role: "user",
           content:
             `Product name: "${name}"\n` +
-            `Choose the single best category path from this list (exact spelling):\n${sample}\n\n` +
+            `Choose the single best category path from this Category Master list (exact spelling):\n${sample}\n\n` +
             `Reply ONLY JSON: {"path":"<exact path from list>"}\n` +
             `If none fit, reply {"path":""}.`,
         },
@@ -432,12 +453,7 @@ export async function suggestCategoryForProduct(
       categoryPaths.find((p) => norm(p) === norm(path)) ||
       categoryPaths.find((p) => norm(p).includes(norm(path)) || norm(path).includes(norm(p)));
     if (!hit) return null;
-    const parts = hit.split(/\s*›\s*/).map((s) => s.trim()).filter(Boolean);
-    if (!parts.length) return null;
-    return {
-      category: parts[0],
-      subcategory: parts.length > 1 ? parts[parts.length - 1] : "",
-    };
+    return toSuggestion(hit);
   } catch (err) {
     console.error("[ai] suggestCategoryForProduct failed:", err);
     return null;

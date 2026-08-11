@@ -1,4 +1,5 @@
 import type { Db, Document } from "mongodb";
+import { aiConfigured, suggestCategoryForProduct } from "./ai";
 import { cached } from "./cache";
 
 // Shared reads over the category tree — same adjacency-list pattern as locations.
@@ -190,4 +191,65 @@ export function categoryAncestorChain(byId: Map<string, Document>, id: string): 
     node = node.parent ? byId.get(String(node.parent)) : undefined;
   }
   return chain;
+}
+
+/** Every Active category as a display trail ("Pipe" / "Pipe › PVC Pipe"). */
+export async function categoryMasterPaths(db: Db): Promise<string[]> {
+  const all = await activeCategories(db);
+  const byId = new Map(all.map((c) => [c._id.toString(), c]));
+  return [
+    ...new Set(
+      all
+        .map((c) => categoryPathFrom(byId, c._id.toString()).trim())
+        .filter(Boolean)
+    ),
+  ].sort((a, b) => a.localeCompare(b));
+}
+
+/** Root category names from Category Master (picker when nothing matches the query). */
+export async function rootCategoryNames(db: Db): Promise<string[]> {
+  const roots = await activeRootCategories(db);
+  return roots.map((c) => String(c.name ?? "").trim()).filter(Boolean);
+}
+
+export type ResolvedCategoryPath = {
+  /** Root → matched node names from Category Master. */
+  path: string[];
+  source: "match" | "ai" | "none";
+};
+
+/**
+ * Resolve a typed product/query (e.g. "pipe") to a Category Master path.
+ * 1) Deterministic name match on the tree
+ * 2) Nemotron pick from master paths when available
+ * Empty path means no confident match — caller may show master roots.
+ */
+export async function resolveCategoryPathForItem(
+  db: Db,
+  itemName: string
+): Promise<ResolvedCategoryPath> {
+  const query = String(itemName ?? "").trim();
+  if (!query) return { path: [], source: "none" };
+
+  const all = await activeCategories(db);
+  if (!all.length) return { path: [], source: "none" };
+
+  const byId = new Map(all.map((c) => [c._id.toString(), c]));
+  const matched = matchCategory(all, query);
+  if (matched) {
+    const chain = categoryAncestorChain(byId, matched._id.toString());
+    const path = chain.map((c) => String(c.name ?? "").trim()).filter(Boolean);
+    if (path.length) return { path, source: "match" };
+  }
+
+  if (!aiConfigured()) return { path: [], source: "none" };
+
+  const masterPaths = await categoryMasterPaths(db);
+  if (!masterPaths.length) return { path: [], source: "none" };
+
+  const suggestion = await suggestCategoryForProduct(query, masterPaths);
+  if (suggestion?.path?.length) {
+    return { path: suggestion.path, source: "ai" };
+  }
+  return { path: [], source: "none" };
 }

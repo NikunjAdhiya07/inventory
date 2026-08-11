@@ -161,7 +161,7 @@ export default function DashboardPage() {
       <div style={{ display: "grid", gridTemplateColumns: "repeat(4,1fr)", gap: 16, marginBottom: 18 }}>
         {tiles.map((t) => (
           <Link
-            key={t.href}
+            key={t.label}
             href={t.href}
             style={{
               background: "#fff",

@@ -34,6 +34,7 @@ const GROUPS: NavGroup[] = [
       { key: "locations", label: "Storage Locations", href: "/locations", icon: "▧" },
       { key: "storage-map", label: "Storage Map", href: "/storage-map", icon: "▥" },
       { key: "vendors", label: "Vendors", href: "/vendors", icon: "◈" },
+      { key: "plants", label: "Plants", href: "/plants", icon: "🏭" },
       { key: "departments", label: "Departments", href: "/departments", icon: "⌂" },
       { key: "units", label: "Units", href: "/units", icon: "⚖" },
     ],
