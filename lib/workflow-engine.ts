@@ -1176,13 +1176,13 @@ const DEFAULT_STOCK_TYPES = [
 const CAPACITY_UNITS = ["ml", "Liter", "Gram", "Kilogram", "Pieces", "Meter"];
 
 function stockTypeChoices(step: StepInstance): { label: string; value: string }[] {
-  const raw = step.config?.options;
+  const raw = step.config?.options as string[] | string | undefined;
   let labels: string[] = [];
   if (Array.isArray(raw)) {
     labels = raw.map(String).map((s) => s.trim()).filter(Boolean);
   } else if (typeof raw === "string" && raw.trim()) {
     // Builder text field may store "Add Stock, Opening Stock" as one string.
-    labels = raw.split(",").map((s) => s.trim()).filter(Boolean);
+    labels = raw.split(",").map((s: string) => s.trim()).filter(Boolean);
   }
   const valuesRaw = step.config?.optionValues;
   const values = Array.isArray(valuesRaw) ? valuesRaw.map(String) : [];
@@ -1506,6 +1506,8 @@ export async function renderCurrentStep(db: Db, session: BotSession): Promise<Re
       }
       return { text: label, keyboard: navRow(session) };
     }
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Input handling
