@@ -238,6 +238,20 @@ export async function onHandLive(db: Db, productId: string, locationId: string):
   return rows[0]?.qty ?? 0;
 }
 
+// Uncached on-hand for a product across every location holding it. Same reason
+// as `onHandLive`: it is quoted back to somebody who just changed it, so it must
+// not be answered from a balance taken before their write.
+export async function onHandTotalLive(db: Db, productId: string): Promise<number> {
+  const rows = await db
+    .collection("stockMovements")
+    .aggregate<{ qty: number }>([
+      { $match: { productId } },
+      { $group: { _id: null, qty: { $sum: "$qty" } } },
+    ])
+    .toArray();
+  return rows[0]?.qty ?? 0;
+}
+
 function productAttributes(p: Document): ProductAttribute[] {
   if (!Array.isArray(p.attributes)) return [];
   return p.attributes

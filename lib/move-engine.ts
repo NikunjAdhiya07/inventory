@@ -27,6 +27,12 @@ import type { ItemRequest } from "./request-types";
 import { activeVendors } from "./vendors";
 import { activeDepartments } from "./departments";
 import { activePlants } from "./plants";
+import {
+  activeMaintenanceUsers,
+  activeWorkers,
+  BORROW_MOVEMENT_CODE,
+  ensureBorrowMovementType,
+} from "./borrowing";
 import { groupConfig } from "./telegram-health";
 import { findOutboundShortage, isInboundMovement, persistOutboundShortage } from "./outbound-stock";
 import { note } from "./requests";
@@ -74,6 +80,12 @@ export function clearMoveUi(ui: ItemRequest["ui"]): void {
   ui.movePlantQuery = "";
   ui.moveDepartmentId = null;
   ui.moveDepartmentName = null;
+  ui.moveMaintenanceUserId = null;
+  ui.moveMaintenanceUserName = null;
+  ui.moveBorrowerId = null;
+  ui.moveBorrowerName = null;
+  ui.moveBorrowerSelf = null;
+  ui.borrowChoiceStage = null;
   ui.moveQtyDraft = "";
   ui.moveReference = "";
   ui.moveRemarks = "";
@@ -91,6 +103,13 @@ export async function focusedProduct(db: Db, request: ItemRequest): Promise<Stoc
 }
 
 async function loadWorkflow(db: Db, chatId?: string): Promise<SearchMoveWorkflow> {
+  // Borrow is offered from the same keyboard as every other movement, and that
+  // keyboard is built by filtering the tree's branches against Movement Master
+  // — so a missing Borrow row there means the branch exists but the button
+  // never appears. Ensured here rather than in the workflow module, which is
+  // also bundled into the client-side builder. Cached, so it is one round trip
+  // per process, not one per tap.
+  await ensureBorrowMovementType(db).catch(() => {});
   if (!chatId) return getSearchMoveWorkflow(db);
   try {
     const { mode } = await groupConfig(db, chatId);
@@ -151,6 +170,8 @@ async function promptVars(db: Db, request: ItemRequest, hit: StockHit | null, ty
     vendor: request.ui.moveVendorName || "",
     plant: request.ui.movePlantName || "",
     department: request.ui.moveDepartmentName || "",
+    maintenance_user: request.ui.moveMaintenanceUserName || "",
+    borrower: request.ui.moveBorrowerName || "",
     question: "",
   };
 }
@@ -361,6 +382,10 @@ export async function renderMoveFlow(db: Db, request: ItemRequest): Promise<Move
       return renderPlantPick(db, request, node, vars);
     case "pick_department":
       return renderDepartmentPick(db, request, node, vars);
+    case "pick_maintenance_user":
+      return renderMaintenanceUserPick(db, request, node, vars);
+    case "pick_borrower":
+      return renderBorrowerPick(db, request, node, vars);
     case "select_movement":
     case "record_hub":
       return renderSelectMovement(db, request, node, vars);
@@ -593,10 +618,17 @@ async function renderProductResults(
     };
   }
 
-  // Single clear match — show Product Master category and confirm.
+  // Single clear match — the product's details, including where it actually is.
+  //
+  // The location is named HERE and only here when one shelf holds it: the
+  // picker that would normally come next resolves itself in that case (see
+  // `autoSelectsSingleLocation`), so the caller reads the location once. When
+  // several shelves hold it there is no single "exact location" to state, so
+  // this screen counts them and the picker names them — again, once.
   if (hits.length === 1) {
     const hit = hits[0];
     const cat = [hit.category, hit.subcategory].filter(Boolean).join(" → ");
+    const only = hit.lines.length === 1 ? hit.lines[0] : null;
     return {
       text: [
         `<b>Product found</b>`,
@@ -604,7 +636,14 @@ async function renderProductResults(
         `<b>${esc(hit.name)}</b>${hit.unit ? ` — ${esc(hit.unit)}` : ""}`,
         cat ? `\nCategory:\n${esc(cat)}` : "",
         "",
-        "<i>Category comes from Product Master — no need to pick it again.</i>",
+        `On hand: <b>${money(hit.total)}</b>${hit.unit ? ` ${esc(hit.unit)}` : ""}`,
+        only
+          ? `📍 Location: <b>${esc(only.locationPath)}</b> — ${money(only.qty)}${
+              only.unit ? ` ${esc(only.unit)}` : ""
+            }`
+          : hit.lines.length
+            ? `<i>Held at ${hit.lines.length} locations — pick one next.</i>`
+            : `<i>No stock on any shelf yet.</i>`,
       ]
         .filter(Boolean)
         .join("\n"),
@@ -686,6 +725,44 @@ async function renderSelectMovement(
   };
 }
 
+/**
+ * True when a location step has exactly one possible answer and should resolve
+ * itself instead of being shown.
+ *
+ * Only ever for stock LEAVING: an outbound step can only offer shelves that
+ * already hold the item, so one stock line means one answer. An inbound step
+ * (a purchase, a return) is choosing where material should go, which is a real
+ * question however few shelves currently hold it.
+ */
+async function autoSelectsSingleLocation(
+  db: Db,
+  request: ItemRequest,
+  mode: "location" | "from" | "to",
+  type: MovementType | null
+): Promise<boolean> {
+  if (mode === "to") return false;
+  if (type?.direction === "in") return false;
+  if (request.ui.moveTypeCode === "warehouse-transfer") return false;
+  const hit = await focusedProduct(db, request);
+  return Boolean(hit && hit.lines.length === 1);
+}
+
+/** Would this node resolve itself rather than render? Back has to skip it too. */
+async function isSilentNode(db: Db, request: ItemRequest, node: FlowNode): Promise<boolean> {
+  if (node.kind === "stock_in" || node.kind === "stock_out") return true;
+  const mode =
+    node.kind === "pick_location" || node.kind === "location"
+      ? "location"
+      : node.kind === "from"
+        ? "from"
+        : null;
+  if (!mode) return false;
+  const type = request.ui.moveTypeCode
+    ? (await loadManualTypes(db, request.chatId)).find((t) => t.code === request.ui.moveTypeCode) ?? null
+    : null;
+  return autoSelectsSingleLocation(db, request, mode, type);
+}
+
 async function renderLocationPick(
   db: Db,
   request: ItemRequest,
@@ -702,6 +779,26 @@ async function renderLocationPick(
   // Move Stock "from" uses stock lines when available; "to" always browses destinations.
   const receiving = type?.direction === "in" || mode === "to";
   const isMoveStock = request.ui.moveTypeCode === "warehouse-transfer";
+
+  // One shelf holds it, so there is nothing to choose. The product screen has
+  // already named that location; putting a one-button picker in front of the
+  // user would show the same location a second time to ask a question with one
+  // possible answer.
+  if (await autoSelectsSingleLocation(db, request, mode, type)) {
+    const only = hit?.lines[0];
+    if (only) {
+      if (mode === "from") {
+        request.ui.moveFromLocationId = only.locationId;
+        request.ui.moveLocationId = only.locationId;
+        request.ui.focusLocationId = only.locationId;
+      } else {
+        request.ui.moveLocationId = only.locationId;
+        request.ui.focusLocationId = only.locationId;
+        request.ui.intentLocationPicked = true;
+      }
+      return advance(db, request);
+    }
+  }
 
   if (hit && hit.lines.length && !receiving && mode === "from") {
     const btns = hit.lines.slice(0, LOCATIONS_SHOWN).map((l, i) => ({
@@ -928,6 +1025,74 @@ async function renderDepartmentPick(
   };
 }
 
+async function renderMaintenanceUserPick(
+  db: Db,
+  request: ItemRequest,
+  node: FlowNode,
+  vars: Record<string, string>
+): Promise<MoveRender> {
+  const users = await activeMaintenanceUsers(db);
+  if (!users.length) {
+    return {
+      text: `${nodeText(node, vars)}\n\n<i>No Active maintenance users. Add them in the console (or run npm run seed:borrow-masters), then try again.</i>`,
+      keyboard: [[{ text: "⬅ Back", callback_data: "rq:mv:back" }], footer(request)],
+    };
+  }
+  const btns = users.slice(0, 12).map((u, i) => ({
+    text: truncate(`👷 ${String(u.name ?? "Maintenance user")}`, 32),
+    callback_data: `rq:mv:mu:${i}`,
+  }));
+  return {
+    text: nodeText(node, vars),
+    keyboard: [...buttonRows(btns, 1), [{ text: "⬅ Back", callback_data: "rq:mv:back" }], footer(request)],
+  };
+}
+
+// Himself / Other, and — once Other is tapped — the worker list, on the same
+// node. They are one question ("who is actually taking this?") with a follow-up
+// that only exists for one of the two answers, so splitting them into two
+// flowchart steps would leave a step that is skipped half the time and a Back
+// button that lands on nothing.
+async function renderBorrowerPick(
+  db: Db,
+  request: ItemRequest,
+  node: FlowNode,
+  vars: Record<string, string>
+): Promise<MoveRender> {
+  const ui = request.ui;
+  const owner = ui.moveMaintenanceUserName || "the maintenance user";
+
+  if (ui.borrowChoiceStage !== "worker") {
+    return {
+      text: `${nodeText(node, vars)}\n\n<i>Recorded under ${esc(owner)} either way.</i>`,
+      keyboard: [
+        [{ text: `🙋 Himself (${truncate(owner, 22)})`, callback_data: "rq:mv:bself" }],
+        [{ text: "👥 Other", callback_data: "rq:mv:bother" }],
+        [{ text: "⬅ Back", callback_data: "rq:mv:back" }],
+        footer(request),
+      ],
+    };
+  }
+
+  const workers = await activeWorkers(db);
+  if (!workers.length) {
+    return {
+      text: `${nodeText(node, vars)}\n\n<i>No Active workers. Add them in the console (or run npm run seed:borrow-masters), then try again.</i>`,
+      keyboard: [[{ text: "⬅ Back", callback_data: "rq:mv:bwho" }], footer(request)],
+    };
+  }
+  const btns = workers.slice(0, 12).map((w, i) => ({
+    text: truncate(String(w.name ?? "Worker"), 32),
+    callback_data: `rq:mv:bw:${i}`,
+  }));
+  return {
+    text:
+      `${nodeText(node, vars)}\n\n<b>Who is taking it?</b>\n` +
+      `<i>It stays on ${esc(owner)}'s account — the ticket shows who actually took it.</i>`,
+    keyboard: [...buttonRows(btns, 1), [{ text: "⬅ Back", callback_data: "rq:mv:bwho" }], footer(request)],
+  };
+}
+
 function renderQty(request: ItemRequest, node: FlowNode, vars: Record<string, string>): MoveRender {
   const draft = request.ui.moveQtyDraft ?? "";
   const parts = draftQtyParts(draft);
@@ -1052,9 +1217,13 @@ async function movementSummaryLines(
       ? "Location"
       : type?.code === "return-from-plant"
         ? "Return To"
-        : receiving
+        : // A borrow leaves from the shelf the item was found on, and the
+          // review already names who took it — "From" would read as a transfer.
+          type?.code === BORROW_MOVEMENT_CODE
           ? "Location"
-          : "From";
+          : receiving
+            ? "Location"
+            : "From";
 
   const parsed = parseQuantityRepeat(request.ui.moveQtyDraft || "");
   const unit = hit?.unit ?? "";
@@ -1084,6 +1253,15 @@ async function movementSummaryLines(
   }
 
   if (request.ui.moveDepartmentName) rebuilt.push(`Department: ${esc(request.ui.moveDepartmentName)}`);
+  // Both names, always — "Borrowed by" is the whole point of the Other branch,
+  // and stating it even when it repeats the account holder keeps the two lines
+  // in the same place on every borrow ticket.
+  if (request.ui.moveMaintenanceUserName) {
+    rebuilt.push(`Maintenance User: ${esc(request.ui.moveMaintenanceUserName)}`);
+  }
+  if (request.ui.moveBorrowerName) {
+    rebuilt.push(`Borrowed by: ${esc(request.ui.moveBorrowerName)}`);
+  }
   for (const [qid, a] of Object.entries(request.ui.moveAnswers ?? {})) {
     const qNode = Object.values(wf.nodes).find((n) => n.question?.id === qid);
     const label = qNode?.question?.label || qNode?.label || "Answer";
@@ -1103,12 +1281,24 @@ async function renderReview(
   _vars: Record<string, string>
 ): Promise<MoveRender> {
   const summary = await movementSummaryLines(db, request, hit, type);
-  const text = ["📋 <b>Review</b>", "", ...summary].filter(Boolean).join("\n");
+  // A borrow does not go in a cart — confirming it deducts the stock there and
+  // then — so the button has to say what it actually does.
+  const borrowing = request.ui.moveTypeCode === BORROW_MOVEMENT_CODE;
+  const text = borrowing
+    ? ["🔧 <b>Confirm borrowing</b>", "", ...summary, "", "<i>Confirming deducts this from stock straight away.</i>"]
+        .filter(Boolean)
+        .join("\n")
+    : ["📋 <b>Review</b>", "", ...summary].filter(Boolean).join("\n");
 
   return {
     text,
     keyboard: [
-      [{ text: "🛒 Add to Cart", callback_data: "rq:mv:cart" }],
+      [
+        {
+          text: borrowing ? "✅ Confirm Borrow" : "🛒 Add to Cart",
+          callback_data: "rq:mv:cart",
+        },
+      ],
       [{ text: "⬅ Back", callback_data: "rq:mv:back" }],
       footer(request),
     ],
@@ -1155,10 +1345,12 @@ async function goBack(db: Db, request: ItemRequest): Promise<MoveRender> {
     return { text: "Cancelled. Type an item name to search again.", keyboard: [footer(request)] };
   }
   request.ui.flowNodeId = prev;
-  // Skip silent stock-effect markers when walking back.
+  // Skip anything that renders nothing on the way forward — the silent
+  // stock-effect markers, and a location step with only one possible answer.
+  // Landing on one of those would auto-advance again and make Back a no-op.
   for (let i = 0; i < 20; i++) {
     const cur = currentNode(wf, request);
-    if (!cur || (cur.kind !== "stock_in" && cur.kind !== "stock_out")) break;
+    if (!cur || !(await isSilentNode(db, request, cur))) break;
     const skipPrev = prevNodeId(wf, cur.id);
     if (!skipPrev) break;
     request.ui.flowNodeId = skipPrev;
@@ -1221,6 +1413,12 @@ export async function applyMoveCallback(
     }
     if (data === "rq:mv:next" && node?.kind === "pick_department" && !request.ui.moveDepartmentId) {
       return { notice: "Pick a department first." };
+    }
+    if (data === "rq:mv:next" && node?.kind === "pick_maintenance_user" && !request.ui.moveMaintenanceUserId) {
+      return { notice: "Pick the maintenance user first." };
+    }
+    if (data === "rq:mv:next" && node?.kind === "pick_borrower" && !request.ui.moveBorrowerName) {
+      return { notice: "Say who is borrowing it — Himself or Other." };
     }
     if (data === "rq:mv:next" && node?.kind === "reference") {
       const type = request.ui.moveTypeCode
@@ -1285,6 +1483,10 @@ export async function applyMoveCallback(
     if (hasDeptStep && !request.ui.moveDepartmentId) {
       return { notice: "Pick a department first." };
     }
+    if (request.ui.moveTypeCode === BORROW_MOVEMENT_CODE) {
+      if (!request.ui.moveMaintenanceUserId) return { notice: "Pick the maintenance user first." };
+      if (!request.ui.moveBorrowerName) return { notice: "Say who is borrowing it — Himself or Other." };
+    }
     const typeForCart = request.ui.moveTypeCode
       ? (await loadManualTypes(db, request.chatId)).find((t) => t.code === request.ui.moveTypeCode)
       : null;
@@ -1323,6 +1525,12 @@ export async function applyMoveCallback(
     request.ui.moveFromLocationId = null;
     request.ui.moveToLocationId = null;
     request.ui.moveLocationId = null;
+    request.ui.moveMaintenanceUserId = null;
+    request.ui.moveMaintenanceUserName = null;
+    request.ui.moveBorrowerId = null;
+    request.ui.moveBorrowerName = null;
+    request.ui.moveBorrowerSelf = null;
+    request.ui.borrowChoiceStage = null;
     const entered = enterMovementBranch(wf, picked.code);
     if (entered) {
       request.ui.flowNodeId = entered;
@@ -1421,6 +1629,59 @@ export async function applyMoveCallback(
     if (!d) return { notice: "That department is no longer available." };
     request.ui.moveDepartmentId = d._id.toString();
     request.ui.moveDepartmentName = String(d.name ?? "");
+    return { render: await advance(db, request) };
+  }
+
+  // Maintenance User Master pick — whose account the borrowing sits under.
+  if (data.startsWith("rq:mv:mu:")) {
+    const idx = Number(data.slice("rq:mv:mu:".length));
+    const users = await activeMaintenanceUsers(db);
+    const u = users[idx];
+    if (!u) return { notice: "That maintenance user is no longer available." };
+    request.ui.moveMaintenanceUserId = u._id.toString();
+    request.ui.moveMaintenanceUserName = String(u.name ?? "");
+    // Changing the account holder invalidates a Himself answer that named the
+    // previous one, so the borrower question starts again.
+    request.ui.moveBorrowerId = null;
+    request.ui.moveBorrowerName = null;
+    request.ui.moveBorrowerSelf = null;
+    request.ui.borrowChoiceStage = "who";
+    return { render: await advance(db, request) };
+  }
+
+  // Himself: the borrowing sits under the maintenance user AND they took it.
+  if (data === "rq:mv:bself") {
+    const owner = request.ui.moveMaintenanceUserName;
+    if (!owner) return { notice: "Pick the maintenance user first." };
+    request.ui.moveBorrowerId = request.ui.moveMaintenanceUserId ?? null;
+    request.ui.moveBorrowerName = owner;
+    request.ui.moveBorrowerSelf = true;
+    request.ui.borrowChoiceStage = "who";
+    return { render: await advance(db, request) };
+  }
+
+  // Other: same account, different pair of hands — open the worker list.
+  if (data === "rq:mv:bother") {
+    if (!request.ui.moveMaintenanceUserName) return { notice: "Pick the maintenance user first." };
+    request.ui.borrowChoiceStage = "worker";
+    return { render: await renderMoveFlow(db, request) };
+  }
+
+  // Back out of the worker list to Himself / Other without leaving the step.
+  if (data === "rq:mv:bwho") {
+    request.ui.borrowChoiceStage = "who";
+    return { render: await renderMoveFlow(db, request) };
+  }
+
+  if (data.startsWith("rq:mv:bw:")) {
+    const idx = Number(data.slice("rq:mv:bw:".length));
+    const workers = await activeWorkers(db);
+    const w = workers[idx];
+    if (!w) return { notice: "That worker is no longer available." };
+    request.ui.moveBorrowerId = w._id.toString();
+    request.ui.moveBorrowerName = String(w.name ?? "");
+    request.ui.moveBorrowerSelf = false;
+    request.ui.borrowChoiceStage = "who";
     return { render: await advance(db, request) };
   }
 

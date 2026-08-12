@@ -142,6 +142,19 @@ const INDEX_SPECS: Record<string, { key: Document; unique?: boolean; partialFilt
     { key: { status: 1, createdAt: -1 } },
     { key: { createdAt: -1 } },
   ],
+  // Borrowings (BRW-). The ledger already says stock left; this is the record of
+  // WHO is holding it — the maintenance user it sits under, and the worker who
+  // physically took it when those differ.
+  borrowings: [
+    { key: { ticketNumber: 1 }, unique: true },
+    { key: { maintenanceUserId: 1, status: 1, createdAt: -1 } },
+    { key: { productId: 1, createdAt: -1 } },
+    { key: { chatId: 1, createdAt: -1 } },
+  ],
+  // The two people-masters the Borrow flow offers. Seeded on first read, so the
+  // unique code index is what keeps that seed from doubling up under a race.
+  maintenanceUsers: [{ key: { code: 1 }, unique: true }, { key: { status: 1, order: 1 } }],
+  workers: [{ key: { code: 1 }, unique: true }, { key: { status: 1, order: 1 } }],
 };
 
 export async function ensureIndexes(db?: Db): Promise<void> {

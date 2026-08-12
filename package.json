@@ -16,6 +16,7 @@
     "seed:vendors": "node scripts/seed-vendors.mjs",
     "seed:plants": "node scripts/seed-plants.mjs",
     "seed:departments": "node scripts/seed-departments.mjs",
+    "seed:borrow-masters": "node scripts/seed-borrow-masters.mjs",
     "ensure-indexes": "node scripts/ensure-indexes.mjs",
     "backfill:stock": "node scripts/backfill-stock.mjs",
     "migrate:request-roles": "node scripts/migrate-request-roles.mjs",

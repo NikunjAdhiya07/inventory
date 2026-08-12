@@ -177,6 +177,18 @@ export type RequestUi = {
   movePlantQuery?: string;
   moveDepartmentId?: string | null;
   moveDepartmentName?: string | null;
+  // Borrow flow. A borrowing has TWO people on it: the maintenance user whose
+  // account it sits under, and whoever physically took the item — the same
+  // person when they picked "Himself", one of their workers when they did not.
+  // Both are kept because "Vijay's account, borrowed by Babu" is precisely the
+  // fact the store needs when the item does not come back.
+  moveMaintenanceUserId?: string | null;
+  moveMaintenanceUserName?: string | null;
+  moveBorrowerId?: string | null;
+  moveBorrowerName?: string | null;
+  moveBorrowerSelf?: boolean | null;
+  /** Which half of the Himself / Other picker is on screen. */
+  borrowChoiceStage?: "who" | "worker" | null;
   moveQtyDraft?: string;
   moveReference?: string;
   moveRemarks?: string;

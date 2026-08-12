@@ -32,6 +32,9 @@ export const TicketSeries = {
   PURCHASE: "PUR",
   ISSUE: "ISS",
   RETURN: "RET",
+  // A borrowing is quoted on its own — it is the number the store asks for when
+  // chasing an item that has not come back — so it counts in its own series.
+  BORROW: "BRW",
 } as const;
 
 export type TicketSeriesName = (typeof TicketSeries)[keyof typeof TicketSeries];

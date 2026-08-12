@@ -7,6 +7,9 @@ import { cached, invalidate } from "./cache";
 import { newQuestionId, normalizeQuestions, type MoveQuestion, type MoveQuestionKind } from "./movement-questions";
 import { pressQuantityKey } from "./quantity-repeat";
 import { groupConfig } from "./telegram-health";
+// Constants only — this module is bundled into the client-side Workflows
+// builder, so it must not reach the Mongo-backed borrowing logic.
+import { BORROW_BRANCH_LABEL, BORROW_MOVEMENT_CODE } from "./borrowing-types";
 
 export const SEARCH_MOVE_WORKFLOW_KEY = "search-move";
 
@@ -22,6 +25,8 @@ export type FlowNodeKind =
   | "pick_vendor"
   | "pick_plant"
   | "pick_department"
+  | "pick_maintenance_user"
+  | "pick_borrower"
   | "select_movement"
   | "movement"
   | "location"
@@ -97,6 +102,10 @@ export function defaultMessage(kind: FlowNodeKind, label?: string): string {
       return "{{product}} — {{type}}\n\n📍 Which plant is returning this item?\n\n<i>Type a name to search Plant Master, or pick below.</i>";
     case "pick_department":
       return "{{product}} — {{type}}\n\nWhich department is returning this item?";
+    case "pick_maintenance_user":
+      return "{{product}} — {{type}}\n{{where}}\n\n👷 Which maintenance user is borrowing this?";
+    case "pick_borrower":
+      return "{{product}} — {{type}}\n\n<b>{{maintenance_user}}</b> — who is taking it?";
     case "movement":
       return "{{product}} — {{type}}";
     case "from":
@@ -228,6 +237,7 @@ export function buildExampleWorkflow(): SearchMoveWorkflow {
       ],
     },
     newPurchaseBranchExample(),
+    borrowBranchExample(),
   ];
 
   for (const ex of examples) {
@@ -326,6 +336,14 @@ type BranchExample = {
   includeDepartment?: boolean;
   includePlant?: boolean;
   includeReference?: boolean;
+  /** Borrow: who the borrowing sits under, then who physically took it. */
+  includeMaintenanceUser?: boolean;
+  includeBorrower?: boolean;
+  /**
+   * Skip the branch's own location step. Set when the lead-in already asked
+   * which shelf and asking again would show the same location twice.
+   */
+  skipLocation?: boolean;
   locationLabel?: string;
   locationMessage?: string;
   vendorLabel?: string;
@@ -339,6 +357,10 @@ type BranchExample = {
   qtyMessage?: string;
   referenceLabel?: string;
   referenceMessage?: string;
+  maintenanceUserLabel?: string;
+  maintenanceUserMessage?: string;
+  borrowerLabel?: string;
+  borrowerMessage?: string;
 };
 
 function questionStep(
@@ -387,6 +409,33 @@ function moveStockBranchExample(): BranchExample {
     toLabel: "Where do you want to move it?",
     toMessage: "{{product}} — {{type}}\n\n📍 Where do you want to move it?",
     qtyMessage: "{{product}} — {{type}}\n\nHow many?\n\nQty: {{qty}} {{unit}}",
+    questions: [],
+  };
+}
+
+/**
+ * Search-group Borrow: quantity → maintenance user → Himself / Other → confirm.
+ *
+ * Deliberately has NO location step. The lead-in already asked which shelf the
+ * item is on, and a borrow always leaves from that same shelf — a second picker
+ * would show the caller the same location twice and let them contradict it.
+ */
+function borrowBranchExample(): BranchExample {
+  return {
+    code: BORROW_MOVEMENT_CODE,
+    name: BORROW_BRANCH_LABEL,
+    direction: "out",
+    qtyFirst: true,
+    skipLocation: true,
+    includeMaintenanceUser: true,
+    includeBorrower: true,
+    includeReference: false,
+    qtyMessage: "{{product}} — {{type}}\n{{where}}\n\nHow many are you borrowing?\n\nQty: {{qty}} {{unit}}",
+    maintenanceUserLabel: "Select maintenance user",
+    maintenanceUserMessage:
+      "{{product}} — {{type}}\n{{where}}\n\n👷 Which maintenance user is borrowing this?",
+    borrowerLabel: "Himself or Other?",
+    borrowerMessage: "{{product}} — {{type}}\n\n<b>{{maintenance_user}}</b> — who is taking it?",
     questions: [],
   };
 }
@@ -446,7 +495,26 @@ function attachMovementBranch(
     });
   };
 
+  const pushMaintenanceUser = () => {
+    if (!ex.includeMaintenanceUser) return;
+    stepDefs.push({
+      kind: "pick_maintenance_user",
+      label: ex.maintenanceUserLabel || "Select maintenance user",
+      message: ex.maintenanceUserMessage || defaultMessage("pick_maintenance_user"),
+    });
+  };
+
+  const pushBorrower = () => {
+    if (!ex.includeBorrower) return;
+    stepDefs.push({
+      kind: "pick_borrower",
+      label: ex.borrowerLabel || "Himself or Other?",
+      message: ex.borrowerMessage || defaultMessage("pick_borrower"),
+    });
+  };
+
   const pushLocation = () => {
+    if (ex.skipLocation) return;
     if (ex.direction === "transfer") {
       stepDefs.push(
         {
@@ -507,17 +575,22 @@ function attachMovementBranch(
   }
 
   if (ex.qtyFirst) {
-    // New Purchase / Return from Plant / Move Stock: qty first, then parties/locations
+    // New Purchase / Return from Plant / Move Stock / Borrow: qty first, then
+    // the parties and locations that qualify it.
     pushQty();
     pushVendor();
     pushPlant();
     pushLocation();
+    pushMaintenanceUser();
+    pushBorrower();
   } else {
     if (ex.includeVendor && ex.vendorBeforeLocation) pushVendor();
     if (ex.includePlant) pushPlant();
     pushLocation();
     if (ex.includeVendor && !ex.vendorBeforeLocation) pushVendor();
     pushQty();
+    pushMaintenanceUser();
+    pushBorrower();
   }
 
   const effectKind = stockEffectKindForDirection(ex.direction);
@@ -794,6 +867,57 @@ function moveStockBranchNeedsSimplify(workflow: SearchMoveWorkflow, moveId: stri
   return false;
 }
 
+/**
+ * Ensure Borrow exists in the form the search bot drives:
+ * Quantity → Maintenance user → Himself / Other → Review → Confirm.
+ * Rebuilt in place when a saved branch predates the borrower steps.
+ */
+export function ensureBorrowBranch(workflow: SearchMoveWorkflow): SearchMoveWorkflow {
+  const existing = movementBranches(workflow).find((n) => n.movementCode === BORROW_MOVEMENT_CODE);
+  if (existing && !borrowBranchNeedsRebuild(workflow, existing.id)) {
+    if (existing.label !== BORROW_BRANCH_LABEL) {
+      const nodes = cloneNodes(workflow);
+      nodes[existing.id] = { ...nodes[existing.id], label: BORROW_BRANCH_LABEL };
+      return { ...workflow, nodes, updatedAt: new Date().toISOString() };
+    }
+    return workflow;
+  }
+
+  let base = workflow;
+  if (existing) base = removeNode(workflow, existing.id);
+  const hub = findSelectMovement(base);
+  if (!hub) return workflow;
+  const nodes = cloneNodes(base);
+  const hubNode = nodes[hub.id];
+  if (!hubNode) return workflow;
+  attachMovementBranch(nodes, hubNode, borrowBranchExample());
+  // Derived from the children so the saved code list stays in the order the
+  // buttons are drawn in — a hub whose two orderings disagree is a keyboard
+  // that reads differently from the tree the admin arranged.
+  const codes: string[] = [];
+  for (const id of hubNode.children) {
+    const code = nodes[id]?.movementCode;
+    if (code && !codes.includes(code)) codes.push(code);
+  }
+  if (!codes.includes(BORROW_MOVEMENT_CODE)) codes.push(BORROW_MOVEMENT_CODE);
+  hubNode.movementCodes = codes;
+  nodes[hub.id] = hubNode;
+  return { ...base, nodes, updatedAt: new Date().toISOString() };
+}
+
+function borrowBranchNeedsRebuild(workflow: SearchMoveWorkflow, moveId: string): boolean {
+  const steps = branchSteps(workflow, moveId);
+  const kinds = steps.map((id) => workflow.nodes[id]?.kind);
+  if (kinds[0] !== "qty") return true;
+  if (!kinds.includes("pick_maintenance_user")) return true;
+  if (!kinds.includes("pick_borrower")) return true;
+  // A second location picker is exactly the duplicate this branch exists to avoid.
+  if (kinds.includes("location") || kinds.includes("pick_location")) return true;
+  const mi = kinds.indexOf("pick_maintenance_user");
+  const bi = kinds.indexOf("pick_borrower");
+  return mi > bi;
+}
+
 /** Ensure known Movement Master example branches exist on a saved tree. */
 export function ensureConfiguredMovementBranches(workflow: SearchMoveWorkflow): SearchMoveWorkflow {
   let next = ensureVendorReplacementBranch(workflow);
@@ -801,6 +925,7 @@ export function ensureConfiguredMovementBranches(workflow: SearchMoveWorkflow): 
   next = ensureNewPurchaseBranch(next);
   next = ensureReturnFromPlantBranch(next);
   next = ensureMoveStockBranch(next);
+  next = ensureBorrowBranch(next);
   next = ensureStockEffectStepsOnBranches(next);
   return next;
 }
@@ -965,6 +1090,7 @@ export async function getSearchMoveWorkflow(
           let next = ensureNewPurchaseBranch(wf);
           next = ensureReturnFromPlantBranch(next);
           next = ensureMoveStockBranch(next);
+          next = ensureBorrowBranch(next);
           if (next.updatedAt !== wf.updatedAt) {
             await db.collection(COLLECTION).updateOne({ key }, { $set: next }, { upsert: true });
             await syncQuestionsToMovementTypes(db, next);
@@ -993,9 +1119,11 @@ export async function getSearchMoveWorkflow(
       if (mode === "request") {
         const legacy = await db.collection(COLLECTION).findOne({ key: SEARCH_MOVE_WORKFLOW_KEY });
         if (legacy) {
-          const migrated = ensureMoveStockBranch(
-            ensureReturnFromPlantBranch(
-              ensureNewPurchaseBranch(stampChat(normalizeWorkflow(legacy), chatId))
+          const migrated = ensureBorrowBranch(
+            ensureMoveStockBranch(
+              ensureReturnFromPlantBranch(
+                ensureNewPurchaseBranch(stampChat(normalizeWorkflow(legacy), chatId))
+              )
             )
           );
           await db.collection(COLLECTION).updateOne({ key }, { $set: migrated }, { upsert: true });
@@ -1329,6 +1457,8 @@ export function makeStepNode(kind: FlowNodeKind): FlowNode {
     pick_vendor: "Select vendor",
     pick_plant: "Which plant?",
     pick_department: "Select department",
+    pick_maintenance_user: "Select maintenance user",
+    pick_borrower: "Himself or Other?",
     select_movement: "Select movement",
     location: "Location",
     from: "From location",
@@ -1372,6 +1502,10 @@ export function createMovementBranch(
   if (movementBranches(workflow).some((n) => n.movementCode === input.code)) return workflow;
 
   // Known Movement Master shapes — keep Entries/Requests branches consistent.
+  if (input.code === BORROW_MOVEMENT_CODE) {
+    return ensureBorrowBranch(workflow);
+  }
+
   if (input.code === "new-purchase") {
     const nodes = cloneNodes(workflow);
     const hubNode = nodes[hub.id];
@@ -1694,6 +1828,8 @@ export type PreviewButton = {
     | "pick_vendor"
     | "pick_plant"
     | "pick_department"
+    | "pick_maintenance_user"
+    | "pick_borrower"
     | "qty_digit"
     | "qty_del"
     | "qty_ok"
@@ -1728,6 +1864,9 @@ export type PreviewSimState = {
   vendor: string;
   plant: string;
   department: string;
+  /** Borrow: the account holder, and who actually took it. */
+  maintenanceUser: string;
+  borrower: string;
   done: boolean;
 };
 
@@ -1767,6 +1906,17 @@ const SAMPLE_LOCS = ["Main warehouse", "Plant shelf", "Store room"];
 const SAMPLE_VENDORS = ["ABC Vendor", "Precision Pipes Ltd", "Metro Plumbing Supply", "SafeFit Industrial"];
 const SAMPLE_PLANTS = ["Asian Paints Plant", "Ahmedabad Plant", "Mumbai Plant"];
 const SAMPLE_DEPARTMENTS = ["Production", "Maintenance", "Electrical", "Quality", "Stores", "Packaging"];
+const SAMPLE_MAINTENANCE_USERS = ["Vijay", "Nilesh Chauhan", "Devang", "Vishal"];
+const SAMPLE_WORKERS = [
+  "Babu",
+  "Hardip",
+  "Aakash",
+  "Mahesh Chauhan",
+  "Nilesh",
+  "Rahul",
+  "Jayesh",
+  "Mahesh Madhar",
+];
 const SAMPLE_MOVES: Record<string, string> = {
   "opening-stock": "Add to Stock",
   "return-from-plant": "Return from Plant",
@@ -1775,6 +1925,7 @@ const SAMPLE_MOVES: Record<string, string> = {
   "vendor-replacement": "Vendor Replacement",
   "department-return": "Department Return",
   "new-purchase": "New Purchase",
+  [BORROW_MOVEMENT_CODE]: BORROW_BRANCH_LABEL,
 };
 
 export function initialPreviewState(_movementCode?: string | null): PreviewSimState {
@@ -1792,6 +1943,8 @@ export function initialPreviewState(_movementCode?: string | null): PreviewSimSt
     vendor: "",
     plant: "",
     department: "",
+    maintenanceUser: "",
+    borrower: "",
     done: false,
   };
 }
@@ -1822,6 +1975,8 @@ function screenVars(state: PreviewSimState, typeLabel = ""): Record<string, stri
     vendor: state.vendor || "ABC Vendor",
     plant: state.plant || "Asian Paints Plant",
     department: state.department || "Production",
+    maintenance_user: state.maintenanceUser || "Vijay",
+    borrower: state.borrower || state.maintenanceUser || "Vijay",
     question: "",
   };
 }
@@ -1962,6 +2117,20 @@ export function previewScreen(workflow: SearchMoveWorkflow, state: PreviewSimSta
     buttons.push(
       ...SAMPLE_DEPARTMENTS.map((d) => ({ label: d, action: "pick_department" as const, value: d }))
     );
+  } else if (node.kind === "pick_maintenance_user") {
+    buttons.push(
+      ...SAMPLE_MAINTENANCE_USERS.map((u) => ({
+        label: `👷 ${u}`,
+        action: "pick_maintenance_user" as const,
+        value: u,
+      }))
+    );
+  } else if (node.kind === "pick_borrower") {
+    const owner = state.maintenanceUser || SAMPLE_MAINTENANCE_USERS[0];
+    buttons.push({ label: `🙋 Himself (${owner})`, action: "pick_borrower", value: `self:${owner}` });
+    buttons.push(
+      ...SAMPLE_WORKERS.map((w) => ({ label: w, action: "pick_borrower" as const, value: `other:${w}` }))
+    );
   } else if (node.kind === "select_movement") {
     const moves = movementBranches(workflow);
     if (moves.length) {
@@ -2014,6 +2183,9 @@ export function previewScreen(workflow: SearchMoveWorkflow, state: PreviewSimSta
         ? `\nVendor: ${state.vendor}`
         : "";
     const plant = state.plant && state.movementCode === "return-from-plant" ? `\nFrom Plant: ${state.plant}` : "";
+    const borrowers = state.maintenanceUser
+      ? `\nMaintenance User: ${state.maintenanceUser}\nBorrowed by: ${state.borrower || state.maintenanceUser}`
+      : "";
     const draft = state.qtyDraft || "12";
     const hasTimes = /[×xX*]/.test(draft);
     const parts = draft.split(/\s*[×xX*]\s*/);
@@ -2031,12 +2203,16 @@ export function previewScreen(workflow: SearchMoveWorkflow, state: PreviewSimSta
         (answerLines ? `\n${answerLines}` : "");
     } else {
       const locLabel = state.movementCode === "return-from-plant" ? "Return To" : "Location";
+      const head = state.movementCode === BORROW_MOVEMENT_CODE ? "🔧 Confirm borrowing" : "📋 Review";
       text =
-        `📋 Review\n\nItem: ${state.product}\nAction: ${typeLabel(state) || "Add to Stock"}\n${qtyBlock}${plant}${vendor}\n${locLabel}: ${
+        `${head}\n\nItem: ${state.product}\nAction: ${typeLabel(state) || "Add to Stock"}\n${qtyBlock}${plant}${vendor}\n${locLabel}: ${
           state.location || SAMPLE_WHERE
-        }${dept}${answerLines ? `\n${answerLines}` : ""}`;
+        }${dept}${borrowers}${answerLines ? `\n${answerLines}` : ""}`;
     }
-    buttons.push({ label: "🛒 Add to Cart", action: "add_cart" });
+    buttons.push({
+      label: state.movementCode === BORROW_MOVEMENT_CODE ? "✅ Confirm Borrow" : "🛒 Add to Cart",
+      action: "add_cart",
+    });
   } else if (node.kind === "reference" || node.kind === "remarks") {
     // typed in real bot; preview advances
     buttons.push({ label: "✔ Next", action: "next" });
@@ -2139,6 +2315,19 @@ export function applyPreviewAction(
   if (action === "pick_department") {
     return advance(workflow, { ...state, department: value || state.department });
   }
+  if (action === "pick_maintenance_user") {
+    // Changing the account holder drops a "Himself" answer that named the old one.
+    return advance(workflow, { ...state, maintenanceUser: value || state.maintenanceUser, borrower: "" });
+  }
+  if (action === "pick_borrower") {
+    const self = String(value ?? "").startsWith("self:");
+    const name = String(value ?? "").replace(/^(self|other):/, "");
+    return advance(workflow, {
+      ...state,
+      borrower: name || state.maintenanceUser,
+      ...(self && !state.maintenanceUser ? { maintenanceUser: name } : {}),
+    });
+  }
   if (action === "pick_move") {
     const code = value || state.movementCode || "";
     const entered = enterMovementBranch(workflow, code);
@@ -2215,6 +2404,8 @@ export function previewFrames(
         b.action === "pick_vendor" ||
         b.action === "pick_plant" ||
         b.action === "pick_department" ||
+        b.action === "pick_maintenance_user" ||
+        b.action === "pick_borrower" ||
         b.action === "pick_move" ||
         b.action === "qty_ok" ||
         b.action === "confirm" ||

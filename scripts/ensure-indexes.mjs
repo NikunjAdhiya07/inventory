@@ -71,6 +71,16 @@ const INDEX_SPECS = {
     { key: { reason: 1, createdAt: -1 } },
     { key: { productId: 1, createdAt: -1 } },
   ],
+  maintenanceUsers: [{ key: { code: 1 }, unique: true }, { key: { status: 1, order: 1 } }],
+  workers: [{ key: { code: 1 }, unique: true }, { key: { status: 1, order: 1 } }],
+  borrowings: [
+    { key: { ticketNumber: 1 }, unique: true },
+    // "What is Vijay still holding?" and "who has this item?" are the two
+    // questions a borrowing record exists to answer.
+    { key: { maintenanceUserId: 1, status: 1, createdAt: -1 } },
+    { key: { productId: 1, createdAt: -1 } },
+    { key: { chatId: 1, createdAt: -1 } },
+  ],
   requests: [
     { key: { chatId: 1, requesterUserId: 1, status: 1 } },
     { key: { ticketNumber: 1 }, unique: true, partialFilterExpression: { ticketNumber: { $type: "string" } } },

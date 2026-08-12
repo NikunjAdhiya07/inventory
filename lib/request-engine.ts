@@ -22,7 +22,8 @@ import { resolveStockEffectFromAnswers } from "./movement-questions";
 import { activeMovementTypes, toMovementType } from "./movements";
 import { lookupProducts, type StockHit } from "./stock";
 import { buttonRows, type InlineKeyboard } from "./telegram";
-import { approversFor, mentionList, note, type Approver } from "./requests";
+import { approversFor, mentionList, note, saveRequest, type Approver } from "./requests";
+import { BORROW_MOVEMENT_CODE, postBorrowing } from "./borrowing";
 import {
   findOutboundShortage,
   isInboundMovement,
@@ -722,6 +723,12 @@ export async function applyDraftCallback(
   if (isMoveCallback(data)) {
     const res = await applyMoveCallback(db, request, data, by);
     if (res.addToCart) {
+      // A borrow never reaches the cart. The person is holding the item, so the
+      // ledger has to agree with the shelf now rather than after a manager
+      // Accept that may be hours away.
+      if (request.ui.moveTypeCode === BORROW_MOVEMENT_CODE) {
+        return commitBorrow(db, request, by);
+      }
       const draft = request.ui.moveQtyDraft || request.ui.qtyDraft || "";
       if (!request.ui.focusLocationId && request.ui.moveLocationId) {
         request.ui.focusLocationId = request.ui.moveLocationId;
@@ -1205,6 +1212,128 @@ async function commitLine(db: Db, request: ItemRequest, draft: string): Promise<
         [{ text: "➕ Add Another Item", callback_data: "rq:again" }],
         [{ text: `🛒 View Cart (${request.lines.length})`, callback_data: "rq:cart" }],
         [{ text: "✖ Cancel", callback_data: "rq:cancel" }],
+      ],
+    },
+  };
+}
+
+// Confirm a borrowing: post it, then say what is left on the shelf.
+//
+// This is the one search-group action that settles itself. Everything else
+// builds a cart line and waits for an Inventory Manager, because everything
+// else is a request. A borrow is not a request — the maintenance user is at the
+// shelf with the item — so the confirmation IS the transaction, and the number
+// it reports back has to be the balance after the write rather than the one the
+// screen was built from.
+async function commitBorrow(db: Db, request: ItemRequest, by: string): Promise<RequestResult> {
+  const ui = request.ui;
+  const parsed = parseQuantityRepeat(ui.moveQtyDraft || ui.qtyDraft || "");
+  if (!parsed.ok) return { notice: parsed.notice };
+  // `qty × entries` splits one amount into several cart lines. A borrowing is a
+  // single handover of a single amount, so the total is what leaves the shelf.
+  const qty = parsed.value.qty * parsed.value.times;
+
+  const hit = await focusedHit(db, request);
+  if (!hit) return { notice: "That item is no longer available." };
+
+  const locationId = ui.moveLocationId || ui.focusLocationId;
+  if (!locationId) return { notice: "Pick a storage location first." };
+  const locationPath =
+    hit.lines.find((l) => l.locationId === locationId)?.locationPath ||
+    (await locationPathById(db, locationId)) ||
+    "(unknown location)";
+  const unit = hit.lines.find((l) => l.locationId === locationId)?.unit || hit.unit;
+
+  const maintenanceUserName = ui.moveMaintenanceUserName || "";
+  if (!maintenanceUserName) return { notice: "Pick the maintenance user first." };
+  const self = ui.moveBorrowerSelf !== false;
+  const borrowedByName = ui.moveBorrowerName || (self ? maintenanceUserName : "");
+  if (!borrowedByName) return { notice: "Say who is borrowing it — Himself or Other." };
+
+  const posted = await postBorrowing(db, {
+    chatId: request.chatId,
+    productId: hit.productId,
+    productName: hit.name,
+    productNumber: hit.productNumber,
+    unit,
+    locationId,
+    locationPath,
+    qty,
+    maintenanceUserId: ui.moveMaintenanceUserId || "",
+    maintenanceUserName,
+    borrowedByName,
+    borrowedBySelf: self,
+    ...(self ? {} : { workerId: ui.moveBorrowerId || undefined }),
+    recordedByUserId: request.requesterUserId,
+    recordedByName: by,
+    ...(request._id ? { requestId: String(request._id) } : {}),
+  });
+
+  if (!posted.ok) {
+    note(request, by, `Borrow refused: ${hit.name} — ${posted.reason}`);
+    return {
+      render: {
+        text: [
+          `⚠️ <b>Can't borrow that</b>`,
+          "",
+          `Item: ${esc(hit.name)}`,
+          `Location: ${esc(locationPath)}`,
+          `Wanted: ${money(qty)} ${esc(unit)}`,
+          ...(posted.available === undefined ? [] : [`Available: ${money(posted.available)} ${esc(unit)}`]),
+          "",
+          `<i>${esc(posted.reason)}</i>`,
+        ].join("\n"),
+        keyboard: [
+          [{ text: "⬅ Back", callback_data: "rq:mv:back" }],
+          [{ text: "✖ Cancel", callback_data: "rq:cancel" }],
+        ],
+      },
+      notice: posted.reason,
+    };
+  }
+
+  note(
+    request,
+    by,
+    `Borrowed ${money(qty)} ${unit} ${hit.name} from ${locationPath} — ${maintenanceUserName}` +
+      (self ? "" : ` (taken by ${borrowedByName})`) +
+      ` · ${posted.ticketNumber}`
+  );
+
+  clearCategoryPath(ui);
+  clearMoveUi(ui);
+  ui.query = "";
+  ui.focusProductId = null;
+  ui.focusLocationId = null;
+  ui.qtyDraft = "";
+  ui.intentLocationPicked = false;
+  // The borrowing is its own record, so it must survive whatever happens to the
+  // draft that hosted the conversation — including the requester cancelling it.
+  await saveRequest(db, request);
+
+  const text = [
+    `✅ <b>Borrowing recorded</b> — <b>${esc(posted.ticketNumber)}</b>`,
+    "",
+    `<b>${esc(hit.name)}</b> — ${money(posted.qty)} ${esc(unit)}`,
+    `📍 ${esc(locationPath)}`,
+    "",
+    `Maintenance User: <b>${esc(maintenanceUserName)}</b>`,
+    `Borrowed by: <b>${esc(borrowedByName)}</b>${self ? " <i>(himself)</i>" : ""}`,
+    "",
+    `<b>Remaining stock</b>`,
+    `📍 ${esc(locationPath)}: <b>${money(posted.remainingAtLocation)}</b> ${esc(unit)}`,
+    `All locations: <b>${money(posted.remainingTotal)}</b> ${esc(unit)}`,
+  ].join("\n");
+
+  return {
+    render: {
+      text,
+      keyboard: [
+        [{ text: "🔧 Borrow Another Item", callback_data: "rq:again" }],
+        ...(request.lines.length
+          ? [[{ text: `🛒 View Cart (${request.lines.length})`, callback_data: "rq:cart" }]]
+          : []),
+        [{ text: "✖ Close", callback_data: "rq:cancel" }],
       ],
     },
   };
